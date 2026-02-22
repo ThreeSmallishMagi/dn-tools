@@ -1,0 +1,7 @@
+*.acv
+*.amp
+*.csv
+Scans
+junk
+__pycache__
+curves
