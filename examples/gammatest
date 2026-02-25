@@ -1,0 +1,47 @@
+#!/usr/bin/bash -x
+# Test dividing out an estimation of the lcd response that is made up of
+# a gamma component composed witha linear component. jpeg data is typically in a color space 
+# that has a gamma 1/2.2 encoding/gamma compression curve. Computer monitors have the 
+# 2.2/decoding/gamma expansion curve built into their response, so that the image data is shown
+# correctly/linearly
+#
+echo npd4i is the inverse of NewPaperDev4 correction curve, so my best estimate of the lcd response curve
+acv show npd4i.amp
+
+echo Make a gamma curve. 
+# I think I need to incorporate the inverting of the image to make a negative into the model
+acv identity id.amp
+acv gamma 2.2 id.amp gamma2_2.amp
+acv show gamma2_2.amp
+
+echo first divide out the gamma part. 
+acv divide npd4i.amp gamma2_2.amp npd4igamma.amp
+echo it is much straighter
+acv show npd4igamma.amp
+
+echo Assuming the curve is monotonic, find the central x range where  2<y<255-2
+acv linear 2 npd4igamma.amp npd4il.amp
+acv show npd4il.amp
+
+echo compose the gamma and linear parts to get the estimated response
+acv compose gamma2_2.amp npd4il.amp npd4iestimate.amp
+acv show npd4iestimate.amp
+
+echo See how far off the linear estimate is from the actual response
+acv diff npd4i.amp npd4iestimate.amp  %
+
+echo acv decompose does this all in one step
+acv decompose 2.2 npd4i.amp  npd4idecomp.amp
+acv diff npd4iestimate.amp npd4idecomp.amp %
+
+echo Now divide the linear estimate from the actual response 
+acv divide npd4i.amp npd4iestimate.amp npd4iEstimateResidual.amp
+acv show npd4iEstimateResidual.amp
+
+echo Now reconstruct the response from the linear estimate and the residual
+acv compose npd4iestimate.amp npd4iEstimateResidual.amp npd4irecon.amp
+acv show npd4irecon.amp
+
+echo See how close the reconstruction is to the actual response
+acv diff npd4i.amp npd4irecon.amp %
+

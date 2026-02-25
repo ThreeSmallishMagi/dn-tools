@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -u 
+
+acv identity id.amp
+
+icat(){
+    for f in "$@";
+    do
+        #convert  $f -resize 1000x\> png:- |img2sixel -I
+        convert  "$f" -resize 1000x1000 sixel:-
+    done
+}
+
+run_test() {
+    local func="$1" ; shift
+    local success_test="$1" ; shift
+    
+    echo  "--- Test $func  $* ---"
+    
+    # Call the function with parameters and capture result
+    result=""
+    "$func" "$@"
+    local exit_code=$?
+    
+    local expr
+    expr=$(eval "echo \"$success_test\"")
+
+    # Check if success test passes
+    if (( $(bc -l <<< "$expr") )); then
+        echo "SUCCESS $expr"
+        return 0
+    else
+        echo "FAIL expr:$expr result:$result  exit:$exit_code"
+        return 1
+    fi
+}
+
+
+test_shuffle() {
+    local method="$1"
+    local size="$2"
+    rm -f cb10.jpg cb10.csv
+    chart --generate cb10.jpg --grid $size --shuffle "$method" && icat cb10.jpg 
+    chart --grid $size --shuffle "$method" cb10.jpg cb10.csv && acv show cb10.csv
+    result=$(acv error cb10.csv id.amp)
+    chart --grid $size  cb10.jpg cb10.csv && acv show cb10.csv
+}
+
+run_test test_shuffle '$result  < 2' hilbert 32
+run_test test_shuffle '$result  < 2' shuffle 32
+run_test test_shuffle '$result  < 2' blue_noise 32
+run_test test_shuffle '$result  < 2' split 32
+run_test test_shuffle '$result  < 2' maximize_closest 32
+run_test test_shuffle '$result  < 2' gcd 32
+
+run_test test_shuffle '$result  < 2' hilbert 16
+run_test test_shuffle '$result  < 2' shuffle 16
+run_test test_shuffle '$result  < 2' blue_noise 16
+run_test test_shuffle '$result  < 2' split 16
+run_test test_shuffle '$result  < 2' maximize_closest 16
+run_test test_shuffle '$result  < 2' gcd 16
+
+#run_test test_shuffle '$result  < 2' hilbert 10
+run_test test_shuffle '$result  < 2' shuffle 10
+run_test test_shuffle '$result  < 2' blue_noise 10
+run_test test_shuffle '$result  < 2' split 10
+run_test test_shuffle '$result  < 2' maximize_closest 10
+run_test test_shuffle '$result  < 2' gcd 10

@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Default to t.csv if no argument provided
+filename=${1:-t.csv}
+
+gnuplot << EOF
+set terminal sixelgd size 1000,900 background rgb '#05042b'
+set output
+set datafile separator ","
+set key autotitle columnhead
+set style fill solid 1.0
+set boxwidth 1 relative
+set xlabel 'X' textcolor rgb 'white' font ',10'
+set ylabel 'Y' textcolor rgb 'white' font ',10'
+set border lw 1 lc rgb '#a0a0a0'
+set tics textcolor rgb '#e0e0e0' font ',8'
+set grid lw 1 lc rgb '#505050'
+set xrange [0:255]
+set yrange [0:255]
+set xtics 32
+set ytics 32
+set mxtics 1
+set mytics 1
+plot x lc rgb '#505050' lw 1 notitle, \
+    '$filename' using 'x':'y' with points pt 7 ps 0.3  notitle
+#    '$filename' using 'x':'y' with linespoints ls 1 notitle
+EOF
+#plot 'spread.csv' using 1:2 smooth freq with boxes lc rgb '#1f77b4' notitle

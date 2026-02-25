@@ -1,0 +1,4 @@
+imagemagick 8:6.9.11.60+dfsg-1.3ubuntu0.22.04.5
+gnuplot 5.4.2+dfsg2-2
+xterm 372-1ubuntu1
+ffmpeg 7:4.4.2-0ubuntu0.22.04.1

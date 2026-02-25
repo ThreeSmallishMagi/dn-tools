@@ -1,0 +1,32 @@
+#!/usr/bin/bash -v
+
+rm -f npd4i.amp npd4il.csv npd4ilinearresidual.csv npd4irecon.csv
+# Test dividing out a linear estimation of the lcd response
+# npd4i is the inverse of NewPaperDev4 correcion curve, so my best estimate of the lcd response curve
+acv inverse NewPapDev4.acv npd4i.amp
+acv show -q -w 40 npd4i.amp
+read
+
+# Assuming the curve is monotonic, find the central x range 5% away from the y extremes
+acv linear 0.05 npd4i.amp npd4il.csv
+acv show -q -w 40 npd4il.csv
+read
+
+# See how far off the linear estimate is from the actual response
+acv diff npd4i.amp npd4il.csv %
+read
+
+# Now divide the linear estimate from actual response 
+acv divide npd4i.amp npd4il.csv npd4ilinearresidual.csv
+acv show -q -w 40  npd4ilinearresidual.csv
+read
+
+# Now reconstruct the response from the linear estimate and the residual
+acv compose  npd4il.csv npd4ilinearresidual.csv  npd4irecon.csv
+acv show  -q -w 40 npd4irecon.csv
+read
+
+# See how close the reconstruction is to the actual response
+acv diff -q -w 40 npd4i.amp npd4irecon.csv %
+
+rm -f npd4i.amp npd4il.csv npd4ilinearresidual.csv npd4irecon.csv

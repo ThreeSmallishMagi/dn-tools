@@ -1,0 +1,199 @@
+.TH ACV 1 "January 2026" "acv" "User Commands"
+.SH NAME
+acv \- manipulate Photoshop ACV curve and AMP pencil curve files
+.SH SYNOPSIS
+.B acv
+.I command
+.RI [ options ]
+.I args ...
+.PP
+Common patterns:
+.PP
+.B acv show
+.RB [ \-w " width" ]
+.I curve
+.RI [ reference ]
+.PP
+.B acv
+.I transform
+.RB [ \-s ]
+.RB [ \-p ]
+.RB [ \-q ]
+.I ...
+.RI [ output ]
+.SH DESCRIPTION
+.B acv
+is a command-line utility (single Python script) for reading, inspecting, and transforming
+Photoshop tonal curves. It supports Photoshop Curves preset files
+.RB ( .acv ),
+Photoshop pencil-curve files
+.RB ( .amp ),
+and a CSV interchange format
+.RB ( .csv )
+for real-valued workflows.
+.PP
+Input format is inferred from filename extension:
+.RB .amp ,
+.RB .acv ,
+otherwise CSV.
+.PP
+Special filenames:
+.TP
+.B \-
+Read CSV from stdin or write CSV to stdout.
+.TP
+.B %
+As an output filename, display the curve instead of writing a file.
+.PP
+If an output argument is omitted for non-display commands, acv chooses a default:
+.B %
+when stdout is a TTY (interactive), otherwise
+.B \-
+for pipeline-friendly stdout output.
+.SH OPTIONS
+.TP
+.BR \-s ", " \-\-select
+Reduce the result curve to (up to) 16 control points using the script's greedy
+selection method (Photoshop's ACV limit). Note: writing
+.B .acv
+also samples to 16 points regardless of this flag.
+.TP
+.BR \-p ", " \-\-preserve
+Preserve x-values from the first input curve when producing an output curve.
+This is useful when the first input has a specific x-grid (e.g., measured or sparse points)
+and you want the output to keep those x locations rather than a filled 0..255 grid.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress debug output (toggles the script's DEBUG printing).
+.TP
+.BR \-w ", " \-\-width " " IwidthR
+Set the terminal plot width (used by
+.BR show ).
+Height is derived as approximately one third of width.
+.SH COMMANDS
+.TP
+.B show
+.RI " <curve> " [ <reference> ]
+Display a terminal plot of channel 0. If a reference is provided, its filled curve
+is used as the background.
+.TP
+.B identity
+.RI " <output>"
+Write an identity curve.
+.TP
+.B offset
+.RI " <offset> <input> " [ <output> ]
+Add a constant offset to output values.
+.TP
+.B min
+.RI " <new x=0 value> <input> " [ <output> ]
+Shift so the curve's x=0 output becomes the given value.
+.TP
+.B max
+.RI " <new x=255 value> <input> " [ <output> ]
+Change contrast by scaling outputs so that input 255 maps to the given value,
+while leaving input 0 unchanged.
+.TP
+.B contrast
+.RI " <factor> <input> " [ <output> ]
+Contrast pivot at 128:
+.IR y' " = 128 + factor*(y-128)."
+.TP
+.B gamma
+.RI " <gamma> <input> " [ <output> ]
+Gamma applied to the filled mapping:
+.IR y' " = 255*(y/255)^gamma."
+.TP
+.B linear
+.RI " <error> <input> " [ <output_model> ]
+Fit a straight line to curve points that are at least
+.I error
+away from 0 and 255 (near the ends), and output the fitted model curve.
+.TP
+.B compose
+.RI " <curve1> <curve2> " [ <output> ]
+Compose two curves (apply one after the other). Returns
+.IR curve2 " \[smalldot] " curve1
+(i.e.,
+.IR curve2 " \[ring] " curve1 ,
+curve2 after curve1).
+.TP
+.B diff
+.RI " <curve1> <curve2> " [ <output> ]
+Calculate
+.IR 128 " + " curve1 " - " curve2 .
+.TP
+.B error
+.RI " <curve1> <curve2>"
+Print the maximum absolute difference between two curves over channels and x=0..255.
+(Output is a number, not a curve.)
+.TP
+.B at
+.RI " <x> <curve>"
+Print the output value for a given input x (channel 0).
+.TP
+.B divide
+.RI " <original> <divider> " [ <output residual> ]
+Divide original by divider by composing with inverse(divider) so that:
+.IR compose(divider, residual) " == " original .
+Equivalently:
+.IR residual " = divider^{-1} \[smalldot] original ."
+.TP
+.B decompose
+.RI " <gamma> <input> " [ <output_model> ]
+Model input as a gamma curve (usually 2.2) composed with a linear curve:
+.IR model " = g \[smalldot] linear ."
+(Typically used to approximate an input curve with two simpler components.)
+.TP
+.B adjust
+.RI " <curve1> <curve2> " [ <output> ]
+Combine two curves by adding curve2's deviation from identity to curve1.
+.TP
+.B inverse
+.RI " <input> " [ <output> ]
+Invert a curve by flipping it about the line y=x.
+.TP
+.B smooth
+.RI " <points> <input> " [ <output> ]
+Smooth a curve by fitting a spline with the given number of points.
+.TP
+.B average
+.RI " <span> <input> " [ <output> ]
+Smooth a curve by averaging points within
+.I span
+of x.
+.SH FILE FORMATS
+.TP
+.B .acv
+Binary control-point format. Output values are clamped to 0..255 when writing.
+When writing, the curve is sampled down to 16 points (Photoshop-friendly).
+.TP
+.B .amp
+Binary 256-byte mapping per curve (one byte per input level). Multiple curves may be concatenated.
+.TP
+.B .csv
+Text format with header:
+.BR curve,x,y .
+For predictable reading, rows should be grouped by curve index.
+CSV output is not clipped.
+.SH EXAMPLES
+.nf
+# Display
+acv show measured.csv reference.acv
+acv show -w 180 measured.csv
+
+# Transform with explicit output
+acv gamma 2.2 input.acv output.acv
+acv offset 10 input.csv output.csv
+
+# Transform with default output (TTY -> % display; non-TTY -> stdout CSV)
+acv gamma 2.2 input.csv
+
+# Preserve x-grid from the first input
+acv compose -p sparse.csv correction.acv out.csv
+
+# Pipeline
+cat measured.csv | acv smooth 12 - - > smoothed.csv
+.fi
+.SH SEE ALSO
+.BR chart (1)

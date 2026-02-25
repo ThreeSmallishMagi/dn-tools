@@ -1,0 +1,30 @@
+#!/usr/bin/bash
+# Linearize a scanned image of a chart
+# 
+shuffle_method="blue_noise"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <input_image> [shuffle_method]" >&2
+    echo "  shuffle_method defaults to 'blue_noise'" >&2
+    exit 1
+fi
+scannedImage=$1
+if [ $# -eq 2 ]; then
+    shuffle_method=$2
+fi
+
+basename="$(basename "${scannedImage%.*}")"
+csvOutput="${basename}.csv"
+varianceImg="${basename}-var.jpg"
+variance="${basename}-var.csv"
+inverseOutput="${basename}i.csv"
+inverseAcvOutput="${basename}i.acv"
+rm -f $csvOutput $variance $varianceImg debug.jpg
+chart --grid 32 --debug debug.jpg --shuffle $shuffle_method $scannedImage $csvOutput
+#chart --grid 32 --debug debug.jpg --variance $varianceImg --shuffle $shuffle_method $scannedImage $csvOutput
+#chart --grid 32 --shuffle blue_noise $varianceImg $variance
+rm -f $inverseOutput
+acv average 4 $csvOutput - |acv min -1 - - |acv max 258 - - |acv inverse - -|acv average 1 - - |acv average 1 - $inverseOutput
+rm -f $inverseAcvOutput
+acv offset -s 0 $inverseOutput $inverseAcvOutput
+acv show -w 40 $inverseOutput
+echo "Correction curve for $scannedImage is in $inverseAcvOutput. Unprocessed response in $csvOutput"

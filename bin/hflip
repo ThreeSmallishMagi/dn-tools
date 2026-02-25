@@ -1,0 +1,8 @@
+#!/bin/bash
+# flip a curve along the line x=128
+# can be used  the same way as acv  e.g.
+# hflip input.acv output.amp
+# hflip input.acv | acv show -
+# or just
+# hflip input.acv 
+acv inverse -q  "$1" | acv contrast  -q -1 - |acv inverse  -q  - "${@:2}"

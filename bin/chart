@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""
+NxN grayscale ramp chart generator + reader.
+
+Modes:
+1) Generate a printable NxN ramp chart (8-bit grayscale image).
+2) Read a photographed/scan grayscale NxN ramp grid and emit CSV points.
+
+Output CSV columns: channel,x,y
+- channel is always 0
+- x is the intended (printed) ramp level: 0..255 across 100 patches (row-major)
+- y is the measured level, normalized so the darkest measured patch is 0 and the lightest is 255
+
+Dependencies: opencv-python, numpy
+"""
+
+from __future__ import annotations
+from collections import defaultdict
+from math import gcd, log2
+
+import argparse
+import os
+import csv
+import sys
+import random
+
+import cv2
+import numpy as np
+
+def dbg(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def bit_reverse(x,width=8):
+    result = 0
+    for _ in range(width):
+        result = (result << 1) | (x & 1)
+        x >>= 1
+    return result
+
+def closest_1d(l,target,candidate, dist):
+    r= min(abs(int(l[candidate]) - int(l[y]))
+               for y in range(max(0, target-dist), min(target, len(l))) if y != target)
+    return r
+
+def neighborhood_indices(target, dist, grid_size):
+    tr, tc = divmod(target, grid_size)
+    r0 = max(0, tr - dist)
+    r1 = min(grid_size, tr + dist + 1)
+    c0 = max(0, tc - dist)
+    c1 = min(grid_size, tc + dist + 1)
+
+    rows = np.arange(r0, r1)
+    cols = np.arange(c0, c1)
+    rr, cc = np.meshgrid(rows, cols, indexing="ij")
+    idx = (rr * grid_size + cc).ravel()
+    return idx[idx != target]
+
+def placement_score(arr, pos, value, dist, grid_size, use_min=True):
+    nidx = neighborhood_indices(pos, dist, grid_size)
+    if nidx.size == 0:
+        return 0.0
+    d = np.abs(value - arr[nidx])
+    return float(d.min() if use_min else d.sum())
+
+def best_swap(arr, pos, candidate_positions, dist, grid_size, use_min=True):
+    """Return (best_pos, best_score_gain)."""
+    arr = np.asarray(arr)
+    base = placement_score(arr, pos, arr[pos], dist, grid_size, use_min)
+
+    best_j = pos
+    best_gain = 0.0
+
+    for j in candidate_positions:
+        if j == pos:
+            continue
+
+        # score both endpoints before and after
+        before = (placement_score(arr, pos, arr[pos], dist, grid_size, use_min) +
+                  placement_score(arr, j,   arr[j],   dist, grid_size, use_min))
+        after  = (placement_score(arr, pos, arr[j],   dist, grid_size, use_min) +
+                  placement_score(arr, j,   arr[pos], dist, grid_size, use_min))
+
+        gain = after - before
+        if gain > best_gain:
+            best_gain = gain
+            best_j = j
+
+    return best_j, best_gain
+
+def permute_maximize_closest(x, passes=2, dist=3, use_min=True):
+    arr = np.asarray(x).copy()
+    n = arr.size
+    grid_size = int(np.sqrt(n))
+    if grid_size * grid_size != n:
+        raise ValueError("len(x) must be a perfect square")
+
+    rng = np.random.default_rng(0)
+    rng.shuffle(arr)
+
+    order = np.arange(n)
+    rng.shuffle(order)
+
+    for _ in range(passes):
+        total_gain = 0.0
+        for pos in order:
+            cand = rng.choice(n, grid_size, replace=False)
+            j, gain = best_swap(arr, pos, cand, dist, grid_size, use_min=use_min)
+            if gain > 0:
+                arr[pos], arr[j] = arr[j], arr[pos]
+                total_gain += gain
+        #dbg(f"gain:{total_gain}")
+    return arr
+
+
+#---------------------
+
+def blue_noise(size: int) -> list[int]:
+    """
+    Return a length-(size*size) permutation p where p[pos] is the rank (0..N-1)
+    assigned to that grid cell. Adjacent ranks tend to be far apart spatially
+    (blue-noise / void-and-cluster style).
+
+    Efficient enough for size=32 in a few seconds on a typical desktop.
+    """
+    s = int(size)
+    if s <= 0:
+        return []
+    n = s * s
+    if n == 1:
+        return [0]
+
+    rng = np.random.default_rng(0)  # deterministic
+    half = n // 2
+
+    # Kernel radius scales mildly with size; tuned to work well at 32.
+    rad = max(2, s // 6)            # 32 -> 4
+    sigma = rad / 2.0               # 4 -> 2.0
+
+    # Precompute periodic Gaussian "influence" offsets (center weight = 0).
+    offsets = []
+    wsum = 0.0
+    for dr in range(-rad, rad + 1):
+        for dc in range(-rad, rad + 1):
+            if dr == 0 and dc == 0:
+                continue
+            w = np.exp(-(dr * dr + dc * dc) / (2.0 * sigma * sigma))
+            offsets.append((dr, dc, float(w)))
+            wsum += w
+    inv_wsum = 1.0 / wsum
+
+    def add_kernel(density: np.ndarray, r: int, c: int, delta: float) -> None:
+        """Add kernel to density map at (r,c) with given delta."""
+        d = delta * inv_wsum
+        for dr, dc, w in offsets:
+            density[(r + dr) % s, (c + dc) % s] += d * w
+
+    def argmax_on(density_flat: np.ndarray, mask_flat: np.ndarray) -> int:
+        """Return the index of the maximum value in density_flat where mask_flat is True."""
+        tmp = density_flat.copy()
+        tmp[~mask_flat] = -np.inf
+        return int(tmp.argmax())
+
+    def argmin_on(density_flat: np.ndarray, mask_flat: np.ndarray) -> int:
+        """Return the index of the minimum value in density_flat where mask_flat is True."""
+        tmp = density_flat.copy()
+        tmp[~mask_flat] = np.inf
+        return int(tmp.argmin())
+
+    # --- Initialize a random 50% binary pattern ---
+    b = np.zeros(n, dtype=np.uint8)
+    b[rng.choice(n, size=half, replace=False)] = 1
+    b2 = b.reshape(s, s)
+
+    # --- Build initial density map by accumulating kernels from all ones ---
+    density = np.zeros((s, s), dtype=np.float32)
+    ones = np.flatnonzero(b)
+    for idx in ones:
+        r, c = divmod(int(idx), s)
+        add_kernel(density, r, c, +1.0)
+
+    # --- Optimize the 50% pattern via "remove tightest cluster, add largest void" ---
+    # A few multiples of n is typically enough at these sizes.
+    opt_iters = 4 * n
+    for _ in range(opt_iters):
+        bf = b2.ravel()
+        df = density.ravel()
+
+        idx1 = argmax_on(df, bf.astype(bool))          # most clustered 1
+        # remove it
+        bf[idx1] = 0
+        r1, c1 = divmod(idx1, s)
+        add_kernel(density, r1, c1, -1.0)
+
+        # recompute after removal (density updated)
+        df = density.ravel()
+        idx0 = argmin_on(df, ~(bf.astype(bool)))       # largest void 0
+        # add it
+        bf[idx0] = 1
+        r0, c0 = divmod(idx0, s)
+        add_kernel(density, r0, c0, +1.0)
+
+        # small early-exit heuristic: if we "undo" ourselves repeatedly, stop
+        if idx0 == idx1:
+            break
+
+    # --- Convert optimized 50% pattern into a full ranking 0..n-1 ---
+    ranks = np.full(n, -1, dtype=np.int32)
+
+    # Lower half: repeatedly remove the most clustered 1; last removed gets rank 0.
+    b_rem = b2.copy()
+    d_rem = density.copy()
+    for rnk in range(half - 1, -1, -1):
+        bf = b_rem.ravel()
+        df = d_rem.ravel()
+        idx = argmax_on(df, bf.astype(bool))
+        ranks[idx] = rnk
+        bf[idx] = 0
+        rr, cc = divmod(idx, s)
+        add_kernel(d_rem, rr, cc, -1.0)
+
+    # Upper half: repeatedly add at the largest void 0; first added gets rank=half.
+    b_add = b2.copy()
+    d_add = density.copy()
+    for rnk in range(half, n):
+        bf = b_add.ravel()
+        df = d_add.ravel()
+        idx = argmin_on(df, ~(bf.astype(bool)))
+        ranks[idx] = rnk
+        bf[idx] = 1
+        rr, cc = divmod(idx, s)
+        add_kernel(d_add, rr, cc, +1.0)
+
+    # Safety check (should always hold)
+    # assert np.all(np.sort(ranks) == np.arange(n, dtype=np.int32))
+
+    return ranks.tolist()
+
+def permute_blue_noise(x):
+    side = int(len(x) ** 0.5)
+    order = blue_noise(side)
+    return [x[i] for i in order]
+
+#---------------------
+def hilbert_indices(n: int):
+    """
+    Yield indices (i) into a row-major 1D list representing an n×n grid,
+    in Hilbert curve order.
+
+    Constraints:
+      - n must be a power of two (1,2,4,8,...). Hilbert curves are naturally
+        defined on 2^k grids.
+
+    Usage:
+      for idx in hilbert_indices(n):
+          val = a[idx]   # where a is length n*n, row-major
+    """
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError("n must be a positive power of two")
+
+    def rot(s, x, y, rx, ry):
+        # Rotate/flip a quadrant appropriately.
+        if ry == 0:
+            if rx == 1:
+                x = s - 1 - x
+                y = s - 1 - y
+            x, y = y, x
+        return x, y
+
+    def d2xy(s, d):
+        # Convert Hilbert distance d to (x,y) on an s×s grid (s is power of two).
+        x = y = 0
+        t = d
+        step = 1
+        while step < s:
+            rx = (t >> 1) & 1
+            ry = (t ^ rx) & 1
+            x, y = rot(step, x, y, rx, ry)
+            x += step * rx
+            y += step * ry
+            t >>= 2
+            step <<= 1
+        return x, y
+
+    total = n * n
+    for d in range(total):
+        x, y = d2xy(n, d)
+        yield y * n + x  # row-major index
+
+
+def hilbert_iter(a, n: int):
+    """ Yield values from row-major 1D list `a` (length n*n) in Hilbert order. """
+    if len(a) != n * n:
+        raise ValueError("len(a) must be n*n")
+    for idx in hilbert_indices(n):
+        yield a[idx]
+
+def permute_hilbert(x):
+    """Permute using a bit reversal along a Hilbert curve."""
+    side = int(len(x) ** 0.5)
+    bits = int(log2(len(x)))
+    brorder = [bit_reverse(i, bits) for i in range(len(x))]
+    horder = [i for i in hilbert_indices(side)]
+    hinverse = [0] * len(horder)
+    for pos, idx in enumerate(horder):
+        hinverse[idx] = pos
+    order = [brorder[i] for i in hinverse]
+    return [x[i] for i in order]
+#---------------------
+
+def tf():
+    return random.choice([True, False])
+
+def split_image(w, h, pixels):
+    """Split image along longest dimension: alternating pixels into two subimages."""
+    if w > h - random.randint(0,1):
+        # Split by columns:
+        left =  [pixels[y*w + x] for y in range(h) for x in range(0, w, 2)]
+        right = [pixels[y*w + x] for y in range(h) for x in range(1, w, 2)]
+        for i in range(min(len(left),len(right))):
+            if tf():
+                left[i], right[i] = right[i], left[i]
+        return ['c', (len(left)//h, h, left), (len(right)//h, h, right)]
+    else:
+        # Split by rows:
+        top =    [pixels[y*w + x] for y in range(0, h, 2) for x in range(w)]
+        bottom = [pixels[y*w + x] for y in range(1, h, 2) for x in range(w)]
+        for i in range(min(len(top),len(bottom))):
+            if tf():
+                top[i], bottom[i] = bottom[i], top[i]
+        return ['r', (w, len(top)//w, top), (w, len(bottom)//w, bottom)]
+
+def recursive_split(w, h, pixels):
+    """Recursively split image until one dimension is 1. Returns list of split images."""
+    if w == 1 or h == 1:
+        return [(w, h, pixels)]
+
+    axis, left, right = split_image(w, h, pixels)
+    return [axis, recursive_split(*left), recursive_split(*right)]
+
+def join_images(split_structure):
+    """Join a splitting structure back into a single image."""
+    if len(split_structure) == 1:
+        return split_structure[0]
+
+    axis,left,right = split_structure
+    w1, h1, p1 = join_images(left)
+    w2, h2, p2 = join_images(right)
+
+    if axis == 'c':
+        # Join horizontally
+        new_w = w1 + w2
+        new_pixels = []
+        for y in range(h1):
+            for x in range(w1):
+                new_pixels.append(p1[y * w1 + x])
+            for x in range(w2):
+                new_pixels.append(p2[y * w2 + x])
+        return (new_w, h1, new_pixels)
+    else:
+        # Join vertically
+        new_h = h1 + h2
+        new_pixels = p1 + p2
+        return (w1, new_h, new_pixels)
+
+def permute_split(x):
+
+    side = int(len(x) ** 0.5)
+    jx=join_images(recursive_split(side,side, x))
+    #print(f"jx:{jx}")
+    return jx[2]
+
+def test_permute_split():
+    t1=(3,3,[1,2,3,4,5,6,7,8,9])
+    s=split_image(t1[0],t1[1],t1[2])
+    print(f"t1:{t1} s:{s}")
+
+    t1=(3,3,[2,3,4,5,6,7,8,9,10])
+    s=split_image(t1[0],t1[1],t1[2])
+    print(f"t2:{t1} s:{s}")
+
+    t1=(4,4,[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+    s=split_image(t1[0],t1[1],t1[2])
+    print(f"t3:{t1} s:{s}")
+
+    t1=(3,4,[1,2,3,4,5,6,7,8,9,10,11,12])
+    s=split_image(t1[0],t1[1],t1[2])
+    print(f"t4:{t1} s:{s}")
+
+    t1=(3,3,[1,2,3,4,5,6,7,8,9])
+    s=recursive_split(t1[0],t1[1],t1[2])
+    print(f"t5:{t1} s:{s}")
+
+    j1=join_images(s)
+    print(f"j1:{j1}")
+    j1=join_images(recursive_split(8,8, [x for x in range(8*8)]))
+    print(f"j1:{j1}")
+#---------------------
+
+
+def permute_shuffle(x):
+    result = x.copy()
+    random.shuffle(result)
+    return result
+#---------------------
+
+
+def best_stride_maximin_manhattan(
+    n: int,
+    *,
+    torus: bool = False,
+    include_wrap: bool = True,
+) -> tuple[int, dict]:
+    """
+    Choose a stride s (1 <= s < L=n*n, gcd(s,L)=1) that maximizes the minimum
+    Manhattan distance between consecutive visited cells when iterating
+        idx <- (idx + s) mod L
+    with idx mapped to (x=idx%n, y=idx//n).
+
+    torus=False: standard Manhattan on the grid coordinates.
+    torus=True : toroidal (Lee) distance: dx=min(|dx|, n-|dx|), same for dy.
+
+    include_wrap=True includes the final step returning to the start (L moves);
+    otherwise considers only the first L-1 moves.
+    Returns (best_s, stats_dict).
+    """
+    if n <= 1:
+        raise ValueError("n must be >= 2")
+    L = n * n
+    moves = L if include_wrap else (L - 1)
+
+    def step_dist(a: int, b: int) -> int:
+        ax, ay = a % n, a // n
+        bx, by = b % n, b // n
+        dx = abs(bx - ax)
+        dy = abs(by - ay)
+        if torus:
+            dx = min(dx, n - dx)
+            dy = min(dy, n - dy)
+        return dx + dy
+
+    best_s = None
+    best_key = None
+    best_stats = None
+
+    for s in range(1, L):
+        if gcd(s, L) != 1:
+            continue
+
+        idx = 0
+        dmin = 10**9
+        dsum = 0
+
+        for _ in range(moves):
+            nxt = (idx + s) % L
+            d = step_dist(idx, nxt)
+            if d < dmin:
+                dmin = d
+                # Early exit: if already worse than current best min, stop.
+                if best_key is not None and dmin < best_key[0]:
+                    break
+            dsum += d
+            idx = nxt
+        else:
+            davg = dsum / moves
+            key = (davg, dmin,  -s)  # maximize min, then average; tie -> smaller s
+            if best_key is None or key > best_key:
+                best_key = key
+                best_s = s
+                best_stats = {"L": L, "min_dist": dmin, "avg_dist": davg, "torus": torus}
+
+    assert best_s is not None
+    return best_s, best_stats
+
+def permute_gcd(x):
+    side = int(len(x) ** 0.5)
+    s, stats = best_stride_maximin_manhattan(side)
+    dbg(f"permute_gcd: s:{s} stats:{stats}")
+    return [x[(i*s)%len(x)] for i in range(len(x))]
+
+#---------------------
+def permute(x,method='blue_noise'):
+    random.seed(0)
+    np.random.seed(0)
+    if method == 'none':
+        return x
+    elif method == 'blue_noise':
+        return permute_blue_noise(x)
+    elif method == 'hilbert':
+        return permute_hilbert(x)
+    elif method == 'split':
+        return permute_split(x)
+    elif method == 'shuffle':
+        return permute_shuffle(x)
+    elif method == 'maximize_closest':
+        return permute_maximize_closest(x)
+    elif method == 'gcd':
+        return permute_gcd(x)
+    else:
+        raise ValueError(f"Unknown permutation method: {method}")
+#---------------------
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Return 4 points ordered as (tl, tr, br, bl)."""
+    pts = pts.reshape(4, 2).astype(np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).reshape(-1)
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(d)]
+    bl = pts[np.argmax(d)]
+    return np.stack([tl, tr, br, bl], axis=0)
+
+
+def find_grid_quad(gray: np.ndarray) -> np.ndarray | None:
+    """Try to find the outer grid border as a 4-point contour; return 4 ordered points or None."""
+
+    def try_find_quad(img, label=""):
+        g = cv2.GaussianBlur(img, (5, 5), 0)
+        edges = cv2.Canny(g, 50, 150)
+        edges = cv2.dilate(edges, None, iterations=1)
+
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:10]
+        #dbg(f"{label}: Found {len(cnts)} contours")
+
+        for c in cnts:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            area = cv2.contourArea(approx)
+            area_ratio = area / img.size
+            #dbg(f"{label}: {len(approx)} points, ratio={area_ratio:.3f}")
+
+            if len(approx) == 4 and area_ratio > 0.10:
+                return order_points(approx)
+        return None
+
+    gmin, gmax = np.min(gray), np.max(gray)
+    dbg(f"Image range: {gmin} to {gmax}")
+    quad = try_find_quad(gray -gmin, "ORIGINAL")
+    if quad is not None:
+        return quad
+
+    return try_find_quad(gmax - gray - gmin, "INVERTED")
+
+def warp_to_square(gray: np.ndarray, quad: np.ndarray | None, size: int) -> np.ndarray:
+    """Perspective-warp to a square canvas of given size; if quad is None, just resize."""
+    if quad is None:
+        return cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
+
+    dst = np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], np.float32)
+    M = cv2.getPerspectiveTransform(quad, dst)
+    return cv2.warpPerspective(gray, M, (size, size), flags=cv2.INTER_CUBIC)
+
+
+def measure_patches(warped: np.ndarray, grid: int = 10, roi_frac: float = 2 / 3) -> np.ndarray:
+    """Return 100 medians (row-major) measured from a centered square ROI in each cell."""
+    h, w = warped.shape
+    cw, ch = w / grid, h / grid
+    roi_side = int(round(min(cw, ch) * roi_frac))
+    roi_side = max(1, roi_side)
+    half = roi_side // 2
+
+    medians = []
+    for r in range(grid):
+        for c in range(grid):
+            cx = int(round((c + 0.5) * cw))
+            cy = int(round((r + 0.5) * ch))
+            x0, x1 = max(0, cx - half), min(w, cx - half + roi_side)
+            y0, y1 = max(0, cy - half), min(h, cy - half + roi_side)
+            roi = warped[y0:y1, x0:x1]
+            median_val = float(np.median(roi))
+            medians.append(median_val)
+            warped[y0:y1, x0:x1] = 0   # Replace ROI with median value
+            warped[y0+1:y1-1, x0+1:x1-1] = median_val   # Replace ROI with median value
+    return np.array(medians, dtype=np.float32)
+
+
+def normalize_to_0_255(vals: np.ndarray) -> np.ndarray:
+    vmin = float(vals.min())
+    vmax = float(vals.max())
+    if vmax <= vmin:
+        return np.zeros_like(vals, dtype=np.uint8)
+    out = (vals - vmin) * (255.0 / (vmax - vmin))
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def write_chart(data: list[tuple[int, int]], out_path: str, cell: int, margin: int, grid: int, line: int, border: int, label: str = "") -> None:
+    """
+    Write a chart image from data list.
+    data: list of (intended_level, actual_level) tuples
+    """
+    side = grid * cell + 2 * margin
+    img = np.full((side, side), 255, dtype=np.uint8)
+
+    # Inner square where the grid lives
+    x0, y0 = margin, margin
+    x1, y1 = margin + grid * cell, margin + grid * cell
+
+    # Outer border (black)
+    cv2.rectangle(img, (x0, y0), (x1, y1), 0, thickness=border)
+
+    # Extract levels from data
+    levels = np.array([y for x, y in data], dtype=np.uint8)
+
+    k = 0
+    for r in range(grid):
+        for c in range(grid):
+            px0 = x0 + c * cell
+            py0 = y0 + r * cell
+            px1 = px0 + cell
+            py1 = py0 + cell
+
+            # Leave a little breathing room so grid lines don't contaminate the ROI
+            pad = max(1, line // 2 + 2)
+            cv2.rectangle(
+                img,
+                (px0 + pad, py0 + pad),
+                (px1 - pad, py1 - pad),
+                int(levels[k]),
+                thickness=-1,
+            )
+            k += 1
+
+    # Internal grid lines (black)
+    if line > 0:
+        for i in range(1, grid):
+            x = x0 + i * cell
+            y = y0 + i * cell
+            cv2.line(img, (x, y0), (x, y1), 0, thickness=line)
+            cv2.line(img, (x0, y), (x1, y), 0, thickness=line)
+
+    # Write label at the bottom
+    if not label:
+        label = f"chart from data, file={out_path}"
+    cv2.putText(img, label, (10, side - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 0, 1)
+
+    if out_path.endswith(".tif"):
+        dbg(f"Converting data to 16-bit")
+        img = (img.astype(np.float32) * 257).astype(np.uint16)  # Scale 8-bit to 16-bit
+
+    if not cv2.imwrite(out_path, img):
+        raise RuntimeError(f"Failed to write chart image: {out_path}")
+    dbg(f"Saved chart image: {out_path}")
+
+
+def generate_chart(out_path: str, cell: int, margin: int, grid: int, line: int, border: int, invert: bool, shuffle: str) -> None:
+    """
+    Create a printable grid x grid ramp chart:
+    - Outer thick black border (easy quad detection)
+    - Thin internal grid lines
+    - Patches filled with x levels 0..255 (row-major)
+    """
+    # Patch levels
+    levels = np.rint(np.linspace(0, 255, grid * grid)).astype(np.uint8)
+    if invert:
+        levels = (255 - levels).astype(np.uint8)
+
+    shuffled = permute(levels, shuffle)
+
+    # Create data as (intended, actual) pairs
+    data = [(int(levels[i]), int(shuffled[i])) for i in range(len(levels))]
+
+    label = f"shuffle={shuffle} invert={invert} grid={grid} cell={cell} border={border} file={out_path}"
+    write_chart(data, out_path, cell, margin, grid, line, border, label)
+
+def write_csv(filename: str, curve: list[tuple[int, int]]) -> None:
+    """Write (x, y) data pairs to CSV file in the format used by acv."""
+    with open(filename, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["channel", "x", "y"])
+        for x, y in curve:
+            w.writerow([0, x, y])
+
+def read_chart(image_path: str, out_csv: str, grid: int, size: int, shuffle: str, debug: str, border: int, cell: int ) -> list[tuple[int, int]]:
+    """Read and analyze a ramp chart from an image."""
+
+    gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        dbg(f"Error: cannot read image: {image_path}")
+        return []
+
+    quad = find_grid_quad(gray)
+    if quad is None:
+        dbg("Warning: could not detect outer grid border; using full image.")
+
+    warped = warp_to_square(gray, quad, size)
+
+    # Crop out half the margin
+    chart_side = grid * cell +  border
+    margin_pixels = int(border/2 *size/chart_side )
+    warped = warped[margin_pixels:-margin_pixels, margin_pixels:-margin_pixels]
+
+
+    med = measure_patches(warped, grid=grid, roi_frac=2 / 3)
+
+    if debug:
+        cv2.imwrite(debug, warped)
+        dbg(f"Debug image written to: {debug}")
+
+    # y: normalize so darkest measured = 0 and lightest measured = 255
+    y = normalize_to_0_255(med)
+
+    # Enforce increasing direction assuming chart is darkest->lightest row-major.
+    #if shuffle == "none" and med[0] > med[-1]:
+    #    y = (255 - y).astype(np.uint8)
+
+    # x: intended ramp levels 0..255 across 100 patches (row-major)
+    x = np.rint(np.linspace(0, 255, grid * grid)).astype(np.uint8)
+    x = permute(x, shuffle)
+
+    data = [(int(xi), int(yi)) for xi, yi in zip(x, y)]
+    write_csv(out_csv, data)
+
+    dbg(f"Read {len(x)} patches from {image_path} and wrote to {out_csv}")
+    return data
+
+def generate_variance_chart( data: list[tuple[int, int]], out_path: str, grid: int) -> None:
+    """
+     Some variance in chart values is due to enlarger light falloff. With a 32x32 chart and
+     shuffled patches there are 4 samples per level spread across the image. The average
+     of those levels gives a better estimate of the true level, and variance of a patch
+     from the best estimate is a sample of the error due to light falloff.
+     This function writes a chart where each patch is the difference between the measured
+     value and the best estimate value.
+    """
+    #`dbg(f"Generating variance chart from {(data)} measurements")
+    # Group data by intended level (x value)
+    level_groups = defaultdict(list)
+    for x, y in data:
+        level_groups[x//2].append(y)
+    #dbg(f"Level groups: {level_groups}")
+
+    # Calculate best estimates using leave_one_out for each group
+    variance_data = []
+    for x, y in data:
+        group = level_groups[x//2]
+        if len(group) > 1 and y != 0 :
+            # Leave-one-out mean: exclude this specific measurement
+            leave_one_out_mean = (sum(group) - y) / (len(group) - 1)
+            variance = (y - leave_one_out_mean)
+            #dbg(f"variance {x} y:{y} m:{leave_one_out_mean} v:{variance:.0f}")
+        else:
+            # Single measurement: no variance to calculate
+            variance = 0
+
+        variance_level = int(np.clip(-variance + 128, 0, 255))
+        variance_data.append((x, variance_level))
+
+    # Write variance chart using write_chart
+    label = f"variance chart from {len(data)} measurements"
+    write_chart(variance_data, out_path, cell=40, margin=80, grid=grid, line=1, border=10, label=label)
+    csvfile = os.path.splitext(out_path)[0] + ".csv"
+    write_csv(csvfile, variance_data)
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    def usage(message: str):
+        print(__doc__)
+        ap.print_help()
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+    ap.error = usage
+    ap.add_argument("--generate", metavar="OUT_IMAGE", help="Generate a printable ramp chart image and exit")
+    ap.add_argument("--grid", type=int, default=32, help="Chart: size for a grid x grid chart (default 32)")
+    ap.add_argument("--invert-chart", action="store_true", help="Chart: invert patch levels ")
+    ap.add_argument("--shuffle", type=str, default='blue_noise', 
+                    help="Chart: shuffle methods: none, blue_noise, gcd, hilbert, split, shuffle, maximize_closest (default blue_noise)")
+
+    ap.add_argument("image", nargs="?", help="Input photo/scan containing the NxN ramp grid (reader mode)")
+    ap.add_argument("out_csv", nargs="?", help="Output CSV path (reader mode)")
+    ap.add_argument("--size", type=int, default=1000, help="Reader: warp canvas size (pixels), default 1000")
+    ap.add_argument("--debug", help="Reader: optional path to save the warped grayscale image")
+    ap.add_argument("--variance", type=str, default=None, help="Reader: optional path to save a variance chart")
+    ap.add_argument("--cell", type=int, default=40, help="Chart: cell size in pixels (default 40)")
+    ap.add_argument("--margin", type=int, default=80, help="Chart: outer margin in pixels (default 80)")
+    ap.add_argument("--line", type=int, default=1, help="Chart: internal grid line thickness (default 1)")
+    ap.add_argument("--border", type=int, default=10, help="Chart: outer border thickness (default 10)")
+    args = ap.parse_args( )
+
+
+    # Generator mode
+    if args.generate:
+        generate_chart(
+            out_path=args.generate,
+            cell=args.cell,
+            margin=args.margin,
+            grid=args.grid,
+            line=args.line,
+            border=args.border,
+            invert=args.invert_chart,
+            shuffle=args.shuffle,
+        )
+        return 0
+
+    # Reader mode
+    if not args.image or not args.out_csv:
+        ap.error("Reader mode requires: image out_csv (or use --generate OUT_IMAGE).")
+
+    data = read_chart(
+        image_path=args.image,
+        out_csv=args.out_csv,
+        grid=args.grid,
+        size=args.size,
+        shuffle=args.shuffle,
+        debug=args.debug,
+        border=args.border,
+        cell=args.cell,
+    )
+    if args.variance:
+        generate_variance_chart(data, args.variance, args.grid)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

@@ -1,0 +1,1 @@
+identify -format "FileName: %[filename]\nSize: %[w]x%[h]\nColorSpace: %[colorspace]\nBitDepth: %[depth]\nGamma: %[gamma]\n" $@

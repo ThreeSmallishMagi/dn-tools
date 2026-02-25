@@ -1,0 +1,189 @@
+.TH CHART 1 "January 2026" "chart" "User Commands"
+.SH NAME
+chart \- generate and read NxN grayscale ramp charts (for calibration)
+.SH SYNOPSIS
+.B chart
+.BR --generate " " OUT_IMAGE
+.RI [ options ]
+.PP
+.B chart
+.I IMAGE
+.I OUT_CSV
+.RI [ options ]
+.PP
+Default mode is selected by presence of
+.BR --generate :
+generation mode if present, otherwise reader mode.
+.SH DESCRIPTION
+.B chart
+is a command-line tool (Python script) that supports two workflows:
+.IP 1. 3
+Generate a printable
+.IR N x N
+grayscale ramp chart image (with a thick outer border and internal grid lines).
+.IP 2. 3
+Read a photographed/scanned chart image, detect/warp the chart grid, measure each patch,
+normalize measurements, and emit CSV suitable for curve fitting (e.g. with the companion
+.BR acv
+tool).
+.PP
+The generator can optionally permute (shuffle) the patch levels using several spatial
+permutations intended to reduce adjacency bias in capture/printing.
+.SH MODES
+.SS Generator mode
+Generator mode is enabled with
+.BR --generate .
+It writes an image with an outer black border, internal grid lines, and filled grayscale patches.
+.SS Reader mode
+Reader mode is enabled when
+.BR --generate
+is not provided. It reads an input image, attempts to detect the outer border quadrilateral,
+warps to a square canvas, measures per-cell median values, normalizes them to 0..255, and writes CSV.
+.SH OUTPUT
+.SS Reader CSV format
+The reader writes a CSV with header:
+.PP
+.nf
+channel,x,y
+.fi
+.PP
+Where:
+.IP \[bu] 3
+.B channel
+is always 0.
+.IP \[bu] 3
+.B x
+is the intended (printed) ramp value per patch (0..255), taking the selected
+.BR --shuffle
+method into account.
+.IP \[bu] 3
+.B y
+is the measured patch value normalized so the darkest measured patch maps to 0
+and the lightest maps to 255.
+.PP
+Notes:
+.IP \[bu] 3
+For correct interpretation,
+.BR --shuffle
+in reader mode must match the shuffle method used to generate/print the chart.
+.IP \[bu] 3
+The current implementation does not have a reader-side
+.BR --invert-chart
+flag; if you generated an inverted chart, you will need to invert the intended axis
+in a post-processing step.
+.SH OPTIONS
+.TP
+.BR --generate " " OUT_IMAGE
+Generate a chart image at
+.IR OUT_IMAGE
+and exit. The output format is inferred from the filename extension (e.g. .png, .jpg, .tif).
+If
+.IR OUT_IMAGE
+ends with
+.BR .tif ,
+the file is written as 16-bit (8-bit values scaled by 257).
+.TP
+.BR --grid " " N
+Chart/Reader grid size
+.IR N
+for an
+.IR N x N
+chart. Default: 16.
+.TP
+.BR --cell " " PX
+Generator: cell size in pixels (patch size). Default: 40.
+.TP
+.BR --margin " " PX
+Generator: outer margin in pixels (white area around grid). Default: 80.
+.TP
+.BR --line " " PX
+Generator: internal grid line thickness in pixels. Default: 1.
+.TP
+.BR --border " " PX
+Generator: outer border thickness in pixels (black). Default: 10.
+.TP
+.BR --invert-chart
+Generator: invert patch levels (0 <-> 255) before shuffling. Default: off.
+.TP
+.BR --shuffle " " METHOD
+Select the shuffle/permutation method. Default:
+.BR blue_noise .
+See
+.B SHUFFLE METHODS
+below.
+.TP
+.BR --size " " PX
+Reader: warped canvas size (pixels) used after perspective correction. Default: 1000.
+.TP
+.BR --debug " " PATH
+Reader: save the warped grayscale image to
+.IR PATH
+(for inspection/debug).
+.TP
+.BR --variance " " OUT_IMAGE
+Reader: after reading the chart, write a variance chart image to
+.IR OUT_IMAGE
+and a matching CSV alongside it.
+This is intended to visualize spatial falloff/illumination variance when multiple samples per level exist.
+.SH SHUFFLE METHODS
+These methods permute the association between patch location (row-major position)
+and patch value:
+.TP
+.B none
+No permutation; patches are filled in row-major 0..255 order.
+.TP
+.B blue_noise
+Deterministic blue-noise / void-and-cluster style ordering designed to make adjacent
+patches differ strongly in value on average.
+.TP
+.B hilbert
+Hilbert-curve based ordering.
+.TP
+.B split
+Recursive even/odd splitting style permutation.
+.TP
+.B shuffle
+Random shuffle (deterministic seed).
+.TP
+.B maximize_closest
+Iterative local swapping heuristic to maximize neighborhood value separation.
+.TP
+.B gcd
+Stride-based permutation using a stride chosen to maximize Manhattan-distance statistics on the grid.
+.SH NOTES
+.IP \[bu] 3
+Reader mode attempts to locate the outer chart border using edge detection and contour approximation.
+If it cannot find a suitable quadrilateral, it falls back to using the full image (resize-only).
+.IP \[bu] 3
+Per-patch measurement is a median over a centered ROI covering roughly 2/3 of the cell
+to reduce contamination from grid lines.
+.IP \[bu] 3
+Normalization is performed on measured medians so the darkest measured patch becomes 0 and
+the lightest becomes 255. This makes output robust to exposure differences, but it does not
+recover absolute reflectance/irradiance.
+.SH DEPENDENCIES
+.B chart
+requires:
+.IP \[bu] 3
+opencv-python (cv2)
+.IP \[bu] 3
+numpy
+.SH EXAMPLES
+.nf
+# Generate a 16x16 printable chart (PNG)
+chart --generate chart.png --grid 16 --cell 40 --margin 80 --border 10 --shuffle blue_noise
+
+# Generate a 32x32 chart (useful for multiple samples per level)
+chart --generate chart32.tif --grid 32 --cell 30 --margin 80 --border 10 --shuffle blue_noise
+
+# Read a photographed chart and write CSV
+chart photo.jpg measurements.csv --grid 16 --shuffle blue_noise
+
+# Read and also save a debug warped image
+chart photo.jpg measurements.csv --grid 16 --shuffle blue_noise --debug warped.png
+
+# Read and generate a variance visualization
+chart photo.jpg measurements.csv --grid 32 --shuffle blue_noise --variance variance.png
+.fi
+.SH SEE ALSO
+.BR acv (1)

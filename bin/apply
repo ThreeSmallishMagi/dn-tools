@@ -1,0 +1,28 @@
+#!/bin/bash
+# Apply Photoshop curve (.acv) to image using ffmpeg
+
+set -euo pipefail
+
+if [ $# -ne 3 ]; then
+    echo "Usage: $0 <curve.acv> <input_tif> <output_tif>" >&2
+    exit 1
+fi
+
+curve_file="$1"
+input_image="$2"
+output_image="$3"
+
+# Check if files exist
+if [ ! -f "$curve_file" ]; then
+    echo "Error: Curve file '$curve_file' not found" >&2
+    exit 1
+fi
+
+if [ ! -f "$input_image" ]; then
+    echo "Error: Input image '$input_image' not found" >&2
+    exit 1
+fi
+
+#ffmpeg  -i "$input_image" -vf "curves=psfile=$curve_file" -q:v 2 "$output_image"
+#ffmpeg  -i "$input_image" -vf "curves=psfile=$curve_file" -q:v 2 -pix_fmt rgb48le "$output_image"
+ffmpeg  -loglevel warning -i "$input_image" -vf "curves=psfile=$curve_file" -q:v 2 -pix_fmt gray16le "$output_image"

@@ -1,0 +1,28 @@
+#!/usr/bin/bash -v
+# Test dividing out an estimation of the lcd response
+# npd4i is the inverse of NewPaperDev4 correction curve, so my best estimate of the lcd response curve
+acv show -w 60 npd4i.amp
+read
+
+# Model the curve assuming the curve is made of a gamma 2.2 component and a linear component
+acv decompose 2.2 npd4i.amp npd4id.csv
+acv show -w 60 npd4id.csv
+read
+
+# See how far off the estimate is from the actual response
+acv diff -q -w 60 npd4i.amp npd4id.csv %
+read
+
+# Now divide the model from actual response 
+acv divide npd4i.csv npd4id.csv npd4ilinearresidual.csv
+acv show -w 60 npd4ilinearresidual.csv
+read
+
+# Now reconstruct the response from the linear estimate and the residual
+acv compose  npd4id.csv npd4ilinearresidual.csv  npd4irecon.csv
+acv show -w 60 npd4irecon.csv
+read
+
+# See how close the reconstruction is to the actual response
+acv diff -q -w 60 npd4i.amp npd4irecon.csv %
+

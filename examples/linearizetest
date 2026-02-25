@@ -1,0 +1,20 @@
+#!/bin/bash -x
+
+rm -f testchart.tif gamma045.acv testchart045.tif
+
+# create a chart, apply  a curve to it, read the chart and re-create the curve
+chart --grid 32 --generate testchart.tif
+read
+
+acv identity | acv gamma 0.4545 - gamma045.acv
+acv show -w 40 gamma045.acv
+read
+
+apply gamma045.acv testchart.tif testchart045.tif
+
+chart --grid 32 testchart045.tif testchart045.csv
+
+acv -w 60 show testchart045.csv gamma045.acv
+acv error testchart045.csv gamma045.acv
+
+rm -f testchart.tif gamma045.acv testchart045.tif

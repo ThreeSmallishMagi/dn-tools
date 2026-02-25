@@ -1,0 +1,35 @@
+#!/bin/bash -v
+
+rm -f weird.{csv,acv} c[0-9]*.{amp,csv} saw.csv testchart*.{tif,csv} gamma045.csv
+
+# Make a spiky curve. Points beyond 0 and 255 are not truncated
+acv identity |acv gamma -s 0.45 - gamma045.csv
+acv identity |acv contrast 4 - c4.csv
+# use the fact that amp files clamp to 0-255
+acv offset 384 c4.csv c41.amp
+acv offset 128 c4.csv c42.amp
+acv offset -128 c4.csv c43.amp
+acv offset -384 c4.csv c44.amp
+acv diff c41.amp c42.amp |acv diff c44.amp - |acv diff c43.amp - |acv offset -128 - |acv contrast 0.5 - saw.csv
+acv diff gamma045.csv saw.csv weird.csv
+acv identity  |acv contrast 0.5 - |acv adjust - weird.csv | acv offset -88.6 - |acv max 255 - weird.csv
+
+# how well can it be represented with a 16 point acv curve?
+acv offset -s 0 weird.csv weird.acv
+acv -w 40 show weird.csv weird.acv
+acv diff -w 40 weird.csv weird.acv
+acv error weird.csv weird.acv 
+read
+
+# create a chart, apply  a curve to it, read the chart and re-create the curve
+chart --grid 32 --generate testchart.tif
+apply weird.acv testchart.tif testchart-weird.tif
+
+# read the chart back in and re-create the curve
+chart --grid 32 testchart-weird.tif testchart-weird.csv
+
+# Compare the original and the re-created curve
+acv -w 60 show testchart-weird.csv weird.acv
+acv error testchart-weird.csv weird.acv
+
+rm -f weird.{csv,acv} c[0-9]*.{amp,csv} saw.csv testchart*.{tif,csv} gamma045.csv

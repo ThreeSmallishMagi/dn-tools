@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""
+Manipulate Photoshop ACV curve files and pencil curve AMP files.
+
+Options:
+  -s, --select    Choose best 16 points (Photoshop's limit)
+  -p, --preserve  Preserve x-values from first input
+
+File formats:
+  .acv   Photoshop curve files
+  .amp   8-bit pencil curves (256 bytes)
+  .csv   Real values with no clipping
+  '%'    Display curve on screen (can be omitted)
+  '-'    Read from stdin or write to stdout
+
+Usage:
+  acv offset <offset> <input> <output>
+            Add an offset to a curve’s output values.
+  acv max <new x=255 value> <input> <output>
+            Change the contrast of a curve. The parameter is the new output
+            value for an input of 255. Input 0's value will not change
+  acv min <new x=0 value> <input> <output>
+            Change the offset of a curve so that the x=0 has the given output.
+  acv contrast <factor> <input> <output>
+            Change the contrast of a curve pivoting around x=128.
+  acv gamma <gamma> <input> <output>
+            Apply a gamma adjustment to a curve.
+  acv linear <error> <input> <output_model>
+            Fit a straight line to curve points error away from 0/255.
+  acv compose <curve1> <curve2> <output>
+            Compose two curves (apply one after the other) Returns curve2 ∘ curve1.
+  acv diff <curve1> <curve2> <output>
+            Calculate 128 + curve1 - curve2.
+  acv error <curve1> <curve2>
+            print the max error between two curves ( output is not a curve )
+  acv at <x> <curve>
+            print the output value for a given input
+  acv divide <original> <divider> <output residual>
+            Divide original by divider by composing with inverse(divider)
+            so that compose(divider, result) == original
+            i.e.  r = d⁻¹ ∘ o   d ∘ r == o
+  acv decompose <gamma> <input> <output_model>
+            Model input as a gamma curve (usually 2.2) composed with a linear curve.
+            i.e. output = g22 ∘ linear
+  acv adjust <curve1> <curve2> <output>
+            Combine two curves by adding curve2's deviation from identity.
+  acv inverse <input> <output>
+            Invert a curve. Flip it about the line y=x.
+  acv smooth <points> <input> <output>
+            Smooth a curve by fitting a spline with <points>points.
+  acv average <span> <input> <output>
+            Smooth a curve by averaging points within <span> of x.
+  acv identity <output>
+            Output an identity curve.
+  acv show <curve> [<reference>]
+            Display curve and optional reference curve.
+
+"""
+#ACV File format:
+#  - 2 bytes: Version (1 or 4)
+#  - 2 bytes: Curve count (for version 4)
+#  Then per curve:
+#    - 2 bytes: Point count (2..19)
+#    - point_count * 4 bytes: Each point stored as two shorts: output then input.
+
+import atexit
+import os
+import sys
+import struct
+import shutil
+import traceback
+from contextlib import contextmanager
+
+try:
+    import readline
+    HAS_READLINE = True
+except ImportError:
+    HAS_READLINE = False
+
+DEBUG=True
+
+cols, rows = shutil.get_terminal_size()
+screen_width  = cols-5
+screen_height = min(rows-5 ,screen_width//2)
+#screen_width  = screen_height*4
+
+MAX_CONTROL_POINTS = 16
+
+# ---------- Utilities ----------
+
+def clamp(v): return max(0, min(255, int(round(v))))
+
+def dbg(*args, **kwargs):
+    """Print debug messages to stderr"""
+    if DEBUG:
+        print(*args, file=sys.stderr, **kwargs)
+
+# ---------- ACV File I/O ----------
+
+@contextmanager
+def open_file(filename, mode):
+    """Open file or return stdin/stdout for '-'"""
+    if filename == "-":
+        streams = {'r': sys.stdin, 'rb': sys.stdin.buffer, 'w': sys.stdout, 'wb': sys.stdout.buffer}
+        yield streams.get(mode, sys.stdout)
+    else:
+        with open(filename, mode) as f:
+            yield f
+
+def read_acv(filename):
+    """Read a Photoshop ACV file.
+       return data in curve format [ [(i1,o1),...], ... ] """
+    if not os.path.isfile(filename):
+        if os.path.isfile(filename + ".acv"):
+            filename = filename + ".acv"
+        else:
+            raise ValueError(f"ACV file not found: {filename}")
+    with open_file(filename, "rb") as f:
+        data = f.read()
+    offset = 0
+    if len(data) < 4:
+        raise ValueError("Invalid ACV file.")
+    version = struct.unpack_from(">H", data, offset)[0]
+    offset += 2
+    num_curves = struct.unpack_from(">H", data, offset)[0]
+    offset += 2
+    curves = []
+    for _ in range(num_curves):
+        if offset + 2 > len(data): break
+        point_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2
+        pts = []
+        for _ in range(point_count):
+            if offset + 4 > len(data): break
+            output_val, input_val = struct.unpack_from(">HH", data, offset)
+            offset += 4
+            pts.append((input_val, output_val))
+        curves.append(pts)
+    #if debug: print(f"read {curves} from {filename}")
+    if len(curves) == 0:
+        raise ValueError("No curves found in file.")
+    return version, curves
+
+def read_amp(filename):
+    """Read a Photoshop pencil curve .amp file.
+    The .amp file is expected to contain 256 bytes, one output value per input level.
+    return data in curve format [ [(i1,o1),...], ... ]
+    """
+    if not os.path.isfile(filename):
+        if os.path.isfile(filename + ".amp"):
+            filename = filename + ".amp"
+        else:
+            raise ValueError(f"AMP file not found: {filename}")
+    curves = []
+    with open_file(filename, "rb") as f:
+        data = f.read()
+    if len(data) < 256:
+        raise ValueError(f"AMP pencil curve must be 256 bytes, got {len(data)} bytes")
+    while len(data) >= 256:
+        # Each byte is the output for input 0..255
+        pts = [(i, data[i]) for i in range(256)]
+        curves.append(pts)
+        data = data[256:]
+    # assume version 4 for acv compatability
+    if len(data) > 0:
+        dbg(f"WARNING:Extra data in AMP file: {filename}. {len(data)} extra bytes")
+    return 4, curves
+
+def read_csv(filename):
+    """Read a CSV file containing curves.
+    The file is expected to contain a header line followed by lines of the form:
+        curve,x,y
+    where curve is the curve index, x is the input, and y is the output.
+    """
+    with open_file(filename, "r") as f:
+        lines = f.readlines()
+    curves, current_ix = [], None
+
+    for line in lines[1:]:  # Skip header
+        ix, input, output  = line.strip().split(",")
+
+        if current_ix != ix:
+            curves.append([])
+            current_ix = ix
+
+        curves[-1].append((float(input), float(output)))
+
+    return 4, curves
+
+
+def write_acv(curves, filename, version=4):
+    """Write curves to a Photoshop ACV file."""
+    if not filename[-4:].lower() == ".acv":
+        filename = filename + ".acv"
+    with open_file(filename, "wb") as f:
+        f.write(struct.pack(">H", version))
+        f.write(struct.pack(">H", len(curves)))
+        for curve in curves:
+            f.write(struct.pack(">H", len(curve)))
+            for input_val, output_val in curve:
+                f.write(struct.pack(">HH", clamp(output_val), clamp(input_val)))
+
+def write_amp(curves, filename):
+    """Write a 256-entry mapping (list of floats/ints) as a .amp pencil curve. """
+    with open_file(filename, "wb") as f:
+        for curve in curves:
+            if len(curve) < 256:
+                raise ValueError("Mapping must have at least 256 entries to write .amp")
+            map= [clamp(o) for i,o in curve]
+            f.write(bytes(map))
+
+def write_csv(curves, filename):
+    """Write curves to a CSV file."""
+    with open_file(filename, "w") as f:
+        f.write("curve,x,y\n")
+        for ix,curve in enumerate(curves):
+            for input_val, output_val in curve:
+                f.write(f"{ix},{input_val},{output_val}\n")
+
+history = {}
+
+def read_curve(filename):
+    """Read a single curve from a file.
+    If the filename ends with .amp, it is interpreted as a Photoshop pencil curve.
+    Otherwise it is read as a standard ACV file.
+    """
+    if filename in history:
+        return history[filename]
+    if filename.lower().endswith(".amp"):
+        _,curves =  read_amp(filename)
+    elif filename.lower().endswith(".acv"):
+        _, curves = read_acv(filename)
+    else:
+        _, curves = read_csv(filename)
+    if not curves:
+        raise ValueError("No curves found in file.")
+    return curves
+
+
+def write_curve(curves, filename, version=4):
+    """Write curves to either ACV or AMP depending on extension."""
+    try:
+        history[filename] = curves
+        if filename[0] == '$':
+            return
+        elif filename.lower().endswith(".amp"):
+            mappings = fill_curve(curves)
+            write_amp(mappings, filename)
+        elif filename.lower().endswith(".acv"):
+            write_acv(curves, filename, version)
+        else:
+            write_csv(curves, filename)
+        if filename[0] != '-':
+            dbg(f"Saved curves to {filename}")
+    except BrokenPipeError:
+        sys.exit(0)
+
+# ---------- Display ----------
+
+
+# Mapping from (row, col) within a 2×4 cell to the Braille dot bit
+_DOT_MAP = {
+    (0, 0): 0,  (1, 0): 1,  (2, 0): 2,  (3, 0): 6,
+    (0, 1): 3,  (1, 1): 4,  (2, 1): 5,  (3, 1): 7,
+}
+
+# ANSI colour codes
+BOLD      = '\033[1m'
+CURVE_CLR = '\033[97m'  # bright white
+DIAG_CLR  = '\033[90m'  # dark grey
+FILL_CLR  = DIAG_CLR  #'\033[92m'  # green for fill curve
+RESET     = '\033[0m'
+
+def display_curve(curves, width=screen_width, height=screen_height, ref_curve=None):
+    """
+    curves: list of [(input, output), ...] with values in 0–255
+    width: # of Braille cells horizontally (each = 2 dots)
+    height:# of Braille cells vertically   (each = 4 dots)
+    """
+
+    #CURVE_CLR, DIAG_CLR, RESET = "","",""
+
+    # prepare empty bitmasks
+    curve_bits = [[0]*width for _ in range(height)]
+    fill_bits  = [[0]*width for _ in range(height)]
+    diag_bits  = [[0]*width for _ in range(height)]
+    grid_bits  = [[0]*width for _ in range(height)]
+
+    max_xdot = width*2 - 1
+    max_ydot = height*4 - 1
+
+    # 0) plot the fill_curve version first (background)
+    filled_curves = fill_curve(curves) if ref_curve is None else fill_curve(ref_curve)
+    for inp, out in filled_curves[0]:
+        xdot = int(round(clamp(inp)  / 255 * max_xdot))
+        ydot = int(round(clamp(out)  / 255 * max_ydot))
+        # flip Y so 0 at bottom
+        yplot = max_ydot - ydot
+        cx, dx = divmod(xdot, 2)
+        cy, dy = divmod(yplot, 4)
+        fill_bits[cy][cx] |= 1 << _DOT_MAP[(dy, dx)]
+
+    # 1) plot your curves
+    #print(f"plotting {curves} ")
+    for inp, out in curves[0]:
+        xdot = int(round(clamp(inp)  / 255 * max_xdot))
+        ydot = int(round(clamp(out)  / 255 * max_ydot))
+        # flip Y so 0 at bottom
+        yplot = max_ydot - ydot
+        cx, dx = divmod(xdot, 2)
+        cy, dy = divmod(yplot, 4)
+        curve_bits[cy][cx] |= 1 << _DOT_MAP[(dy, dx)]
+
+    # 2) plot the input==output diagonal
+    for xdot in range(max_xdot+1):
+        frac = xdot / max_xdot
+        ydot = int(round(frac * max_ydot))
+        yplot = max_ydot - ydot
+        cx, dx = divmod(xdot, 2)
+        cy, dy = divmod(yplot, 4)
+        diag_bits[cy][cx] |= 1 << _DOT_MAP[(dy, dx)]
+
+    # 3) add grid‐tick dots at 0,128,255 on both axes
+    #    we’ll mark a single dot (top‑left) in each cell at those major positions
+    tick_vals = [0, 64, 128 ,192, 255]
+    # vertical ticks (columns)
+    for tv in tick_vals:
+        xdot = int(round(tv / 255 * max_xdot))
+        cx, dx = divmod(xdot,2)
+        for r in range(height):
+            grid_bits[r][cx] |= 1 << _DOT_MAP[(0, dx)]
+    # horizontal ticks (rows)
+    for tv in tick_vals:
+        ydot = int(round(tv / 255 * max_ydot))
+        yplot = max_ydot - ydot
+        cy, dy = divmod(yplot, 4)
+        for c in range(width):
+            grid_bits[cy][c] |= 1 << _DOT_MAP[(dy, 0)]
+
+    # 4) build and print each row with Y‐axis labels
+    #    label only at the 255→0 ends
+    y_labels = {
+        0:   "255",
+        height//4: "192",
+        height//2: "128",
+        height//2 +height//4: " 64",
+        height-1: "  0"
+    }
+    label_w = 3
+    # margin is: label + " │ "
+    margin = " " * label_w #+ " │ "
+    for r in range(height):
+        lbl = y_labels.get(r, " " * label_w)
+        line = lbl #+ " │ "
+        for c in range(width):
+            cb = curve_bits[r][c]
+            fb = fill_bits[r][c]
+            db = diag_bits[r][c]
+            gb = grid_bits[r][c]
+            bits =  db | gb
+            bits = cb |fb if cb|fb else bits
+            if bits:
+                if cb:
+                    clr = CURVE_CLR
+                elif fb:
+                    clr = FILL_CLR
+                elif db:
+                    clr = DIAG_CLR
+                else:
+                    clr = DIAG_CLR
+                line += f"{clr}{chr(0x2800 + bits)}{RESET}"
+            else:
+                line += " "
+        print(line)
+
+    # 6) X‐labels at 0,128,255 (center the text under its column)
+    x_labels = {
+        0:   "0",
+        width//4: "64",
+        width//2: "128",
+        width//2 +width//4: "192",
+        width-2:  "255"
+    }
+    blank = [" "] * width
+    for pos, txt in x_labels.items():
+        start = pos - len(txt)//2
+        for i,ch in enumerate(txt):
+            if 0 <= start+i < width:
+                blank[start+i] = ch
+    print(" " * (label_w + 2) + "".join(blank))
+
+    # 7) print the curve points
+    print(f"[{len(curves[0])} points] ", end='')
+    if len(curves[0]) <= 16:
+        for inp, out in curves[0]:
+            print(f" {int(inp)}:{out:.1f}".rstrip("0").rstrip("."), end='')
+    else:
+        for i in range(17):
+            idx = i * (len(curves[0]) - 1) // 16
+            inp, out = curves[0][idx]
+            print(f" {int(inp)}:{out:.1f}".rstrip("0").rstrip("."), end='')
+    print()
+    return curves
+
+# ---------- Spline Interpolation ----------
+
+def compute_spline_coefficients(points):
+    """
+    Compute the coefficients for a cubic spline interpolation.
+    Returns: X, Y, b, c, d where
+        X[i], Y[i] are the original points
+        b[i], c[i], d[i] are the coefficients for the spline between points i and i+1
+    """
+    n = len(points)
+    if n < 2:
+        X = [points[0][0]]; Y = [points[0][1]]
+        return X, Y, [], [], []
+    unique_points = []
+    for p in points:
+        if not unique_points or p[0] != unique_points[-1][0]:
+            unique_points.append(p)
+
+    points = unique_points
+    n = len(points)
+
+    X = [p[0] for p in points]
+    Y = [p[1] for p in points]
+    h = [X[i+1] - X[i] for i in range(n-1)]
+    alpha = [0]*n
+    for i in range(1, n-1):
+        alpha[i] = (3/h[i])*(Y[i+1]-Y[i]) - (3/h[i-1])*(Y[i]-Y[i-1])
+    l = [1] + [0]*(n-1)
+    mu = [0]*n
+    z = [0]*n
+    for i in range(1, n-1):
+        l[i] = 2*(X[i+1]-X[i-1]) - h[i-1]*mu[i-1]
+        mu[i] = h[i]/l[i]
+        z[i] = (alpha[i]-h[i-1]*z[i-1])/l[i]
+    c = [0]*n
+    b = [0]*(n-1)
+    d = [0]*(n-1)
+    for j in range(n-2, -1, -1):
+        c[j] = z[j] - mu[j]*c[j+1]
+        b[j] = (Y[j+1]-Y[j])/h[j] - h[j]*(c[j+1]+2*c[j])/3
+        d[j] = (c[j+1]-c[j])/(3*h[j])
+    return X, Y, b, c, d
+
+
+def spline_eval(x, coeffs):
+    X, Y, b, c, d = coeffs
+    n = len(X)
+    if x <= X[0]: return Y[0]
+    if x >= X[-1]: return Y[-1]
+    i = 0
+    while i < n-2 and x > X[i+1]: i += 1
+    dx = x - X[i]
+    return Y[i] + b[i]*dx + c[i]*dx*dx + d[i]*dx*dx*dx
+
+
+def fill_curve(curves):
+    """ Fill in the gaps between curve points using a spline interpolation """
+    if is_mapping(curves): return curves
+    dbg(f"Fill {[len(c) for c in curves]} point curves")
+    mappings = []
+    curves = cmd_average(curves,0) # average duplicate x values
+    for curve in curves:
+        coeffs = compute_spline_coefficients(curve)
+        mappings.append( [ (i,spline_eval(i, coeffs)) for i in range(256)])
+    return mappings
+
+# ---------- Reduction & Preservation ----------
+
+def is_mapping(curves):
+    """ Return True if the x range is the range 0..255 """
+    return ([[x for x,_ in curve] for curve in curves] ==
+           [[x for x in range(256)] for _ in curves])
+
+def sample_curve(curves, n=MAX_CONTROL_POINTS):
+    """ Fit a spline with up to n points. Points are added at the points
+        of maximum error. """
+    dbg(f"sample_curve: n={n} {[len(c) for c in curves]}")
+    if not is_mapping(curves):
+        curves = fill_curve(curves)
+
+    new_curves = []
+    for curve in curves:
+        sel = {0, 255}
+
+        while len(sel) < n:
+            # Build spline from current selected points
+            current_points = [(x, curve[x][1]) for x in sorted(sel)]
+            coeffs = compute_spline_coefficients(current_points)
+
+            best_err, best_x = -1, None
+
+            # Find point with maximum spline interpolation error
+            for x in range(256):
+                if x not in sel:
+                    actual_y = curve[x][1]
+                    spline_y = spline_eval(x, coeffs)
+                    err = abs(actual_y - spline_y)
+
+                    if err > best_err:
+                        best_err = err
+                        best_x = x
+
+            if best_x is None or best_err == 0:
+                break
+
+            sel.add(best_x)
+
+        new_curves.append([(x, curve[x][1]) for x in sorted(sel)])
+
+    return new_curves
+
+
+def least_squares_line(curve,nonlinear_fraction):
+    """ Fit y ≈ offset + slope * x in the least-squares sense.
+    Returns (offset, slope). """
+    if curve[-1][1] > curve[0][1]:
+        norm = lambda x: x
+    else:
+        norm = lambda x: 255-x
+    low, high = 0, len(curve)-1
+    for ix,(_,y) in enumerate(curve):
+        if norm(y) <= nonlinear_fraction*255:
+            low = ix
+        if norm(y) >= (1.0-nonlinear_fraction)*255:
+            high = ix
+            break
+    xs, ys = zip(*curve[low:high+1])
+    n=len(xs)
+
+    sum_x, sum_y  = sum(xs), sum(ys)
+    sum_xx = sum(x*x for x in xs)
+    sum_xy = sum(x*y for x, y in zip(xs, ys))
+
+    denom  = n*sum_xx - sum_x*sum_x
+    slope  = (n*sum_xy - sum_x*sum_y) / denom if denom else 0.0
+    offset = (sum_y - slope*sum_x) / n
+
+    #dbg(f"least_squares_line: {offset:.1f} + {slope:.1f}x ({low},{high}) ")
+    return offset, slope
+
+def preserve_x(curves, original):
+    """ Preserve the x values of the original curves """
+    if ([[x for x,_ in curve] for curve in curves] ==
+        [[x for x,_ in curve] for curve in original]):
+        return curves
+
+    dbg(f"Use x values of input curve. {[len(c) for c in original]} points")
+    curves = fill_curve(curves)
+    #dbg(f"preserve_x: {[len(c) for c in mappings]} {[len(c) for c in original]}")
+    #dbg(f"preserve_x: {mappings} {original}")
+    return [ [(x, mapping[int(x)][1]) for x,_ in curve]
+    for mapping,curve in zip(curves,original)]
+
+# ---------- Command implementations ----------
+
+def cmd_offset(val, curves):
+    dbg(f"Apply offset {val} ")
+    return [[(x, v+val) for x,v in curve] for curve in curves]
+
+def cmd_inverse(curves):
+    dbg("Apply inverse ")
+    inv = ([[(v,x) for x,v in curve] for curve in curves])
+    return [sorted(curve) for curve in inv]
+
+def cmd_contrast(factor, curves):
+    dbg(f"Apply contrast {factor} ")
+    return [[ (x, 128 + factor * (y-128)) for x,y in curve] for curve in curves]
+
+def cmd_min(min, curves):
+    curves = [sorted(curve) for curve in curves]
+    y1 = curves[0][0][1]
+    dbg(f"Apply new min {min} from {y1} offset {min-y1} ")
+    return cmd_offset(min-y1, curves)
+
+def cmd_max(max, curves):
+    curves = [sorted(curve) for curve in curves]
+    y0 = curves[0][0][1]
+    scale = (max-y0)/(curves[0][-1][1] - y0)
+    dbg(f"Apply new max {max} from {y0} scale {scale} ")
+    return [[ (x, y0 + (y-y0)*scale) for x,y in curve] for curve in curves]
+
+def cmd_gamma(val, curves):
+    filled=fill_curve(curves)
+    dbg(f"Apply gamma {val} ")
+    clamped = [[(x, max(0, v)) for x,v in curve] for curve in filled]
+    return [[(x, 255 * ((v/255)**val)) for x,v in curve] for curve in clamped]
+
+def cmd_divide(curves, component_curves):
+    """ Returns residual = component_curves⁻¹  ∘ curves
+        curves can now be expressed as component_curves ∘ residual """
+    dbg("Apply divide ")
+    inv = cmd_inverse(component_curves)
+    return cmd_compose(inv, curves)
+
+def cmd_compose(m1, m2):
+    """ Returns m2 ∘ m1 """
+    fm1 = fill_curve(m1)
+    fm2 = fill_curve(m2)
+    channels = min(len(fm1), len(fm2))
+    dbg("Apply compose ")
+
+    # clamp(y) loses precision when curve is steep, so we linearly interpolate
+    def lookup(curve, y):
+        y = max(0.0, min(255.0, y))
+        i = int(y)
+        if i in (255,y):
+            return curve[i][1]
+        t = y - i
+        return curve[i][1] * (1 - t) + curve[i + 1][1] * t
+
+    return [[(x, lookup(fm2[c], y)) for x, y in curve]
+            for c, curve in enumerate(fm1[:channels])]
+
+def find_invertible_line(curve, error):
+    x1,y1 = next( ((x,y) for x,y in reversed(curve) if y < error), curve[0])
+    x2,y2 = next( ((x,y) for x,y in curve if y > 255-error), curve[-1])
+
+    if x2 == x1: return y1, 0
+    slope = (y2 - y1) / (x2 - x1)
+    return y1 - slope*x1, slope
+
+def cmd_linear_estimate(curves,error=0.1):
+    dbg(f"Finding linear estimate of curve for points {error} away from 0 and 255 ")
+    return [[(x, offset + slope * x) for x in range(256)]
+            #for offset, slope in (find_invertible_line(curve,error)
+            for offset, slope in (least_squares_line(curve,error)
+            for curve in curves)]
+
+def cmd_decompose(curves,lcd_gamma=2.2):
+    """ Decompose curves into a model and residual where:
+           curves ≈ residual ∘ linear ∘ gamma
+       model represents LCD gamma + linear offset + contrast
+       residual contains everything left """
+    dbg(f"Finding estimate of curve matching linear component ∘ gamma{lcd_gamma}  ")
+    gamma = cmd_gamma(lcd_gamma,cmd_identity(len(curves)))
+    gamma_residual = cmd_divide(curves, gamma)
+    linear = cmd_linear_estimate(gamma_residual)
+    model = cmd_compose(gamma, linear)
+    # residual = cmd_divide(curves, model)
+    return model #residual
+
+def cmd_smooth(curves, points=10):
+    dbg(f"Smoothing by fitting a spline with {points} points ")
+    return sample_curve(curves, points)
+
+def unique(curves):
+    return [list(dict.fromkeys(curve)) for curve in curves]
+
+def cmd_average(curves, span=5):
+    """ Average points within span of x """
+    def average_point_x(curve, i, x):
+        y_sum,count = 0,0
+        sp =  min(span, x, 255-x)
+        for cx, cy in curve:
+            if abs(cx - x) <= sp:
+                y_sum += cy
+                count += 1
+        return (x, y_sum / count if count > 0 else curve[i][1])
+
+    def average_point_i(curve, i, x):
+        """ Average points within span of index """
+        start = max(0, i - span)
+        end = min(len(curve), i + span + 1)
+        y_sum = sum(curve[j][1] for j in range(start, end))
+        return (x, y_sum / (end - start))
+
+    dbg(f"Smoothing curves by averaging points within {span} of x ")
+    curves = [sorted(c) for c in curves]
+    return unique([[average_point_x(curve, i, round(x)) for i, (x, _) in enumerate(curve)]
+            for curve in curves])
+
+def cmd_adjust(m1, m2):
+    m1 = fill_curve(m1)
+    m2 = fill_curve(m2)
+    dbg("Adding m2's deviation from linear to m1 ")
+    return [ [(x, m1[c][x][1] + m2[c][x][1] - x) for x in range(256)]
+           for c in range(min(len(m1), len(m2)))]
+
+def cmd_diff(m1, m2):
+    m1 = fill_curve(m1)
+    m2 = fill_curve(m2)
+    dbg("Calculating m1 - m2 + 128 ")
+    return [ [(x, m1[c][x][1] - m2[c][x][1] +128) for x in range(256)]
+           for c in range(min(len(m1), len(m2)))]
+
+def cmd_at(m1,x):
+    m1 = fill_curve(m1)
+    y=m1[0][x][1]
+    dbg(f"Curve at {x} is {y} ")
+    return y
+
+def cmd_max_error(m1, m2):
+    m1 = fill_curve(m1)
+    m2 = fill_curve(m2)
+    error = max(abs(m1[c][x][1] - m2[c][x][1]) for c in range(len(m1)) for x in range(256))
+    dbg(f"Max difference between m1 and m2 is {error} ")
+    return error
+
+def cmd_identity(channels=1):
+    dbg(f"Creating identity curve with {channels} channels ")
+    return [[(x,x) for x in range(256)] for _ in range(channels)]
+
+def cmd_show(curves, ref=None):
+    return display_curve(curves, width=screen_width, height=screen_height, ref_curve=ref)
+
+# ---------- Main ----------
+
+def usage():
+    print(__doc__)
+
+def process(args):
+    """ Process args as if they were from the cmdline """
+    quiet = any(arg in {'-q', '--quiet'} for arg in args)
+    select_best = any(arg in {'-s', '--select'} for arg in args)
+    preserve = any(arg in {'-p', '--preserve'} for arg in args)
+    flags = {'-s', '--select', '-p', '--preserve', '-q', '--quiet'}
+    args = [arg for arg in args if arg not in flags ]
+
+    wix = next((i for i, a in enumerate(args) if a in {'-w', '--width'}), None)
+    if wix is not None and wix + 1 < len(args):
+        global screen_width, screen_height
+        screen_width, screen_height = int(args[wix + 1]), int(args[wix + 1]) // 3
+        del args[wix:wix + 2] 
+
+    cmd = args[0].lower()
+    args = args[1:]
+
+
+    if quiet:
+        global DEBUG
+        DEBUG = not DEBUG
+
+    if cmd != 'show':
+        args.append('%' if sys.stdout.isatty() else '-')
+
+   # try:
+    # Command dispatch table takes original curve paramater, returns (original, result, output file)
+    commands = {
+    'show':      lambda: (lambda oc: (oc, cmd_show(oc, read_curve(args[1]) if len(args) > 1 else oc), '%'))
+                         (read_curve(args[0])),
+    'identity':  lambda: (lambda oc: (oc, oc, args[0]))
+                         (cmd_identity()),
+    'inverse':   lambda: (lambda oc: (oc, cmd_inverse(oc), args[1]))
+                         (read_curve(args[0])),
+    'offset':    lambda: (lambda oc: (oc, cmd_offset(float(args[0]), oc), args[2]))
+                         (read_curve(args[1])),
+    'contrast':  lambda: (lambda oc: (oc, cmd_contrast(float(args[0]), oc), args[2]))
+                         (read_curve(args[1])),
+    'max':       lambda: (lambda oc: (oc, cmd_max(float(args[0]), oc), args[2]))
+                         (read_curve(args[1])),
+    'min':       lambda: (lambda oc: (oc, cmd_min(float(args[0]), oc), args[2]))
+                         (read_curve(args[1])),
+    'gamma':     lambda: (lambda oc: (oc, cmd_gamma(float(args[0]), oc), args[2]))
+                         (read_curve(args[1])),
+    'compose':   lambda: (lambda oc: (oc, cmd_compose(read_curve(args[0]), oc), args[2]))
+                         (read_curve(args[1])),
+    'adjust':    lambda: (lambda oc: (oc, cmd_adjust(oc, read_curve(args[1])), args[2]))
+                         (read_curve(args[0])),
+    'diff':      lambda: (lambda oc: (oc, cmd_diff(oc, read_curve(args[1])), args[2]))
+                         (read_curve(args[0])),
+    'divide':    lambda: (lambda oc: (oc, cmd_divide(oc, read_curve(args[1])), args[2]))
+                         (read_curve(args[0])),
+    'linear':    lambda: (lambda oc: (oc, cmd_linear_estimate(oc, float(args[0])), args[2]))
+                         (read_curve(args[1])),
+    'decompose': lambda: (lambda oc: (oc, cmd_decompose(oc, float(args[0])), args[2]))
+                         (read_curve(args[1])),
+    'smooth':    lambda: (lambda oc: (oc, cmd_smooth(oc, int(args[0])), args[2]))
+                         (read_curve(args[1])),
+    'average':   lambda: (lambda oc: (oc, cmd_average(oc, int(args[0])), args[2]))
+                         (read_curve(args[1])),
+    'at':        lambda: (lambda oc: (oc, cmd_at(oc, int(args[0])), '%'))
+                         (read_curve(args[1])),
+    'error':     lambda: (lambda oc: (oc, cmd_max_error(oc, read_curve(args[1])), '%'))
+                         (read_curve(args[0]))
+    }
+
+    if cmd not in commands:
+        usage()
+        return (None, None, None)
+
+    original_curves,curves, output_file = commands[cmd]()
+
+    if isinstance(curves, (int, float)):
+        print(curves)
+        return original_curves, curves, output_file
+
+    if select_best or output_file.lower().endswith('.acv'):
+        curves = sample_curve(curves)
+    if preserve:
+        curves = preserve_x(curves, original_curves)
+
+    if cmd == 'show':
+        pass # already displayed
+    elif output_file == '%':
+        cmd_show(curves)
+    else:
+        write_curve(curves, output_file, 4)
+
+    return original_curves, curves, output_file
+
+def complete_commands(text, state):
+    """Command completion function for readline"""
+    commands = ['show', 'identity', 'inverse', 'offset', 'contrast', 'max', 'min',
+                'gamma', 'compose', 'adjust', 'diff', 'divide', 'linear',
+                'decompose', 'smooth', 'average', 'at', 'error', 'help', 'history', 'quit']
+
+    matches = [cmd for cmd in commands if cmd.startswith(text)]
+    try:
+        return matches[state]
+    except IndexError:
+        return None
+
+
+def repl():
+    """Interactive REPL for curve manipulation commands"""
+    # Setup readline history
+    history_file = os.path.expanduser("~/.acv_history")
+    if HAS_READLINE:
+        readline.set_completer(complete_commands)
+        readline.parse_and_bind('tab: complete')
+        try:
+            readline.read_history_file(history_file)
+        except FileNotFoundError:
+            pass
+        atexit.register(readline.write_history_file, history_file)
+
+    # Store results from previous commands
+    cmd_history = {}
+    result_counter = 1
+
+    usage()
+    print("Use $1, $2, etc. to reference previous results. 'h' for history, 'help' for help.")
+    print("'%' at eol in repl means last result. 'q' to quit.")
+
+    while True:
+        try:
+            line = input(f"{BOLD}acv ${result_counter}>{RESET} ").strip()
+            if not line:
+                continue
+
+            if line in ('quit', 'exit', 'q'):
+                break
+
+            if line == 'help':
+                usage()
+                continue
+
+            if line == 'history' or line == 'h':
+                for key, cmd in cmd_history.items():
+                    print(f"{key}| {' '.join(cmd)}")
+                continue
+
+            args = line.split()
+            if result_counter > 1:
+                args = [f"${result_counter-1}" if arg == '%'  else arg for arg in args]
+
+            original_curves, curves, output_file = process(args)
+
+            cmd_history[f"${result_counter}"]=args
+
+            if  output_file == '%' or output_file == '-':
+                write_curve(curves, f"${result_counter}")
+                result_counter += 1
+
+        except Exception as e:
+            tb = traceback.extract_tb(e.__traceback__)
+            filename, line_no, func_name, text = tb[-1]
+            print(f"Error: {e}")
+            print(f"  on line {line_no} in function '{func_name}': {text}")
+
+def main():
+    try:
+        if len(sys.argv) < 2:
+            repl(); return
+
+        process(sys.argv[1:])
+    except FileNotFoundError as e:
+        print(f"File not found: {e.filename}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nExiting.")
+        sys.exit(0)
+    except Exception as e:
+        tb = traceback.extract_tb(e.__traceback__)
+        filename, line_no, func_name, text = tb[-1]
+        print(f"Error: {e}")
+        print(f"  on line {line_no} in function '{func_name}': {text}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
