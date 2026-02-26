@@ -23,4 +23,4 @@ publish:
 	install -m 644 man/acv.1 man/chart.1 ${PUBLISH_BASE}/man
 	mkdir -p ${PUBLISH_BASE}/examples
 	install -m 644 examples/* ${PUBLISH_BASE}/examples
-	(cd ${PUBLISH_BASE} && git add .)
+	(cd ${PUBLISH_BASE} && git add -u .)

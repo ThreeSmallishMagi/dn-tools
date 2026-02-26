@@ -1,12 +1,12 @@
 # Digital Negative Tools
 
-This is a collection of tools for manipualating digital negatives and Photoshop curve files. My use case is to create linearization curves for use with a monochrome LCD that I use in my 4x5 enlarger to make black and white prints.
+This is a collection of tools for manipulating digital negatives and Photoshop curve files. My use case is to create linearization curves for use with a monochrome LCD that I use in my 4x5 enlarger to make black and white prints.
 
 ## Features
 - View Adobe Curve (ACV), pencil curve (AMP) and CSV files from the command line
 - Generate and read calibration charts for linearization. You can choose the number of patches and have multiple randomly shuffled patches per value to eliminate the effects of uneven illumination.
 - Read printed charts and create linearization curves using manipulation primitives. e.g.
-    acv average 4 response.csv - |acv min -1 - - |acv max 258 - - |acv inverse - correction.acv
+    `acv average 4 response.csv - |acv min -1 - - |acv max 258 - - |acv inverse - correction.acv`
 - Apply curves to images
 
 ## Tools
@@ -24,13 +24,13 @@ This is a collection of tools for manipualating digital negatives and Photoshop 
 ## Installation
 ### Windows 7
 
-I have tried acv on Windows 7 but I had to add a monospaced font with braille characters and `ansicon` for ansi color codes. The OpenCV python module used by chart didn't compile for me and I didn't try to fix it.
+I have tried `acv` on Windows 7 but I had to add a monospaced font with braille characters and [ansicon](https://github.com/adoxa/ansicon) for ANSI color codes. The OpenCV python module used by chart didn't compile for me and I didn't try to fix it.
 
 ### Windows 10+
 
 On Windows 10+ I recommend running it under the Windows Subsystem for Linux (WSL).
 
- - Install Windows Terminal from [here].( https://learn.microsoft.com/en-us/windows/terminal/install)
+ - Install Windows Terminal from [here]( https://learn.microsoft.com/en-us/windows/terminal/install)
  - Add  the WSL component from the Add/Remove Windows Features dialog.
  - Install an Ubuntu distribution
 ```cmd
@@ -62,7 +62,7 @@ python3 -m venv dn-tools_env
 source dn-tools_env/bin/activate
 pip install opencv-python
 ```
-otherwise install the python dependencies and tools system wide:
+Otherwise install the python dependencies and tools system wide:
 ```bash 
 cd dn-tools
 sudo apt install python3-opencv
@@ -193,7 +193,7 @@ linearize images/LcdWarmtoneGlossyInverted.jpg
 4. Visualize curves using `plot` or `acv show`.
 ```bash
 plot LcdWarmtoneGlossyInverted.csv # The measured workflow/paper response
-acv show LcdWarmtoneGlossyInvertedi.acv
+acv show LcdWarmtoneGlossyInvertedi.acv # the inverse of the above
 ```
 5. Apply curves to images with `apply`
 ```bash
@@ -206,14 +206,15 @@ In theory, if you printed testchart_corrected.tif, the result should be a linear
 - Add a tool to expose images on a monochrome LCD
 - Improve multi-channel curve support: I don't print multi-color negatives, so not a priority for me. `acv` will preserve multi-channel info in acv, amp and csv files but tool behaviour and limitations might make it useless for your workflow without changes.
 - Add support for .cube format: I don't have a use for this, but it should be easy to add.
-- An html javascript gui frontend: nice for curve tweaking perhaps. Now you'll have to write out a csv file and edit it with a text editor.
+- An html javascript gui frontend: nice for curve tweaking perhaps. For now you'll have to write out a csv file and edit it with a text editor.
 - Make `chart` make and read charts in the format of other linearization tools. ( e.g. chartthrob or Easy Digital Negatives)
 
 ## Bugs
 
+You should be aware of the limitations of the file formats: acv has only 16 control points and truncates out of range values. Amp allows 256 integer values, and truncates out of range values. CSV allows multiple fractional values and does not truncate.  I have seen ugly acv files when trying to make an acv curve directly from noisy data.
 Report bugs at [https://github.com/ThreeSmallishMagi/dn-tools/issues](https://github.com/ThreeSmallishMagi/dn-tools/issues)
 
 ## License
 
-GPL v3
-````
+GPL v3.0
+
