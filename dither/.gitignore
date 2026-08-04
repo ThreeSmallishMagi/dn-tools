@@ -1,0 +1,21 @@
+# Build system
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*_env
+__pycache__/
+
+# Compiled binaries
+dither
+displayimage
+temporaldither
+srgbtest
+
+# Tool output
+*.png
+*.jpg
+dither.csv
+!examples/*.png
+!examples/*.jpg

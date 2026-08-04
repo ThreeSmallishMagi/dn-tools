@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Per-column density check.
+
+  colstats <out> [<ref>] [--linear] [--tol Z] [--cols first:last]
+
+Compares column means of <out> (the image being evaluated) against <ref>
+(default: examples/ramp_256x256.png). For a correctly density-preserving
+dither, the linear-light mean of each output column should match the linear
+mean of the corresponding reference column to within counting noise (~σ/√N).
+A 0.5 LSB noise floor is assumed: deviations smaller than a fraction of an 8-bit
+output level are never flagged regardless of sample count.
+"""
+import os, sys, math, argparse
+import cv2
+import numpy as np
+
+DEFAULT_REF = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'examples', 'ramp_256x256.png')
+
+ap = argparse.ArgumentParser()
+ap.add_argument('out', help="image being evaluated")
+ap.add_argument('ref', nargs='?', default=DEFAULT_REF,
+                help=f"reference image (default: {DEFAULT_REF})")
+ap.add_argument('--linear', action='store_true',
+                help="treat pixel values as raw linear (skip sRGB decode)")
+ap.add_argument('--tol',   type=float, default=3.0, help="pass if |z| <= tol (default 3σ)")
+ap.add_argument('--cols',  default=None, help="column range 'first:last' (default full width)")
+ap.add_argument('--csv',   default=None, metavar='FILE',
+                help="write per-column stats (col,ref_lin,out_lin,dev_lin,z) to FILE")
+args = ap.parse_args()
+
+def load(path):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None: sys.exit(f"cannot read {path}")
+    return img.astype(np.float64)
+
+def _srgb_decode(img):
+    """img: float array in [0,255] → linear float in [0,1]."""
+    x = img / 255.0
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+def _srgb_encode(linear):
+    """linear: scalar in [0,1] → sRGB pixel value in [0,255]."""
+    if linear <= 0.0031308:
+        return linear * 12.92 * 255.0
+    return (1.055 * linear ** (1.0 / 2.4) - 0.055) * 255.0
+
+def to_linear(img):
+    if args.linear:
+        return img / 255.0
+    return _srgb_decode(img)
+
+def to_display(lin_mean):
+    """Convert a linear-space mean to a display pixel value for printing."""
+    if args.linear:
+        return lin_mean * 255.0
+    return _srgb_encode(float(lin_mean))
+
+# Column sampling: dense at the start of the requested range, then log-spaced.
+def sampled(first, last):
+    offset = 1
+    while first + offset - 1 < last:
+        j = first + offset - 1
+        yield j
+        offset = max(offset + 1, int(offset * 1.2))
+    yield last
+
+def parse_cols(spec, W):
+    if spec is None: return 0, W - 1
+    parts = spec.split(':')
+    if len(parts) != 2: sys.exit(f"--cols expects 'first:last', got {spec!r}")
+    return int(parts[0]), int(parts[1])
+
+def multiset_s(data):
+    """Return a string  {value: count}... for the given iterable."""
+    unique_vals, counts = np.unique(data, return_counts=True)
+    d = dict(zip(unique_vals, counts))
+    return ','.join(f"{v:.0f}:{c}" for v, c in d.items())
+
+out = load(args.out)
+ref = load(args.ref)
+if out.shape != ref.shape:
+    sys.exit(f"shape mismatch: out {out.shape} vs ref {ref.shape}")
+
+W = out.shape[1]
+N = out.shape[0]
+first, last = parse_cols(args.cols, W)
+first = max(0, min(first, W - 1))
+last  = max(first, min(last, W - 1))
+
+ref_lin = to_linear(ref)
+out_lin = to_linear(out)
+
+print(f"out={args.out} ref={args.ref} colorspace={'linear' if args.linear else 'sRGB'} "
+      f"N={N} tol={args.tol}σ")
+print(f"SE:Standard error  z:z-score=dev/se <{args.tol}σ to pass")
+print(f"ref/out: sRGB-encoded linear mean (px).  Δ/σ/SE: linear × 255.")
+print(f"{'col':>4} {'ref':>6} {'out':>6} {'diff':>5} {'Δpx':>7} {'σpx':>6} {'SEpx':>6} {'z':>6} {'#white':>6} {'result':>6}")
+
+# Check every column for overall pass/fail; print only the sampled subset.
+shown = set(sampled(first, last))
+fails = 0
+white = 0
+worst_z = 0.0
+worst_col = first
+abs_z_sum = 0.0
+csv_rows = []
+for j in range(first, last + 1):
+    ref_col = ref[:, j]
+    out_col = out[:, j]
+    expect = ref_lin[:, j].mean()
+    oc     = out_lin[:, j]
+    actual = oc.mean()
+    sigma  = oc.std()
+    white  = np.sum(oc >= 0.999)
+    # SE has three floors (largest wins):
+    #   measured: sigma/√N from the actual output column
+    #   binomial: √(p(1-p)/N) — matches true SE for single-frame binary output
+    #   LSB floor: 0.5/255 — column means can't be tested to sub-half-LSB precision;
+    #              prevents z-score blow-up at sRGB endpoints where Bernoulli SE→0
+    p      = min(max(expect, 1e-12), 1 - 1e-12)
+    se     = max(sigma / math.sqrt(N), math.sqrt(p * (1 - p) / N), 0.5 / 255.0)
+    dev    = actual - expect
+    z      = dev / se
+    abs_z_sum += abs(z)
+    ref_pix_col = to_display(expect)
+    out_pix_col = to_display(actual)
+    diff = round(out_pix_col - ref_pix_col)
+    ok = abs(z) <= args.tol
+    if not ok: fails += 1
+    if abs(z) > abs(worst_z): worst_z, worst_col = z, j
+    ref_ms = multiset_s(ref_col)
+    out_ms = multiset_s(out_col)
+    if args.csv is not None:
+        csv_rows.append((j,
+                         round(ref_pix_col, 1),
+                         round(out_pix_col, 1),
+                         round(out_pix_col - ref_pix_col, 1),
+                         round(z, 3)))
+    if j in shown:
+        print(f"{j:4d} {ref_pix_col:6.2f} {out_pix_col:6.2f} {diff:+5d} {dev*255:+7.2f} "
+              f"{sigma*255:6.2f} {se*255:6.2f} {z:+6.1f} {white:6d} {'PASS' if ok else 'FAIL'} {ref_ms}   {out_ms}")
+
+if args.csv is not None:
+    import csv
+    with open(args.csv, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['col', 'ref', 'out', 'dev_px', 'z'])
+        w.writerows(csv_rows)
+
+cols_checked = last - first + 1
+average_abs_z = abs_z_sum / cols_checked
+verdict = 'PASS' if fails == 0 else 'FAIL'
+print('-' * 60)
+print(f"checked={cols_checked} fails={fails} worst |z|={abs(worst_z):.1f} at col {worst_col}  "
+      f"OVERALL {verdict}")
+# Machine-readable trailer: parsed by coltest. Keep stable across versions.
+print(f"RESULT verdict={verdict} checked={cols_checked} fails={fails} "
+      f"worst_z={abs(worst_z):.3f} worst_col={worst_col} average_abs_z={average_abs_z:.3f}")
+sys.exit(0 if fails == 0 else 1)

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Verify the multi-frame temporal-budget invariant.
+
+Every threshold, run with spatial diffusion off (--spatial 0), maintains the
+per-pixel invariant:
+
+    sum_f display_f[r,c]  ==  goal[r,c]  exactly.
+
+The goal itself is `dither_fn(target*frames)`, an integer in
+[0, frames*(levels-1)], so `|sum - target*frames|` is bounded by:
+
+  • round (deterministic)  → 0.  `sum == lround(target*frames)`.
+  • random / blue          → 1.  Goal is floor/ceil(target*frames);
+                                 sum == goal by the invariant.
+
+--spatial 0 is what isolates the temporal budget: with error diffusion on,
+a pixel's residual moves to its neighbours within a frame, so its displayed
+sum is no longer tied to its own goal.
+"""
+import os, sys, subprocess, tempfile
+import cv2
+import numpy as np
+
+HERE   = os.path.dirname(os.path.abspath(__file__))
+REF    = os.path.join(HERE, 'examples', 'ramp_256x256.png')
+DITHER = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else 'build/dither')
+
+
+def srgb_to_linear(pixels_u8):
+    """Piecewise sRGB decode: uint8 pixel [0,255] → float linear [0,1]."""
+    x = pixels_u8.astype(np.float64) / 255.0
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def decode_levels(pixels_u8, levels):
+    """Recover display level 0..levels-1 from encoded 8-bit pixel values.
+
+    Inverts the srgb-spaced ladder the runs below ask for: level k is emitted as
+    pixel round(255k/(levels-1)), so rounding the pixel back onto that scale
+    recovers k exactly for any levels <= 256."""
+    lvl = np.rint(pixels_u8.astype(np.float64) * (levels - 1) / 255.0).astype(np.int64)
+    return np.clip(lvl, 0, levels - 1)
+
+
+def run_dither(threshold, frames, levels, use_srgb, seed, out_path):
+    args = [DITHER, REF, '--threshold', threshold,
+            '--frames', str(frames), '--levels', str(levels),
+            '--seed', str(seed), '--out', out_path,
+            '--spatial', '0', '--save-frames',
+            '--level-spacing', 'srgb']
+    if not use_srgb:
+        args.append('--linear')
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def load_frames(out_path, frames):
+    stem, ext = os.path.splitext(out_path)
+    return [cv2.imread(f"{stem}-{k}{ext}", cv2.IMREAD_GRAYSCALE)
+            for k in range(frames)]
+
+
+def check_invariant(threshold, frames, levels, use_srgb, seed=42):
+    with tempfile.TemporaryDirectory(prefix='budget.') as work:
+        out = os.path.join(work, 'out.png')
+        r = run_dither(threshold, frames, levels, use_srgb, seed, out)
+        if r.returncode != 0:
+            return False, f"dither exit={r.returncode}: {r.stderr.strip()}"
+
+        frame_imgs = load_frames(out, frames)
+        if any(f is None for f in frame_imgs):
+            return False, "missing per-frame side files"
+
+        # sum of display levels per pixel across frames
+        displays = np.zeros(frame_imgs[0].shape, dtype=np.int64)
+        for img in frame_imgs:
+            displays += decode_levels(img, levels)
+
+        # target*frames per pixel (the continuous ideal budget), in display
+        # units on the srgb-spaced ladder: the fractional position of the target
+        # between the two levels that bracket it, interpolated in linear light.
+        ref_img = cv2.imread(REF, cv2.IMREAD_GRAYSCALE)
+        target_lin = srgb_to_linear(ref_img) if use_srgb else ref_img.astype(np.float64) / 255.0
+        rung_px = np.rint(255.0 * np.arange(levels) / (levels - 1))
+        rung_lin = srgb_to_linear(rung_px) if use_srgb else rung_px / 255.0
+        k = np.clip(np.searchsorted(rung_lin, target_lin, side='right') - 1, 0, levels - 2)
+        span = rung_lin[k + 1] - rung_lin[k]
+        target_x_frames = (k + (target_lin - rung_lin[k]) / span) * frames
+
+        if threshold == 'round':
+            # Deterministic: strict equality with lround (floor(x+0.5) for x>=0).
+            expected = np.floor(target_x_frames + 0.5).astype(np.int64)
+            bad = displays != expected
+            n = int(bad.sum())
+            if n == 0:
+                return True, f"{displays.size} pixels, exact match"
+            r, c = tuple(int(v) for v in np.argwhere(bad)[0])
+            return False, (f"{n}/{displays.size} pixels mismatched; "
+                           f"first at ({r},{c}): displays={displays[r, c]} expected={expected[r, c]}")
+
+        # Stochastic thresholds: the goal is floor/ceil(target*frames) and the
+        # invariant gives sum == goal, so |sum - target*frames| ≤ 1.
+        tol = 1.0
+        dev = np.abs(displays.astype(np.float64) - target_x_frames)
+        bad = dev > tol
+        n = int(bad.sum())
+        worst = float(dev.max())
+        if n == 0:
+            return True, f"{displays.size} pixels, all within ±{tol:.0f} (worst={worst:.2f})"
+        r, c = tuple(int(v) for v in np.argwhere(bad)[0])
+        return False, (f"{n}/{displays.size} pixels exceed ±{tol:.0f}; worst={worst:.2f}; "
+                       f"first at ({r},{c}): displays={displays[r, c]} "
+                       f"target*frames={target_x_frames[r, c]:.2f}")
+
+
+def main():
+    if not os.path.isfile(REF):    sys.exit(f"reference not found: {REF}")
+    if not os.path.isfile(DITHER): sys.exit(f"dither binary not found: {DITHER}")
+
+    cases = [
+        # (label,                            threshold, frames, levels, sRGB)
+        ('round  frames=4    levels=2 sRGB',  'round',    4,   2,  True),
+        ('round  frames=16   levels=2 sRGB',  'round',   16,   2,  True),
+        ('round  frames=64   levels=2 sRGB',  'round',   64,   2,  True),
+        ('round  frames=128  levels=2 sRGB',  'round',  128,   2,  True),
+        ('round  frames=16   levels=2 linear','round',   16,   2,  False),
+        ('round  frames=64   levels=2 linear','round',   64,   2,  False),
+        ('round  frames=16   levels=8 linear','round',   16,   8,  False),
+        ('round  frames=16   levels=8 sRGB',  'round',   16,   8,  True),
+        ('random frames=2    levels=2 sRGB',  'random',   2,   2,  True),
+        ('random frames=4    levels=2 sRGB',  'random',   4,   2,  True),
+        ('random frames=16   levels=2 sRGB',  'random',  16,   2,  True),
+        ('random frames=16   levels=8 sRGB',  'random',  16,   8,  True),
+        ('random frames=64   levels=8 sRGB',  'random',  64,   8,  True),
+        ('blue   frames=4    levels=2 sRGB',  'blue',     4,   2,  True),
+        ('blue   frames=16   levels=2 sRGB',  'blue',    16,   2,  True),
+        ('blue   frames=16   levels=8 sRGB',  'blue',    16,   8,  True),
+    ]
+
+    print(f"dither={DITHER}\nref={REF}\n")
+    print(f"{'case':<40} result   detail")
+    print('-' * 90)
+    ok = True
+    for label, threshold, frames, levels, srgb in cases:
+        passed, detail = check_invariant(threshold, frames, levels, srgb)
+        status = 'PASS' if passed else 'FAIL'
+        print(f"{label:<40} {status:<6}  {detail}")
+        ok &= passed
+    print('-' * 90)
+    print('OVERALL', 'PASS' if ok else 'FAIL')
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,4 @@
+# Python dependencies for colstats and budgettest.
+# The C++ build still needs system OpenCV development libraries.
+numpy>=1.26
+opencv-python-headless>=4.9

@@ -1,0 +1,136 @@
+md() {
+    pandoc -s -t man $* | man -l -
+}
+
+icat(){
+    for f in $*;
+    do
+        #convert  $f -resize 1000x\> png:- |img2sixel -I
+        convert  $f -filter point -resize 1000x1000 sixel:-
+    done
+}
+
+dim ()
+{
+    for f in $*;
+    do
+        identify -format "%wx%h\n" $f;
+    done
+}
+
+imagefmt ()
+{
+    local img=$1
+    identify -format "FileName:%[filename]\nSize:%[w]x%[h]\nColorSpace:%[colorspace]\nBitDepth:%[depth]\nGamma:%[gamma]\n" $img
+}
+
+icrop() {
+    if [ $# -lt 3 ]; then
+        echo "Usage: icrop <image> <x> <y>" >&2
+        return 1
+    fi
+    convert $1 -filter point -resize 1000x1000 sixel:-;
+    convert "$1" -crop 500x500+$2+$3 +repage -filter point -resize 1000x1000 sixel:-;
+    convert "$1" -crop 100x100+$(($2 +128))+$(($3 + 128)) +repage -interpolate nearest -filter point -resize 1000x1000 sixel:-;
+}
+
+isquash() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: isquash <image> [result [rows [cols]]]" >&2
+        return 1
+    fi
+    local img=${1:-dither.png}
+    local res=${2:-sixel:-}
+    local rows=${3:-10}
+
+    local w
+    local h
+    w=$(identify -format "%w" "$img") || return 1
+    h=$(identify -format "%h" "$img") || return 1
+
+    local cols=${3:-$w}
+
+    convert "$img" \
+        -colorspace RGB \
+        -filter box -resize "${cols}x${rows}!" \
+        -colorspace sRGB \
+        -filter point -resize "${w}x${h}!" \
+        "$res"
+}
+
+iaverage() {
+    if [ $# -lt 2 ]; then
+        echo "Usage: iaverage <output> <image1> <image2> [image3 ...]" >&2
+        return 1
+    fi
+    local output=$1
+    shift
+    convert "$@" -evaluate-sequence mean "$output"
+}
+
+histo() {
+    local img=${1:-dither.png}
+    local res=${2:-sixel:-}
+    convert $img -colorspace gray histogram:$res
+}
+
+# Usage: rampdiff [image [result [reference [scale [threshold]]]]]
+# Difference is measured in normalized pixel values. Pixels over threshold
+# get a white hatch so >10% deviations are apparent without changing scale.
+rampdiff() {
+    local img=${1:-dither.png}
+    local res=${2:-sixel:-}
+    local ref=${3:-examples/ramp_256x256.png}
+    local scale=${4:-10}
+#    local threshold=${5:-0.1}
+#    convert "$ref" "$img" -compose minus -composite -evaluate multiply 10 -evaluate add 128 -filter point -resize 1000x1000 "$res"
+
+      convert "$img" "$ref" -colorspace Gray \
+          \( -clone 0 -clone 1 -fx "max($scale*(u-v),0)" \) \
+          \( -clone 0 -clone 1 -fx "max($scale*(v-u),0)" \) \
+          -delete 0,1 \
+          \( -clone 1 \) \
+          -combine \
+          -filter point \
+          "$res"
+}
+
+analyse()
+{
+    img=${1:-dither.png}
+    res=${2:-sixel:-}
+    ref=${3:-examples/ramp_256x256.png}
+
+    colstats --csv dither.csv $img  $ref |grep RESULT | grep -e 'RESULT\|FAIL'
+    convert $img <(rampdiff $img - $ref) <(gnuplot -e 'png="-"' colplot) \
+    -resize x1000 +append -filter point -resize 2000x $res
+}
+
+test_dither() {
+    local args="$@"
+    dither examples/ramp_256x256.png $args && analyse
+}
+
+run_suite() {
+    local extra_args="$@"
+    test_dither $extra_args
+    test_dither --threshold random $extra_args
+    test_dither --threshold random --spatial 1 $extra_args
+    test_dither --threshold blue $extra_args
+    test_dither --threshold blue --spatial 0.5 $extra_args
+    test_dither --threshold blue --spatial 1 $extra_args
+}
+
+gallery()
+{
+    run_suite
+    echo "-- multi frame average --"
+    run_suite --frames 16
+    echo "-- bit depth 3 --"
+    run_suite --levels 8
+}
+
+help() {
+    local mdfile=${1:-README.md}
+    pandoc -s -t man $mdfile | man -l -
+}

@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Run dither with a matrix of options and check density preservation of each.
+
+  coltest [reference] [dither_binary]
+
+Defaults: reference=examples/ramp_256x256.png, binary=build/dither.
+A "PASS" means every column's linear-light mean matches the reference column's
+linear-light mean within 3σ of counting noise.
+"""
+import os, sys, subprocess, tempfile
+
+add_full=False
+if '--full' in sys.argv:
+    add_full=True
+    sys.argv.remove('--full')
+
+HERE     = os.path.dirname(os.path.abspath(__file__))
+COLSTATS = os.path.join(HERE, 'colstats')
+REF      = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else 'examples/ramp_256x256.png')
+DITHER   = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else 'build/dither')
+
+
+if not os.path.isfile(REF):    sys.exit(f"reference not found: {REF}")
+if not os.path.isfile(DITHER): sys.exit(f"dither binary not found: {DITHER}")
+
+# Each test: (label, dither args). The first entry is an identity sanity check
+# that bypasses dither (uses the reference itself as "output") to verify the
+# test harness reports PASS on a known-good comparison.
+tests = [
+    ('identity sanity check',              None),
+    ('round   defaults (spatial=1)',       []),
+
+    ('random  spatial=0',                  ['--threshold', 'random', '--spatial', '0']),
+    ('random  spatial=0 lin',              ['--threshold', 'random', '--spatial', '0', '--linear']),
+    ('random  levels=8 spatial=0',         ['--threshold', 'random', '--levels', '8', '--spatial', '0']),
+    ('random  levels=8 spatial=0 lin',     ['--threshold', 'random', '--levels', '8', '--spatial', '0', '--linear']),
+    ('random  frames=16 spatial=0',        ['--threshold', 'random', '--frames', '16', '--spatial', '0']),
+    ('random  frames=64 spatial=0',        ['--threshold', 'random', '--frames', '64', '--spatial', '0']),
+    ('random  frames=128 spatial=0',       ['--threshold', 'random', '--frames', '128', '--spatial', '0']),
+    ('random  spatial=1',                  ['--threshold', 'random', '--spatial', '1']),
+    ('random  frames=16 spatial=1',        ['--threshold', 'random', '--frames', '16', '--spatial', '1']),
+    ('random  frames=16 spatial=0.5',      ['--threshold', 'random', '--frames', '16', '--spatial', '0.5']),
+    ('random  frames=128 spatial=0.1',     ['--threshold', 'random', '--frames', '128', '--spatial', '0.1']),
+
+    ('round   spatial=0',                  ['--threshold', 'round', '--spatial', '0']),
+    ('round   levels=16 spatial=0',        ['--threshold', 'round', '--levels', '16', '--spatial', '0']),
+    ('round   levels=16 spatial=0 lin',    ['--threshold', 'round', '--levels', '16', '--spatial', '0', '--linear']),
+    ('round   frames=64 spatial=0',        ['--threshold', 'round', '--frames', '64', '--spatial', '0']),
+    ('round   spatial=1 lin',              ['--threshold', 'round', '--spatial', '1', '--linear']),
+    ('round   frames=16 spatial=1',        ['--threshold', 'round', '--frames', '16', '--spatial', '1']),
+    ('round   frames=16 spatial=0.5',      ['--threshold', 'round', '--frames', '16', '--spatial', '0.5']),
+    ('round   levels=4 spatial=1',         ['--threshold', 'round', '--levels', '4', '--spatial', '1']),
+    ('round   levels=8 frames=4 spatial=1',['--threshold', 'round', '--levels', '8', '--frames', '4', '--spatial', '1']),
+
+    ('blue    spatial=0',                  ['--threshold', 'blue', '--spatial', '0']),
+    ('blue    frames=16 spatial=0',        ['--threshold', 'blue', '--frames', '16', '--spatial', '0']),
+    ('blue    frames=128 spatial=0',       ['--threshold', 'blue', '--frames', '128', '--spatial', '0']),
+    ('blue    mask=32x32 spatial=0',       ['--threshold', 'blue', '--mask-size', '32x32', '--spatial', '0']),
+    ('blue    mask=128x128 spatial=0',     ['--threshold', 'blue', '--mask-size', '128x128', '--spatial', '0']),
+    ('blue    seed=7 sigma=2.5 spatial=0', ['--threshold', 'blue', '--seed', '7', '--mask-sigma', '2.5', '--spatial', '0']),
+]
+
+thresholds = ['random', 'round', 'blue']
+frame_counts = ['1', '16', '128']
+levels =   ['2', '8' ]
+spatials = ['0', '0.1', '0.5', '1']
+linears =  [True, False]
+
+def add_full_tests():
+    for threshold in thresholds:
+        for frames in frame_counts:
+            for level in levels:
+                for spatial in spatials:
+                    for linear in linears:
+                        args=['--threshold', threshold, '--frames', frames, '--levels', level, '--spatial', spatial ]
+                        if linear: args.append('--linear')
+                        tests.append((f"{threshold} frames={frames} lvl={level} spatial={spatial} lin={linear}",args))
+
+if add_full:
+    add_full_tests()
+
+def label_key(label):
+    return ' '.join(label.split())
+
+expected_failure = {
+    label_key('round   spatial=0'):          200,  # round with no diffusion isn't density-preserving
+    label_key('round   spatial=1 lin'): 1,
+    # Same cause at 16 levels: srgb-spaced rungs are widest in linear light near
+    # white (lin(255)-lin(238) is ~2x a uniform step), so the undiffused rounding
+    # residual there is bigger. Passes cleanly once --spatial is on.
+    label_key('round   levels=16 spatial=0'):  7,
+    label_key('blue    mask=32x32 spatial=0'):23,  # a 32x32 mask can't hold 256 distinct thresholds; also noisier
+    label_key('blue    mask=128x128 spatial=0'): 4, # small masks are noisier
+    # rand() is unseeded; col 85 at ~33% density always draws 111/256 white (z=3.24).
+    label_key('random  spatial=0 lin'):        1,
+    label_key('random  frames=16 spatial=1'):  1,  # systematic wobble around 0, worse for many frames
+}
+
+unknown_expected_failures = sorted(
+    set(expected_failure) - {label_key(label) for label, _ in tests})
+if unknown_expected_failures:
+    sys.exit("expected_failure references unknown test(s): " +
+             ', '.join(unknown_expected_failures))
+
+def parse_trailer(stdout):
+    """Find 'RESULT key=val …' line from colstats; return dict or {} on miss."""
+    for line in reversed(stdout.splitlines()):
+        if line.startswith('RESULT '):
+            return dict(kv.split('=', 1) for kv in line[len('RESULT '):].split())
+    return {}
+
+print(f"ref={REF}\ndither={DITHER}\ncolstats={COLSTATS}\n")
+print(f"{'test':<50} {'worst |z|':>10} {'avg |z|':>10} {'fails':>6}  result")
+print('-' * 87)
+
+# Run dither inside a temp dir so nothing it writes can pollute the repo (side
+# files are opt-in now — no --save-frames or --mask-out is passed). The --out
+# path itself is absolute, so the averaged output still lands where we expect.
+overall_ok = True
+with tempfile.TemporaryDirectory(prefix='coltest.') as work:
+    out_path = os.path.join(work, 'out.png')
+    total_z=0
+    total_average_abs_z=0
+    total_fail=0
+    for label, args in tests:
+        if args is None:
+            check_target = REF                # identity sanity
+        else:
+            r = subprocess.run([DITHER, REF, *args, '--out', out_path],
+                               cwd=work, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"{label:<50} {'-':>10} {'-':>10} {'-':>6}  DITHER ERROR")
+                overall_ok = False
+                continue
+            check_target = out_path
+
+        # Pass --linear through to colstats so the decode matches what dither emits.
+        cs_args = [ COLSTATS, check_target, REF]
+        if args and '--linear' in args: cs_args.append('--linear')
+        r = subprocess.run(cs_args, capture_output=True, text=True)
+        info = parse_trailer(r.stdout)
+        if not info:
+            print(f"{label:<50} {'?':>10} {'?':>10} {'?':>6}  COLSTATS PARSE FAIL")
+            overall_ok = False
+            continue
+        verdict = info.get('verdict', '?')
+        fails   = info.get('fails', '?')
+        worst   = info.get('worst_z', '?')
+        average_abs_z = info.get('average_abs_z', '?')
+        try:
+            fail_count = int(fails)
+        except ValueError:
+            fail_count = None
+        try:
+            average_abs_z_value = float(average_abs_z)
+        except ValueError:
+            average_abs_z_value = None
+
+        max_expected_fails = expected_failure.get(label_key(label))
+        if verdict == 'PASS':
+            result = 'PASS'
+        elif (max_expected_fails is not None and fail_count is not None and
+              fail_count <= max_expected_fails):
+            result = f"EXPECTED <= {max_expected_fails}"
+        else:
+            result = verdict
+            overall_ok = False
+        print(f"{label:<50} {worst:>10} {average_abs_z:>10} {fails:>6}  {result}")
+        if max_expected_fails is None:
+            total_fail = total_fail + fail_count
+            total_z = total_z + float(worst)
+            if average_abs_z_value is not None:
+                total_average_abs_z = total_average_abs_z + average_abs_z_value
+
+print('-' * 87)
+print(f"{'OVERALL ' + ('PASS' if overall_ok else 'FAIL'):<50} "
+      f"{total_z:>10.2f} {total_average_abs_z:>10.2f} {total_fail:>6}  {' '}")
+sys.exit(0 if overall_ok else 1)
