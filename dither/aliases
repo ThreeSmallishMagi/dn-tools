@@ -1,8 +1,43 @@
-md() {
+install_deps() #   Install apt-packages.txt and requirements.txt
+{
+    command -v apt-get >/dev/null || { echo "not Debian — see the README for the brew line" >&2; return 1; }
+    sudo apt-get install $(cat apt-packages.txt) || return 1
+
+    [ -d dither_env ] || python3 -m venv dither_env || return 1
+    dither_env/bin/pip install -qr requirements.txt || return 1
+    export PATH="$PWD/dither_env/bin:$PATH"
+    python3 -c 'import cv2, numpy; print(f"ready: cv2 {cv2.__version__}, numpy {numpy.__version__}")'
+}
+
+build() #          Configure, build, then show the manual.
+{
+    cmake -B build "$@" && cmake --build build && help
+}
+
+deploy() #         Copy the git-tracked files to the public repo
+{
+    local src publicrepo
+    src=$(cd "${1:-.}" && pwd) || return 1
+    publicrepo="$src/../../public/dn-tools/dither"
+
+    ( cd "$src" || exit 1
+      mkdir -p "$publicrepo" || exit 1
+      git ls-files | while IFS= read -r f; do
+          [ -f "$f" ] || continue          # tracked but deleted locally
+          if [ -x "$f" ]; then mode=755; else mode=644; fi
+          mkdir -p "$publicrepo/$(dirname "$f")"
+          install -m "$mode" "$f" "$publicrepo/$f"
+      done ) || return 1
+    echo "deployed $(git -C "$src" ls-files | wc -l) tracked files to $publicrepo"
+}
+
+md() #             Read a markdown file
+{ 
     pandoc -s -t man $* | man -l -
 }
 
-icat(){
+icat() #           Display an image in the terminal
+{ 
     for f in $*;
     do
         #convert  $f -resize 1000x\> png:- |img2sixel -I
@@ -10,21 +45,22 @@ icat(){
     done
 }
 
-dim ()
-{
+dim () #           Display the dimensions of an image
+{ 
     for f in $*;
     do
         identify -format "%wx%h\n" $f;
     done
 }
 
-imagefmt ()
-{
+imagefmt () #      Show properties of an image
+{ 
     local img=$1
     identify -format "FileName:%[filename]\nSize:%[w]x%[h]\nColorSpace:%[colorspace]\nBitDepth:%[depth]\nGamma:%[gamma]\n" $img
 }
 
-icrop() {
+icrop() 
+{
     if [ $# -lt 3 ]; then
         echo "Usage: icrop <image> <x> <y>" >&2
         return 1
@@ -34,7 +70,8 @@ icrop() {
     convert "$1" -crop 100x100+$(($2 +128))+$(($3 + 128)) +repage -interpolate nearest -filter point -resize 1000x1000 sixel:-;
 }
 
-isquash() {
+isquash() 
+{
     if [ $# -lt 1 ]; then
         echo "Usage: isquash <image> [result [rows [cols]]]" >&2
         return 1
@@ -58,7 +95,8 @@ isquash() {
         "$res"
 }
 
-iaverage() {
+iaverage() 
+{
     if [ $# -lt 2 ]; then
         echo "Usage: iaverage <output> <image1> <image2> [image3 ...]" >&2
         return 1
@@ -68,16 +106,15 @@ iaverage() {
     convert "$@" -evaluate-sequence mean "$output"
 }
 
-histo() {
+histo() 
+{
     local img=${1:-dither.png}
     local res=${2:-sixel:-}
     convert $img -colorspace gray histogram:$res
 }
 
-# Usage: rampdiff [image [result [reference [scale [threshold]]]]]
-# Difference is measured in normalized pixel values. Pixels over threshold
-# get a white hatch so >10% deviations are apparent without changing scale.
-rampdiff() {
+rampdiff() #       Usage: rampdiff [image [result [reference [scale ]]]]
+{ 
     local img=${1:-dither.png}
     local res=${2:-sixel:-}
     local ref=${3:-examples/ramp_256x256.png}
@@ -95,7 +132,7 @@ rampdiff() {
           "$res"
 }
 
-analyse()
+analyse() 
 {
     img=${1:-dither.png}
     res=${2:-sixel:-}
@@ -106,12 +143,14 @@ analyse()
     -resize x1000 +append -filter point -resize 2000x $res
 }
 
-test_dither() {
+test_dither() 
+{
     local args="$@"
     dither examples/ramp_256x256.png $args && analyse
 }
 
-run_suite() {
+run_suite() 
+{
     local extra_args="$@"
     test_dither $extra_args
     test_dither --threshold random $extra_args
@@ -121,7 +160,7 @@ run_suite() {
     test_dither --threshold blue --spatial 1 $extra_args
 }
 
-gallery()
+gallery() #        Show what various combinations of options do
 {
     run_suite
     echo "-- multi frame average --"
@@ -130,7 +169,16 @@ gallery()
     run_suite --levels 8
 }
 
-help() {
+help() 
+{
     local mdfile=${1:-README.md}
-    pandoc -s -t man $mdfile | man -l -
+    if command -v pandoc >/dev/null 2>&1; then
+        pandoc -s -t man "$mdfile" | man -l -
+    else
+        less "$mdfile"
+    fi
 }
+
+
+export PATH=$PATH:$(pwd)/build
+grep -e '() #' "${BASH_SOURCE[0]}" |grep -v grep

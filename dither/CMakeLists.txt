@@ -22,10 +22,3 @@ target_include_directories(temporaldither PRIVATE ${OpenCV_INCLUDE_DIRS})
 add_executable(dither dither.cpp bluenoise.cpp srgb.cpp)
 target_link_libraries(dither PRIVATE ${OpenCV_LIBS})
 target_include_directories(dither PRIVATE ${OpenCV_INCLUDE_DIRS})
-
-add_custom_target(deploy
-    COMMAND "${CMAKE_SOURCE_DIR}/deploy.sh" "${CMAKE_SOURCE_DIR}"
-    DEPENDS dither
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Running deployment script"
-)

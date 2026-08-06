@@ -5,13 +5,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build
 
 Dependencies come from two manifests at the repo root — `apt-packages.txt` (system)
-and `requirements.txt` (Python, for the verification tools only):
+and `requirements.txt` (Python, for the verification tools only). The `aliases`
+file drives both, and `build`/`deploy` live there too — there are no build or
+deploy scripts:
 
 ```sh
-sudo apt install -y $(grep -v '^\s*#' apt-packages.txt)
-python3 -m venv dither_env                        # PEP 668: no system-wide pip
-dither_env/bin/pip install -r requirements.txt
+source aliases
+install_deps          # apt (interactive) + the dither_env virtualenv
+build                 # cmake -B build && cmake --build build, then show README
+deploy                # copy the git-tracked files to ../../public/dn-tools/dither
 ```
+
+`install_deps` also exports `dither_env/bin` onto `PATH`, which is what lets
+`coltest` reach the venv's `cv2` (see Verification). By hand:
 
 ```sh
 cmake -B build        # configure (defaults to Release / -O3)

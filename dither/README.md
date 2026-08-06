@@ -1,6 +1,8 @@
 # dither
 
-Command-line image dithering. All quantization happens in linear light, with the
+Start by running "source aliases"
+
+A command-line image dithering tool. All quantization happens in linear light, with the
 sRGB curve applied only at the encode and decode boundaries, so the dot density
 of the output averages back to the tone of the input. Supports multi-level
 output, blue-noise masks, and averaging over several dithered frames.
@@ -65,14 +67,13 @@ you picked deliberately is usually one you want to see on its own. Pass
 :   Where those tones sit. `srgb` (default) spaces them evenly in pixel value —
     3 levels are 0/128/255 — putting the middle level at perceptual half and
     keeping shadow noise down. `linear` spaces them evenly in linear light, so 3
-    levels are 0/188/255. Dithering stays density-correct either way. No effect
-    at `--levels 2` or with `--linear`.
+    levels are 0/188/255. No effect at `--levels 2` or with `--linear`.
 
 `--frames <n>`
-:   Dither *n* independent frames and average them. Smooths noise and gives
-    finer gradations at the cost of crisp dot edges. Error withheld by
-    `--spatial` is not lost across frames: it stays in the pixel's budget and is
-    paid back later, so the average still converges on the target tone.
+:   Dither *n* independent frames and average them; for `blue`, each frame uses
+    a random shift of the same mask. Error withheld by `--spatial` is not lost
+    across frames — it stays in the pixel's budget and is paid back later, so
+    the average still converges on the target tone.
 
 `--save-frames`
 :   Also write each frame beside the average, as `<stem>-N.png`.
@@ -95,19 +96,18 @@ you picked deliberately is usually one you want to see on its own. Pass
 
 `--mask-size <WxH>`
 :   Build a WxH tile and repeat it over the image. Defaults to the image size
-    capped at 256×256, because build time grows with area: an uncapped 1200×1600
-    mask takes about a minute against a second for the 256×256 tile. Larger
-    sizes are honoured when asked for explicitly. Keep the tile at least 4× sigma
-    to avoid visible repetition.
+    capped at 256×256, since build time grows with area; larger sizes are
+    honoured when asked for. Keep the tile at least 4× sigma to avoid visible
+    repetition.
 
 `--mask-sigma <val>`
 :   Kernel radius in pixels — how far dots repel each other. Default `1.8`; try
     `1.0`–`4.0` depending on output resolution.
 
 `--mask-in <path>`
-:   Use this image as the mask instead of building one. Read as raw grayscale
-    and tiled like a generated mask, so a saved mask can be reused without
-    paying to rebuild it. The mask-building options are then ignored.
+:   Use this image as the mask instead of building one; read as raw grayscale
+    and tiled like a generated mask. The mask-building options are then
+    ignored.
 
 `--mask-out <path>`
 :   Write the mask in use to this path, for inspection or for feeding back in
@@ -143,130 +143,40 @@ dither photo.jpg --threshold blue --spatial 0.5 --mask-out mask.png --out out.pn
 
 ## Build
 
-Requires OpenCV 4.x and a C++17 compiler. System packages are listed in
-`apt-packages.txt`:
+Requires OpenCV 4.x and a C++17 compiler. Dependencies are listed in
+`apt-packages.txt` (system) and `requirements.txt` (Python, for the verification
+tools). `install_deps` handles both:
 
 ```sh
-sudo apt install -y $(grep -v '^\s*#' apt-packages.txt)   # Ubuntu 22.04 / 24.04
-cmake -B build
-cmake --build build
+source aliases
+install_deps          # apt, then the dither_env virtualenv
+build                 # cmake configure + build, then show this manual
 ```
 
-On macOS, `xcode-select --install` then
-`brew install cmake opencv imagemagick gnuplot pandoc` covers the same ground.
-For a debug build, configure with `-DCMAKE_BUILD_TYPE=Debug`; the default is
-Release. `./build.sh` configures, builds, and displays this README in one step.
+`install_deps` leaves `dither_env/bin` on `PATH`, which is what the Python tools
+need to find their interpreter. The virtualenv is separate because Ubuntu 24.04
+marks its system Python externally managed (PEP 668); `dither_env` is already in
+`.gitignore`.
 
-The verification tools additionally need NumPy and OpenCV's Python bindings.
-Ubuntu 24.04 marks its system Python externally managed (PEP 668), so install
-them into a virtualenv — `dither_env` is already in `.gitignore`:
+To do it by hand, or on macOS where `install_deps` bows out:
 
 ```sh
+sudo apt install $(cat apt-packages.txt)   # Ubuntu 22.04 / 24.04
 python3 -m venv dither_env
 dither_env/bin/pip install -r requirements.txt
+cmake -B build && cmake --build build
 ```
+
+The default build type is Release; configure with `-DCMAKE_BUILD_TYPE=Debug` for
+a debug build. Nothing in the C++ build needs the virtualenv — skip it if you
+only want the `dither` binary.
 
 ## Tools
 
-<<<<<<< HEAD
 These sit at the repo root. The Python ones find their interpreter through
-`#!/usr/bin/env python3` and shell out to each other, so put the virtualenv on
-`PATH` rather than invoking `dither_env/bin/python` directly:
-=======
-**3. Build**
-
-```sh
-cmake -B build
-cmake --build build
-```
-
-The default build type is Release (`-O3`). For a debug build:
-
-```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-```
-
-`./build.sh` does the same configure-and-build in one shot, then displays this README.
-
-**4. Check it works**
-
-```sh
-./build/dither examples/ramp_256x256.png --out /tmp/out.png
-export PATH="$PWD/dither_env/bin:$PATH"   # put the venv's python3 first
-./coltest                                 # expects OVERALL PASS
-```
-
-## Usage
-
-```
-dither <image> [options]
-```
-
-### Options
-
-| Option              | Default         | Description                                                  |
-|---------------------|-----------------|--------------------------------------------------------------|
-| `--threshold <name>`| `round`         | How each pixel picks its level: `round`, `random`, or `blue` (see above). |
-| `--spatial <frac>` | `1`, or `0` with `--threshold` | Fraction of each pixel's quantization residual diffused to its neighbours by Floyd-Steinberg. `1` = full FS, `0` = none, in between = damped diffusion, which softens FS worming. |
-| `--out <path>` | `dither.png` | Output file path |
-| `--linear` | off | Treat pixel values as raw linear light, skipping the sRGB ↔ linear conversion that normally wraps the dither. |
-| `--levels <n>` | `2` | Number of output tones. `2` = black+white. Higher levels reduce visible dithering but require a display or printer that can reproduce intermediate tones. |
-| `--level-spacing <mode>` | `srgb` | Where those tones sit. `srgb` (the default) spaces them evenly in pixel value, so 3 levels are 0/128/255: the middle level lands at perceptual half, and shadows are dithered against a nearer neighbour instead of against white. `linear` spaces them evenly in linear light — 3 levels are 0/188/255 — which is the physically even ladder but pushes the middle tone up to light grey and makes the dark end noisier. |
-| `--frames <n>` | `1` | Dither *n* independent frames and average them. For `blue`, each frame uses a random shift of the same mask. |
-| `--save-frames` | off | Also write each frame alongside the average, as `<stem>-N.png`. |
-| `--seed <n>` | `42` | Random seed, for reproducible masks and stochastic thresholds. |
-| `--debug-pixel <r,c>` | off | Print the per-frame `ideal`/`display`/`displayed` trace for one pixel to stderr. |
-
-With multiple frames, the withheld part of `--spatial` isn't lost: it stays in the
-pixel's budget and is paid back by a later frame, so the average still converges on
-the target tone.
-
-#### blue-only options
-
-| Option | Default | Description                    |
-|--------|---------|-------------------------------|
-| `--mask-sigma <val>` | `1.8` | Blue-noise kernel radius in pixels. Controls how far dots repel each other. Larger values spread dots further apart — try `1.0`–`4.0` depending on output resolution. |
-| `--mask-size <WxH>` | image size, capped at 256×256 | Generate a WxH tile and repeat it over the image.  |
-| `--mask-in <path>` | off | Use this image as the threshold mask instead of building one. Any 8-bit image works; it is read as raw grayscale (no sRGB decode) |
-| `--mask-out <path>` | off | Write the mask in use to this path, for inspection or for feeding back in via `--mask-in`. |
-| `--mask-eps <val>` | `1e-4` | Gaussian kernel weight cutoff. Reduce to improve quality slightly at the cost of speed. |
-| `--mask-radius <mul>` | `6.0` | Kernel half-width in sigma units. Rarely needs changing unless sigma is very large. |
-
-## Examples
-
-Binary dither with Floyd-Steinberg (default):
-```sh
-dither photo.jpg --out out.png
-```
-
-Four-level blue dither, tiling a 128×128 mask for speed:
-```sh
-dither photo.jpg --threshold blue --spatial 0 --levels 4 --mask-size 128x128 --out out.png
-```
-
-Smooth averaged result using 30 frames:
-```sh
-dither photo.jpg --frames 30 --out out.png
-```
-
-High-quality blue dither with a tighter kernel, keeping the mask for inspection:
-```sh
-dither photo.jpg --threshold blue --spatial 0 --mask-sigma 2.5 --mask-out mask.png --out out.png
-```
-
-Blue noise with half-strength error diffusion:
-```sh
-dither photo.jpg --threshold blue --spatial 0.5 --out out.png
-```
-
-## Verification and analysis tools
-
-These live at the repo root and are what the setup steps above install dependencies
-for. The Python ones resolve their interpreter through `#!/usr/bin/env python3` and
-shell out to each other, so put the virtualenv on `PATH` first rather than invoking
-`dither_env/bin/python` directly:
->>>>>>> refs/remotes/origin/master
+`#!/usr/bin/env python3` and shell out to each other, so the virtualenv has to be
+on `PATH` rather than invoked as `dither_env/bin/python`. `install_deps` does
+that for the current shell; otherwise:
 
 ```sh
 export PATH="$PWD/dither_env/bin:$PATH"
@@ -275,19 +185,9 @@ export PATH="$PWD/dither_env/bin:$PATH"
 Without it `coltest` reports `COLSTATS PARSE FAIL` on every row, which means
 `cv2` is missing, not that the dither is broken.
 
-<<<<<<< HEAD
 `./coltest`
 :   Runs a matrix of `dither` invocations against `examples/ramp_256x256.png`
     and checks each output for density preservation.
-=======
-| Tool | Needs | What it does                      |
-|------|-------|-----------------------------------|
-| `coltest` | venv | Runs a matrix of `dither` invocations against `examples/ramp_256x256.png` and checks each output for density preservation. `./coltest` |
-| `colstats` | venv | Per-column density check of one image against a reference: column means in linear light, z-scored against counting noise. `./colstats out.png` |
-| `budgettest` | venv | Verifies the multi-frame invariant — with `--spatial 0`, the levels displayed for a pixel sum exactly to its budget. |
-| `colplot` | gnuplot | Plots `colstats --csv` output as sixels. `gnuplot colplot` |
-| `aliases` | imagemagick, gnuplot, pandoc, venv | Shell helpers, loaded with `source aliases`. `analyse out.png` gives a one-shot look at a result — the image, a scaled difference against the reference, and the colstats plot side by side; `test_dither <args>` dithers the ramp and analyses it in one step, and `run_suite` / `gallery` sweep that over the thresholds. `icat`, `rampdiff`, `isquash`, `iaverage`, `histo`, `icrop`, and `dim` inspect images directly. |
->>>>>>> refs/remotes/origin/master
 
 `./colstats <image>`
 :   Per-column density check against a reference: column means in linear light,
@@ -301,7 +201,9 @@ Without it `coltest` reports `COLSTATS PARSE FAIL` on every row, which means
 :   Plots `colstats --csv` output as sixels.
 
 `source aliases`
-:   Shell helpers. `analyse out.png` shows the image, a scaled difference
+:   Shell helpers. `install_deps` installs dependencies, `build` configures and
+    builds, `deploy` copies the git-tracked files to the public repo.
+    `analyse out.png` shows the image, a scaled difference
     against the reference, and the colstats plot side by side; `test_dither
     <args>` dithers the ramp and analyses it in one step; `run_suite` and
     `gallery` sweep that across thresholds. `icat`, `rampdiff`, `isquash`,
