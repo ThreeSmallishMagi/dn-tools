@@ -17,5 +17,6 @@ srgbtest
 *.png
 *.jpg
 dither.csv
+!images/*.png
 !examples/*.png
 !examples/*.jpg

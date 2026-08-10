@@ -143,6 +143,84 @@ analyse()
     -resize x1000 +append -filter point -resize 2000x $res
 }
 
+dither_with_caption()
+{
+    local input=$1
+    local output=$2
+    shift 2
+    local args="$@"
+    
+    dither "$input" "$@" --out "$output"
+    
+    local caption="dither ${args}"
+    convert "$output" \
+        -gravity South -background white -splice 0x25 \
+        -pointsize 14 -annotate +0+2 "$caption" \
+        "$output"
+}
+
+examples()
+{
+    convert examples/ramp_256x256.png <(convert examples/m039crop.png -resize 256 -)  +append ex.png
+    
+    dither_with_caption ex.png ex_round.png --threshold round
+    dither_with_caption ex.png ex_random.png --threshold random
+    dither_with_caption ex.png ex_blue.png --threshold blue
+    convert ex_round.png ex_random.png ex_blue.png -append -filter point -resize 1000x examples.png
+    rm ex_round.png ex_random.png ex_blue.png
+
+    dither_with_caption ex.png ex_roundfs.png --threshold round --spatial 1
+    dither_with_caption ex.png ex_randomfs.png --threshold random --spatial 1
+    dither_with_caption ex.png ex_bluefs.png --threshold blue --spatial 1
+    convert ex_roundfs.png ex_randomfs.png ex_bluefs.png -append -filter point -resize 1000x examples_spatial.png
+    rm ex_roundfs.png ex_randomfs.png ex_bluefs.png
+
+    dither_with_caption ex.png ex_roundfs8.png --threshold round  --levels 8
+    dither_with_caption ex.png ex_randomfs8.png --threshold random  --levels 8
+    dither_with_caption ex.png ex_bluefs8.png --threshold blue  --levels 8
+    convert ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png -append -filter point -resize 1000x examples_levels.png
+    rm ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png
+
+    dither_with_caption ex.png ex_roundfsl8.png --threshold round  --frames 8
+    dither_with_caption ex.png ex_randomfsl8.png --threshold random  --frames 8
+    dither_with_caption ex.png ex_bluefsl8.png --threshold blue  --frames 8
+    convert ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png -append -filter point -resize 1000x examples_frames.png
+    rm ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png
+
+    rm ex.png
+    mv examples*.png images/
+}
+
+examples0()
+{
+    convert examples/ramp_256x256.png <(convert examples/m039crop.png -resize 256 -)  +append ex.png
+    dither ex.png --threshold round  --out ex_round.png
+    dither ex.png --threshold random --out ex_random.png
+    dither ex.png --threshold blue   --out ex_blue.png
+    convert ex_round.png ex_random.png ex_blue.png -append  -filter point -resize 1000x  examples.png
+    rm ex_round.png ex_random.png ex_blue.png
+
+    dither ex.png --threshold round  --spatial 1 --out ex_roundfs.png
+    dither ex.png --threshold random --spatial 1 --out ex_randomfs.png
+    dither ex.png --threshold blue   --spatial 1 --out ex_bluefs.png
+    convert ex_roundfs.png ex_randomfs.png ex_bluefs.png -append -filter point -resize 1000x   examples_spatial.png
+    rm ex_roundfs.png ex_randomfs.png ex_bluefs.png
+
+    dither ex.png --threshold round  --spatial 1 --levels 8 --out ex_roundfs8.png
+    dither ex.png --threshold random --spatial 1 --levels 8 --out ex_randomfs8.png
+    dither ex.png --threshold blue   --spatial 1 --levels 8 --out ex_bluefs8.png
+    convert ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png -append  -filter point -resize 1000x  examples_spatial_levels.png
+    rm ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png
+
+    dither ex.png --threshold round  --spatial 1 --frames 8 --out ex_roundfsl8.png
+    dither ex.png --threshold random --spatial 1 --frames 8 --out ex_randomfsl8.png
+    dither ex.png --threshold blue   --spatial 1 --frames 8 --out ex_bluefsl8.png
+    convert ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png -append  -filter point -resize 1000x  examples_spatial_average.png
+    rm ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png
+
+    rm ex.png
+}
+
 test_dither() 
 {
     local args="$@"

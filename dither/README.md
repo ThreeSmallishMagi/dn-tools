@@ -19,6 +19,18 @@ options:
 ```sh
 dither photo.jpg --out out.png
 ```
+## Examples
+**examples.png** - Three threshold modes without diffusion:
+![examples.png](images/examples.png)
+
+**examples_spatial.png** - Same thresholds with full Floyd-Steinberg diffusion:
+![examples_spatial.png](images/examples_spatial.png)
+
+**examples_levels.png** - 8-level output comparison:
+![examples_levels.png](images/examples_levels.png)
+
+**examples_frames.png** - 8-frame averaging comparison:
+![examples_frames.png](images/examples_frames.png)
 
 ## How a dither is specified
 
