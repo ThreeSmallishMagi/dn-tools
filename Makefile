@@ -1,4 +1,4 @@
-
+# DN-Tools v14Aug2026
 INSTALL_BASE=/usr/local
 #INSTALL_BASE=${HOME}/.local
 

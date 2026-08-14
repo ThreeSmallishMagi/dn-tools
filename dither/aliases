@@ -33,7 +33,7 @@ deploy() #         Copy the git-tracked files to the public repo
 
 md() #             Read a markdown file
 { 
-    pandoc -s -t man $* | man -l -
+    pandoc -s -f gfm -t man $* | man -l -
 }
 
 icat() #           Display an image in the terminal

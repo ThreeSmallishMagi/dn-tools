@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Manipulate Photoshop ACV curve files and pencil curve AMP files.
+Manipulate Photoshop ACV tone curve files and pencil curve AMP files.
 
 Options:
   -s, --select    Choose best 16 points (Photoshop's limit)
   -p, --preserve  Preserve x-values from first input
+  -q, --quiet     Turn off debug output
+  -w, --width     Terminal plot width, used by show
+  -v, --pivot     Pivot for contrast (default 128)
 
 File formats:
-  .acv   Photoshop curve files
+  .acv   Photoshop tone curve files
   .amp   8-bit pencil curves (256 bytes)
   .csv   Real values with no clipping
   '%'    Display curve on screen (can be omitted)
@@ -22,11 +25,12 @@ Usage:
   acv min <new x=0 value> <input> <output>
             Change the offset of a curve so that the x=0 has the given output.
   acv contrast <factor> <input> <output>
-            Change the contrast of a curve pivoting around x=128.
+            Change the contrast of a curve pivoting around x=128 (or -v pivot).
   acv gamma <gamma> <input> <output>
             Apply a gamma adjustment to a curve.
   acv linear <error> <input> <output_model>
-            Fit a straight line to curve points error away from 0/255.
+            Fit a straight line to the curve, ignoring points whose output is
+            within <error> fraction of 0/255.
   acv compose <curve1> <curve2> <output>
             Compose two curves (apply one after the other) Returns curve2 ∘ curve1.
   acv diff <curve1> <curve2> <output>
@@ -46,16 +50,20 @@ Usage:
             Combine two curves by adding curve2's deviation from identity.
   acv inverse <input> <output>
             Invert a curve. Flip it about the line y=x.
+  acv invert  <input> <output>
+            Flip a curve around the line x=128. Simulates the effects of inverting before printing.
   acv smooth <points> <input> <output>
             Smooth a curve by fitting a spline with <points>points.
   acv average <span> <input> <output>
             Smooth a curve by averaging points within <span> of x.
+  acv gradient <span> <input> <output>
+            Return 128 plus the gradient of curve using points within <span> of x.
   acv identity <output>
             Output an identity curve.
   acv show <curve> [<reference>]
             Display curve and optional reference curve.
-
 """
+
 #ACV File format:
 #  - 2 bytes: Version (1 or 4)
 #  - 2 bytes: Curve count (for version 4)
@@ -107,6 +115,7 @@ def open_file(filename, mode):
         with open(filename, mode) as f:
             yield f
 
+# -- Read --
 def read_acv(filename):
     """Read a Photoshop ACV file.
        return data in curve format [ [(i1,o1),...], ... ] """
@@ -169,15 +178,22 @@ def read_amp(filename):
 def read_csv(filename):
     """Read a CSV file containing curves.
     The file is expected to contain a header line followed by lines of the form:
-        curve,x,y
-    where curve is the curve index, x is the input, and y is the output.
+        channel,x,y
+    where channel is the curve index, x is the input, and y is the output.
     """
     with open_file(filename, "r") as f:
         lines = f.readlines()
-    curves, current_ix = [], None
+    curves, current_ix, comments = [], None, []
 
-    for line in lines[1:]:  # Skip header
-        ix, input, output  = line.strip().split(",")
+    for line in lines:  # Skip header
+        line = line.strip()
+        if line.startswith('channel,') or line.startswith('curve'):
+            continue
+        if line.startswith('#'):
+            comments.append(line[1:].strip())
+            continue
+
+        ix, input, output  = line.split(",")
 
         if current_ix != ix:
             curves.append([])
@@ -185,8 +201,29 @@ def read_csv(filename):
 
         curves[-1].append((float(input), float(output)))
 
-    return 4, curves
+    return 4, curves, comments
 
+history = {}
+
+def read_curve(filename):
+    """Read a single curve from a file.
+    If the filename ends with .amp, it is interpreted as a Photoshop pencil curve.
+    Otherwise it is read as a standard ACV file.
+    """
+    if filename in history:
+        return history[filename]
+    if filename.lower().endswith(".amp"):
+        _,curves =  read_amp(filename)
+    elif filename.lower().endswith(".acv"):
+        _, curves = read_acv(filename)
+    else:
+        _, curves, _ = read_csv(filename)
+    if not curves:
+        raise ValueError("No curves found in file.")
+    return curves
+
+
+#-- Write --
 
 def write_acv(curves, filename, version=4):
     """Write curves to a Photoshop ACV file."""
@@ -209,47 +246,30 @@ def write_amp(curves, filename):
             map= [clamp(o) for i,o in curve]
             f.write(bytes(map))
 
-def write_csv(curves, filename):
+def write_csv(curves, filename, comment=None):
     """Write curves to a CSV file."""
     with open_file(filename, "w") as f:
-        f.write("curve,x,y\n")
+        if comment:
+            f.write(f"# {comment}\n")
+        f.write("channel,x,y\n")
         for ix,curve in enumerate(curves):
             for input_val, output_val in curve:
                 f.write(f"{ix},{input_val},{output_val}\n")
 
-history = {}
-
-def read_curve(filename):
-    """Read a single curve from a file.
-    If the filename ends with .amp, it is interpreted as a Photoshop pencil curve.
-    Otherwise it is read as a standard ACV file.
-    """
-    if filename in history:
-        return history[filename]
-    if filename.lower().endswith(".amp"):
-        _,curves =  read_amp(filename)
-    elif filename.lower().endswith(".acv"):
-        _, curves = read_acv(filename)
-    else:
-        _, curves = read_csv(filename)
-    if not curves:
-        raise ValueError("No curves found in file.")
-    return curves
-
-
-def write_curve(curves, filename, version=4):
+def write_curve(curves, filename, version=4, comment=None):
     """Write curves to either ACV or AMP depending on extension."""
     try:
         history[filename] = curves
         if filename[0] == '$':
             return
         elif filename.lower().endswith(".amp"):
-            mappings = fill_curve(curves)
+            mappings = [window(m) for m in fill_curve(curves)]
             write_amp(mappings, filename)
         elif filename.lower().endswith(".acv"):
-            write_acv(curves, filename, version)
+            write_acv([window(c) if is_mapping([c]) else c for c in curves],
+                      filename, version)
         else:
-            write_csv(curves, filename)
+            write_csv(curves, filename, comment)
         if filename[0] != '-':
             dbg(f"Saved curves to {filename}")
     except BrokenPipeError:
@@ -269,6 +289,7 @@ BOLD      = '\033[1m'
 CURVE_CLR = '\033[97m'  # bright white
 DIAG_CLR  = '\033[90m'  # dark grey
 FILL_CLR  = DIAG_CLR  #'\033[92m'  # green for fill curve
+FILL_CLR  = '\033[2;32m'  # green for fill curve
 RESET     = '\033[0m'
 
 def display_curve(curves, width=screen_width, height=screen_height, ref_curve=None):
@@ -291,7 +312,7 @@ def display_curve(curves, width=screen_width, height=screen_height, ref_curve=No
 
     # 0) plot the fill_curve version first (background)
     filled_curves = fill_curve(curves) if ref_curve is None else fill_curve(ref_curve)
-    for inp, out in filled_curves[0]:
+    for inp, out in window(filled_curves[0]):
         xdot = int(round(clamp(inp)  / 255 * max_xdot))
         ydot = int(round(clamp(out)  / 255 * max_ydot))
         # flip Y so 0 at bottom
@@ -302,7 +323,7 @@ def display_curve(curves, width=screen_width, height=screen_height, ref_curve=No
 
     # 1) plot your curves
     #print(f"plotting {curves} ")
-    for inp, out in curves[0]:
+    for inp, out in window(curves[0]):
         xdot = int(round(clamp(inp)  / 255 * max_xdot))
         ydot = int(round(clamp(out)  / 255 * max_ydot))
         # flip Y so 0 at bottom
@@ -457,23 +478,52 @@ def spline_eval(x, coeffs):
     return Y[i] + b[i]*dx + c[i]*dx*dx + d[i]*dx*dx*dx
 
 
+# A curve is a list of (x, y). A *mapping* is one sampled at every integer x over
+# a contiguous domain that covers at least 0..255. The domain may be wider: the
+# inverse of a curve whose output leaves 0..255 is defined outside it, and so is
+# the residual from divide. Only the formats that cannot hold that clamp it, on
+# the way out. DOMAIN_LIMIT stops a pathological curve filling forever.
+DOMAIN_LIMIT = 4096
+
+def merge_duplicate_x(curve):
+    """ One point per integer x, averaging any duplicates """
+    groups = {}
+    for x, y in curve:
+        groups.setdefault(round(x), []).append(y)
+    return [(x, sum(ys) / len(ys)) for x, ys in sorted(groups.items())]
+
+def value_at(mapping, x):
+    """ Value of a mapping at integer x. Mappings need not start at 0. """
+    i = int(x) - int(mapping[0][0])
+    return mapping[max(0, min(len(mapping) - 1, i))][1]
+
+def window(mapping, lo=0, hi=255):
+    """ The lo..hi part of a mapping, for formats that hold only that """
+    return [(x, y) for x, y in mapping if lo <= x <= hi]
+
 def fill_curve(curves):
     """ Fill in the gaps between curve points using a spline interpolation """
     if is_mapping(curves): return curves
     dbg(f"Fill {[len(c) for c in curves]} point curves")
     mappings = []
-    curves = cmd_average(curves,0) # average duplicate x values
     for curve in curves:
+        curve = merge_duplicate_x(curve)
         coeffs = compute_spline_coefficients(curve)
-        mappings.append( [ (i,spline_eval(i, coeffs)) for i in range(256)])
+        lo = max(-DOMAIN_LIMIT, min(0, int(curve[0][0])))
+        hi = min(DOMAIN_LIMIT, max(255, int(curve[-1][0])))
+        mappings.append( [ (i,spline_eval(i, coeffs)) for i in range(lo, hi+1)])
     return mappings
 
 # ---------- Reduction & Preservation ----------
 
 def is_mapping(curves):
-    """ Return True if the x range is the range 0..255 """
-    return ([[x for x,_ in curve] for curve in curves] ==
-           [[x for x in range(256)] for _ in curves])
+    """ True if every curve is sampled at each integer x over a contiguous
+        domain covering at least 0..255 """
+    for curve in curves:
+        xs = [x for x,_ in curve]
+        if not xs or xs[0] > 0 or xs[-1] < 255: return False
+        if xs != list(range(int(xs[0]), int(xs[0]) + len(xs))): return False
+    return True
 
 def sample_curve(curves, n=MAX_CONTROL_POINTS):
     """ Fit a spline with up to n points. Points are added at the points
@@ -488,7 +538,7 @@ def sample_curve(curves, n=MAX_CONTROL_POINTS):
 
         while len(sel) < n:
             # Build spline from current selected points
-            current_points = [(x, curve[x][1]) for x in sorted(sel)]
+            current_points = [(x, value_at(curve,x)) for x in sorted(sel)]
             coeffs = compute_spline_coefficients(current_points)
 
             best_err, best_x = -1, None
@@ -496,7 +546,7 @@ def sample_curve(curves, n=MAX_CONTROL_POINTS):
             # Find point with maximum spline interpolation error
             for x in range(256):
                 if x not in sel:
-                    actual_y = curve[x][1]
+                    actual_y = value_at(curve,x)
                     spline_y = spline_eval(x, coeffs)
                     err = abs(actual_y - spline_y)
 
@@ -509,7 +559,7 @@ def sample_curve(curves, n=MAX_CONTROL_POINTS):
 
             sel.add(best_x)
 
-        new_curves.append([(x, curve[x][1]) for x in sorted(sel)])
+        new_curves.append([(x, value_at(curve,x)) for x in sorted(sel)])
 
     return new_curves
 
@@ -539,7 +589,7 @@ def least_squares_line(curve,nonlinear_fraction):
     slope  = (n*sum_xy - sum_x*sum_y) / denom if denom else 0.0
     offset = (sum_y - slope*sum_x) / n
 
-    #dbg(f"least_squares_line: {offset:.1f} + {slope:.1f}x ({low},{high}) ")
+    dbg(f"least_squares_line: {offset:.1f} + {slope:.2f}x ({low},{high}) ")
     return offset, slope
 
 def preserve_x(curves, original):
@@ -566,9 +616,13 @@ def cmd_inverse(curves):
     inv = ([[(v,x) for x,v in curve] for curve in curves])
     return [sorted(curve) for curve in inv]
 
-def cmd_contrast(factor, curves):
+def cmd_invert(curves):
+    dbg("Apply invert ")
+    return [[(255 - x, y) for x, y in curve] for curve in curves]
+
+def cmd_contrast(factor, curves, pivot=128):
     dbg(f"Apply contrast {factor} ")
-    return [[ (x, 128 + factor * (y-128)) for x,y in curve] for curve in curves]
+    return [[ (x, pivot + factor * (y-pivot)) for x,y in curve] for curve in curves]
 
 def cmd_min(min, curves):
     curves = [sorted(curve) for curve in curves]
@@ -603,14 +657,13 @@ def cmd_compose(m1, m2):
     channels = min(len(fm1), len(fm2))
     dbg("Apply compose ")
 
-    # clamp(y) loses precision when curve is steep, so we linearly interpolate
-    def lookup(curve, y):
-        y = max(0.0, min(255.0, y))
-        i = int(y)
-        if i in (255,y):
-            return curve[i][1]
-        t = y - i
-        return curve[i][1] * (1 - t) + curve[i + 1][1] * t
+    # value_at() alone loses precision when the curve is steep, so interpolate
+    # between the two samples either side of y. y outside m2's domain falls back
+    # to its end value, which is what spline_eval does too.
+    def lookup(mapping, y):
+        lo = y // 1
+        t = y - lo
+        return value_at(mapping, lo) * (1 - t) + value_at(mapping, lo + 1) * t
 
     return [[(x, lookup(fm2[c], y)) for x, y in curve]
             for c, curve in enumerate(fm1[:channels])]
@@ -623,22 +676,23 @@ def find_invertible_line(curve, error):
     slope = (y2 - y1) / (x2 - x1)
     return y1 - slope*x1, slope
 
-def cmd_linear_estimate(curves,error=0.1):
-    dbg(f"Finding linear estimate of curve for points {error} away from 0 and 255 ")
+def cmd_linear_estimate(curves,nonlinear_fraction=0.1):
+    dbg(f"Finding linear estimate of curve for points {nonlinear_fraction} fraction away from 0 and 255 ")
+    curves = fill_curve(curves)
     return [[(x, offset + slope * x) for x in range(256)]
             #for offset, slope in (find_invertible_line(curve,error)
-            for offset, slope in (least_squares_line(curve,error)
+            for offset, slope in (least_squares_line(curve,nonlinear_fraction)
             for curve in curves)]
 
-def cmd_decompose(curves,lcd_gamma=2.2):
+def cmd_decompose(curves,lcd_gamma=2.2, nonlinear_fraction=0.1):
     """ Decompose curves into a model and residual where:
            curves ≈ residual ∘ linear ∘ gamma
        model represents LCD gamma + linear offset + contrast
        residual contains everything left """
-    dbg(f"Finding estimate of curve matching linear component ∘ gamma{lcd_gamma}  ")
+    dbg(f"Finding estimate of curve matching linear component ∘ gamma {lcd_gamma}  ")
     gamma = cmd_gamma(lcd_gamma,cmd_identity(len(curves)))
     gamma_residual = cmd_divide(curves, gamma)
-    linear = cmd_linear_estimate(gamma_residual)
+    linear = cmd_linear_estimate(gamma_residual, nonlinear_fraction)
     model = cmd_compose(gamma, linear)
     # residual = cmd_divide(curves, model)
     return model #residual
@@ -649,6 +703,26 @@ def cmd_smooth(curves, points=10):
 
 def unique(curves):
     return [list(dict.fromkeys(curve)) for curve in curves]
+
+def cmd_gradient(curves, span=5):
+    """ Find the gradient of curves using points within span of x """
+    def gradient_at(curve, i, x):
+        points_in_range = [(cx, cy) for cx, cy in curve if abs(cx - x) <= span]
+        
+        gradients = []
+        for j in range(len(points_in_range)):
+            for k in range(j + 1, len(points_in_range)):
+                dx = points_in_range[k][0] - points_in_range[j][0]
+                if dx != 0:
+                    dy = points_in_range[k][1] - points_in_range[j][1]
+                    gradients.append(dy / dx)
+        
+        return sum(gradients) / len(gradients) if gradients else 1.0
+    
+    dbg(f"Computing gradient using points within {span} of x")
+    curves = fill_curve([sorted(c) for c in curves])
+    return [[(x, gradient_at(curve, i, x)+128) for i, (x, _) in enumerate(curve)]
+            for curve in curves]
 
 def cmd_average(curves, span=5):
     """ Average points within span of x """
@@ -677,26 +751,26 @@ def cmd_adjust(m1, m2):
     m1 = fill_curve(m1)
     m2 = fill_curve(m2)
     dbg("Adding m2's deviation from linear to m1 ")
-    return [ [(x, m1[c][x][1] + m2[c][x][1] - x) for x in range(256)]
+    return [ [(x, value_at(m1[c],x) + value_at(m2[c],x) - x) for x in range(256)]
            for c in range(min(len(m1), len(m2)))]
 
 def cmd_diff(m1, m2):
     m1 = fill_curve(m1)
     m2 = fill_curve(m2)
     dbg("Calculating m1 - m2 + 128 ")
-    return [ [(x, m1[c][x][1] - m2[c][x][1] +128) for x in range(256)]
+    return [ [(x, value_at(m1[c],x) - value_at(m2[c],x) +128) for x in range(256)]
            for c in range(min(len(m1), len(m2)))]
 
 def cmd_at(m1,x):
     m1 = fill_curve(m1)
-    y=m1[0][x][1]
+    y=value_at(m1[0],x)
     dbg(f"Curve at {x} is {y} ")
     return y
 
 def cmd_max_error(m1, m2):
     m1 = fill_curve(m1)
     m2 = fill_curve(m2)
-    error = max(abs(m1[c][x][1] - m2[c][x][1]) for c in range(len(m1)) for x in range(256))
+    error = max(abs(value_at(m1[c],x) - value_at(m2[c],x)) for c in range(len(m1)) for x in range(256))
     dbg(f"Max difference between m1 and m2 is {error} ")
     return error
 
@@ -726,13 +800,19 @@ def process(args):
         screen_width, screen_height = int(args[wix + 1]), int(args[wix + 1]) // 3
         del args[wix:wix + 2] 
 
+    pivot = 128
+    pix = next((i for i, a in enumerate(args) if a in {'-v', '--pivot'}), None)
+    if pix is not None and pix + 1 < len(args):
+        pivot = int(args[pix + 1])
+        del args[pix:pix + 2]
+
     cmd = args[0].lower()
     args = args[1:]
 
 
     if quiet:
         global DEBUG
-        DEBUG = not DEBUG
+        DEBUG = False
 
     if cmd != 'show':
         args.append('%' if sys.stdout.isatty() else '-')
@@ -746,9 +826,11 @@ def process(args):
                          (cmd_identity()),
     'inverse':   lambda: (lambda oc: (oc, cmd_inverse(oc), args[1]))
                          (read_curve(args[0])),
+    'invert':    lambda: (lambda oc: (oc, cmd_invert(oc), args[1]))
+                         (read_curve(args[0])),
     'offset':    lambda: (lambda oc: (oc, cmd_offset(float(args[0]), oc), args[2]))
                          (read_curve(args[1])),
-    'contrast':  lambda: (lambda oc: (oc, cmd_contrast(float(args[0]), oc), args[2]))
+    'contrast':  lambda: (lambda oc: (oc, cmd_contrast(float(args[0]), oc, pivot), args[2]))
                          (read_curve(args[1])),
     'max':       lambda: (lambda oc: (oc, cmd_max(float(args[0]), oc), args[2]))
                          (read_curve(args[1])),
@@ -771,6 +853,8 @@ def process(args):
     'smooth':    lambda: (lambda oc: (oc, cmd_smooth(oc, int(args[0])), args[2]))
                          (read_curve(args[1])),
     'average':   lambda: (lambda oc: (oc, cmd_average(oc, int(args[0])), args[2]))
+                         (read_curve(args[1])),
+    'gradient':  lambda: (lambda oc: (oc, cmd_gradient(oc, int(args[0])), args[2]))
                          (read_curve(args[1])),
     'at':        lambda: (lambda oc: (oc, cmd_at(oc, int(args[0])), '%'))
                          (read_curve(args[1])),
@@ -804,9 +888,9 @@ def process(args):
 
 def complete_commands(text, state):
     """Command completion function for readline"""
-    commands = ['show', 'identity', 'inverse', 'offset', 'contrast', 'max', 'min',
+    commands = ['show', 'identity', 'inverse', 'invert', 'offset', 'contrast', 'max', 'min',
                 'gamma', 'compose', 'adjust', 'diff', 'divide', 'linear',
-                'decompose', 'smooth', 'average', 'at', 'error', 'help', 'history', 'quit']
+                'decompose', 'smooth', 'average', 'gradient', 'at', 'error', 'help', 'history', 'quit']
 
     matches = [cmd for cmd in commands if cmd.startswith(text)]
     try:

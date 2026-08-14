@@ -1,4 +1,4 @@
-.TH ACV 1 "January 2026" "acv" "User Commands"
+.TH ACV 1 "August 2026" "acv" "User Commands"
 .SH NAME
 acv \- manipulate Photoshop ACV curve and AMP pencil curve files
 .SH SYNOPSIS
@@ -19,8 +19,17 @@ Common patterns:
 .RB [ \-s ]
 .RB [ \-p ]
 .RB [ \-q ]
+.RB [ \-v " pivot" ]
 .I ...
 .RI [ output ]
+.PP
+.B acv
+.PP
+With no arguments at all,
+.B acv
+starts an interactive prompt (see
+.B INTERACTIVE MODE
+below).
 .SH DESCRIPTION
 .B acv
 is a command-line utility (single Python script) for reading, inspecting, and transforming
@@ -66,10 +75,15 @@ and you want the output to keep those x locations rather than a filled 0..255 gr
 .BR \-q ", " \-\-quiet
 Suppress debug output (toggles the script's DEBUG printing).
 .TP
-.BR \-w ", " \-\-width " " IwidthR
+.BR \-w ", " \-\-width " " \fIwidth\fR
 Set the terminal plot width (used by
 .BR show ).
 Height is derived as approximately one third of width.
+.TP
+.BR \-v ", " \-\-pivot " " VALUE
+Set the pivot used by
+.BR contrast .
+Default: 128.
 .SH COMMANDS
 .TP
 .B show
@@ -96,8 +110,10 @@ while leaving input 0 unchanged.
 .TP
 .B contrast
 .RI " <factor> <input> " [ <output> ]
-Contrast pivot at 128:
-.IR y' " = 128 + factor*(y-128)."
+Change contrast about a pivot:
+.IR y' " = pivot + factor*(y-pivot)."
+The pivot is 128 unless changed with
+.BR \-v .
 .TP
 .B gamma
 .RI " <gamma> <input> " [ <output> ]
@@ -106,16 +122,16 @@ Gamma applied to the filled mapping:
 .TP
 .B linear
 .RI " <error> <input> " [ <output_model> ]
-Fit a straight line to curve points that are at least
+Fit a straight line to curve points that are at least an
 .I error
-away from 0 and 255 (near the ends), and output the fitted model curve.
+fraction away from 0 and 255 (near the ends), and output the fitted model curve.
 .TP
 .B compose
 .RI " <curve1> <curve2> " [ <output> ]
 Compose two curves (apply one after the other). Returns
-.IR curve2 " \[smalldot] " curve1
+.IR curve2 " \[u2218] " curve1
 (i.e.,
-.IR curve2 " \[ring] " curve1 ,
+.IR curve2 " \[u2218] " curve1 ,
 curve2 after curve1).
 .TP
 .B diff
@@ -137,12 +153,12 @@ Print the output value for a given input x (channel 0).
 Divide original by divider by composing with inverse(divider) so that:
 .IR compose(divider, residual) " == " original .
 Equivalently:
-.IR residual " = divider^{-1} \[smalldot] original ."
+.IR residual " = divider^{-1} \[u2218] original ."
 .TP
 .B decompose
 .RI " <gamma> <input> " [ <output_model> ]
 Model input as a gamma curve (usually 2.2) composed with a linear curve:
-.IR model " = g \[smalldot] linear ."
+.IR model " = g \[u2218] linear ."
 (Typically used to approximate an input curve with two simpler components.)
 .TP
 .B adjust
@@ -153,6 +169,13 @@ Combine two curves by adding curve2's deviation from identity to curve1.
 .RI " <input> " [ <output> ]
 Invert a curve by flipping it about the line y=x.
 .TP
+.B invert
+.RI " <input> " [ <output> ]
+Flip a curve about the line x=128, i.e. reverse its input axis. This simulates
+the effect of inverting an image before printing it.
+Not to be confused with
+.BR inverse .
+.TP
 .B smooth
 .RI " <points> <input> " [ <output> ]
 Smooth a curve by fitting a spline with the given number of points.
@@ -162,6 +185,15 @@ Smooth a curve by fitting a spline with the given number of points.
 Smooth a curve by averaging points within
 .I span
 of x.
+.TP
+.B gradient
+.RI " <span> <input> " [ <output> ]
+Write 128 plus the local gradient of the curve, estimated at each x by averaging
+the slope between every pair of points within
+.I span
+of x. A curve with slope 1 comes out flat at 129; steeper sections read higher
+and flatter sections lower. Useful for seeing where a measured response loses
+separation.
 .SH FILE FORMATS
 .TP
 .B .acv
@@ -173,9 +205,55 @@ Binary 256-byte mapping per curve (one byte per input level). Multiple curves ma
 .TP
 .B .csv
 Text format with header:
-.BR curve,x,y .
-For predictable reading, rows should be grouped by curve index.
-CSV output is not clipped.
+.BR channel,x,y .
+The header is optional on input and is recognised rather than assumed, so a file
+of bare
+.I channel,x,y
+rows reads correctly. Lines beginning with
+.B #
+are treated as comments and ignored.
+For predictable reading, rows should be grouped by channel index.
+CSV output is not clipped, in x or in y. A curve may be defined outside 0..255:
+the inverse of a curve whose output leaves that range is, and so is the residual
+from
+.BR divide .
+Writing such a curve to
+.B .acv
+or
+.B .amp
+keeps only the 0..255 part, because those formats cannot hold the rest.
+.SH INTERACTIVE MODE
+Run
+.B acv
+with no arguments to print the usage text and drop into a prompt. Each line is a
+command exactly as it would be typed on the shell command line.
+.PP
+Results are kept rather than written to files. Each command that would have
+written a curve stores it as
+.BR $1 ", " $2 ,
+and so on, and those names can be used as inputs to later commands.
+.B %
+stands for the most recent result, so transformations chain without naming
+intermediate files:
+.PP
+.nf
+acv $1> gamma 2.2 measured.csv
+acv $2> average 4 %
+acv $3> inverse %
+acv $4> show % measured.csv
+.fi
+.PP
+Command names tab-complete.
+.B h
+or
+.B history
+lists the stored results with the command that produced each,
+.B help
+reprints the usage text, and
+.BR q ", " quit " or " exit
+leaves. Line history is kept in
+.I ~/.acv_history
+between sessions.
 .SH EXAMPLES
 .nf
 # Display
@@ -184,13 +262,22 @@ acv show -w 180 measured.csv
 
 # Transform with explicit output
 acv gamma 2.2 input.acv output.acv
-acv offset 10 input.csv output.csv
+acv offset 0 input.csv output.acv
 
 # Transform with default output (TTY -> % display; non-TTY -> stdout CSV)
 acv gamma 2.2 input.csv
 
 # Preserve x-grid from the first input
 acv compose -p sparse.csv correction.acv out.csv
+
+# Contrast about a pivot other than 128
+acv contrast -v 200 1.5 input.csv output.csv
+
+# Reverse the input axis, as if the image were inverted before printing
+acv invert correction.acv correction-inverted.acv
+
+# Look at where a measured response loses separation
+acv gradient 8 measured.csv
 
 # Pipeline
 cat measured.csv | acv smooth 12 - - > smoothed.csv

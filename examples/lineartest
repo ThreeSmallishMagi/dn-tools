@@ -1,23 +1,24 @@
 #!/usr/bin/bash -v
+. "$(dirname "$0")/checks.sh"
 
-rm -f npd4i.amp npd4il.csv npd4ilinearresidual.csv npd4irecon.csv
+rm -f npd4i.csv npd4il.csv npd4ilinearresidual.csv npd4irecon.csv
 # Test dividing out a linear estimation of the lcd response
 # npd4i is the inverse of NewPaperDev4 correcion curve, so my best estimate of the lcd response curve
-acv inverse NewPapDev4.acv npd4i.amp
-acv show -q -w 40 npd4i.amp
+acv inverse NewPapDev4.acv npd4i.csv
+acv show -q -w 40 npd4i.csv
 read
 
 # Assuming the curve is monotonic, find the central x range 5% away from the y extremes
-acv linear 0.05 npd4i.amp npd4il.csv
+acv linear 0.05 npd4i.csv npd4il.csv
 acv show -q -w 40 npd4il.csv
 read
 
 # See how far off the linear estimate is from the actual response
-acv diff npd4i.amp npd4il.csv %
+acv diff npd4i.csv npd4il.csv %
 read
 
 # Now divide the linear estimate from actual response 
-acv divide npd4i.amp npd4il.csv npd4ilinearresidual.csv
+acv divide npd4i.csv npd4il.csv npd4ilinearresidual.csv
 acv show -q -w 40  npd4ilinearresidual.csv
 read
 
@@ -27,6 +28,12 @@ acv show  -q -w 40 npd4irecon.csv
 read
 
 # See how close the reconstruction is to the actual response
-acv diff -q -w 40 npd4i.amp npd4irecon.csv %
+acv diff -q -w 40 npd4i.csv npd4irecon.csv %
 
-rm -f npd4i.amp npd4il.csv npd4ilinearresidual.csv npd4irecon.csv
+# The linear fit is negative below x=59, so the residual has to carry points
+# outside 0..255 for the shadows to come back.
+check "linear reconstruction" "$(acv -q error npd4i.csv npd4irecon.csv) < 2"
+v=$(acv -q at 128 npd4irecon.csv)
+check "reconstruction at x=128" "$v > 81 && $v < 84"
+
+#rm -f npd4i.csv npd4il.csv npd4ilinearresidual.csv npd4irecon.csv

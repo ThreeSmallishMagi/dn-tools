@@ -1,6 +1,6 @@
-.TH CHART 1 "January 2026" "chart" "User Commands"
+.TH CHART 1 "August 2026" "chart" "User Commands"
 .SH NAME
-chart \- generate and read NxN grayscale ramp charts (for calibration)
+chart \- generate and read calibration charts and step wedges, and apply curves to images
 .SH SYNOPSIS
 .B chart
 .BR --generate " " OUT_IMAGE
@@ -11,12 +11,22 @@ chart \- generate and read NxN grayscale ramp charts (for calibration)
 .I OUT_CSV
 .RI [ options ]
 .PP
-Default mode is selected by presence of
-.BR --generate :
-generation mode if present, otherwise reader mode.
+.B chart
+.BR --step-wedge " " OUT_IMAGE
+.RI [ options ]
+.PP
+.B chart
+.I IMAGE
+.BR --read-wedge " " OUT_CSV
+.RI [ options ]
+.PP
+.B chart
+.I IMAGE
+.BR --apply " " CURVE " " OUTPUT
+.RI [ options ]
 .SH DESCRIPTION
 .B chart
-is a command-line tool (Python script) that supports two workflows:
+is a command-line tool (Python script) that supports four workflows:
 .IP 1. 3
 Generate a printable
 .IR N x N
@@ -26,19 +36,81 @@ Read a photographed/scanned chart image, detect/warp the chart grid, measure eac
 normalize measurements, and emit CSV suitable for curve fitting (e.g. with the companion
 .BR acv
 tool).
+.IP 3. 3
+Generate a step wedge, or read one back from a photograph of a print.
+.IP 4. 3
+Apply an
+.BR .acv ", " .amp " or " .csv
+curve to an image, optionally appending a step wedge to it.
 .PP
 The generator can optionally permute (shuffle) the patch levels using several spatial
 permutations intended to reduce adjacency bias in capture/printing.
 .SH MODES
+Mode is selected by which of the mode options is present. If more than one is
+given, the first match in this order wins:
+.BR --apply ", " --read-wedge ", " --generate ", " --step-wedge ,
+otherwise reader mode.
 .SS Generator mode
 Generator mode is enabled with
 .BR --generate .
 It writes an image with an outer black border, internal grid lines, and filled grayscale patches.
 .SS Reader mode
-Reader mode is enabled when
-.BR --generate
-is not provided. It reads an input image, attempts to detect the outer border quadrilateral,
+Reader mode is enabled when no mode option is given, and takes two positional
+arguments,
+.I IMAGE
+and
+.IR OUT_CSV .
+It reads an input image, attempts to detect the outer border quadrilateral,
 warps to a square canvas, measures per-cell median values, normalizes them to 0..255, and writes CSV.
+.SS Step wedge mode
+.B --step-wedge
+on its own writes a step wedge image to the first positional argument. The wedge
+is a vertical column of
+.B --segments
+patches (21 by default) spaced according to
+.BR --progression ,
+each numbered and labelled with its 8-bit value and optical density. Beside it
+are a continuous gradient strip and a column of white/black bars: one white
+segment at the top, one at the bottom, black between. Those bars are what
+.B --read-wedge
+looks for, so leave them in place when printing.
+.PP
+.B --step-wedge
+combined with
+.B --apply
+does not write a wedge on its own; it appends one to the right of the image being
+processed, with the same curve applied to it.
+.SS Read wedge mode
+.B --read-wedge
+.I OUT_CSV
+reads a photograph or scan of a printed wedge. It looks for the right-hand edge of
+the white/black bar column in the rightmost 30% of the image, derives the wedge
+geometry from the bar height, corrects perspective, and measures the median of
+each segment. If the bars cannot be found it falls back to measuring the
+rightmost strip of the image, which is only useful for a squarely-cropped scan.
+The CSV holds the expected value of each segment against the measured one.
+.SS Apply mode
+.B --apply
+.I CURVE OUTPUT
+applies a curve to the image named by the first positional argument.
+.B chart
+reads
+.BR .acv ", " .amp " and " .csv
+curves itself, so
+.B acv
+is not needed for this. The curve becomes a lookup table at the bit depth of the
+image, 8- or 16-bit. A single-channel curve is applied to every channel; a
+multi-channel curve is applied one channel at a time.
+.PP
+The image is rotated to portrait if it is landscape, padded with white by
+.BR --margin ,
+and resized by
+.B --size
+(area averaging when shrinking, Lanczos when enlarging, leaving room for the wedge
+if one is being appended). Output is written as grayscale, and as 16-bit if
+.I OUTPUT
+ends with
+.BR .tif .
 .SH OUTPUT
 .SS Reader CSV format
 The reader writes a CSV with header:
@@ -72,38 +144,59 @@ The current implementation does not have a reader-side
 flag; if you generated an inverted chart, you will need to invert the intended axis
 in a post-processing step.
 .SH OPTIONS
+The options below the first group are tuning parameters. They work, but they are
+hidden from
+.B --help
+because the defaults are almost always what you want.
 .TP
 .BR --generate " " OUT_IMAGE
 Generate a chart image at
-.IR OUT_IMAGE
-and exit. The output format is inferred from the filename extension (e.g. .png, .jpg, .tif).
+.IR OUT_IMAGE .
+The output format is inferred from the filename extension (e.g. .png, .jpg, .tif).
 If
 .IR OUT_IMAGE
 ends with
 .BR .tif ,
 the file is written as 16-bit (8-bit values scaled by 257).
 .TP
+.BR --step-wedge
+Generate a step wedge to the first positional argument, or append one to the
+image when used with
+.BR --apply .
+.TP
+.BR --read-wedge " " OUT_CSV
+Read a printed step wedge from the image named by the first positional argument
+and write expected/measured pairs to
+.IR OUT_CSV .
+.TP
+.BR --apply " " CURVE " " OUTPUT
+Apply
+.IR CURVE
+.RB ( .acv ", " .amp " or " .csv )
+to the image named by the first positional argument and write
+.IR OUTPUT .
+.TP
+.BR --size " " PX
+Apply: resize the image so its longest dimension is
+.IR PX
+pixels, before the curve is applied. No default; the image is left at its
+original size if this is not given.
+.TP
+.BR --progression " " METHOD
+Step wedge spacing, one of
+.BR linear ", " stops " or " inv_stops .
+Default:
+.BR linear .
+See
+.B STEP WEDGE PROGRESSIONS
+below.
+.TP
 .BR --grid " " N
 Chart/Reader grid size
 .IR N
 for an
 .IR N x N
-chart. Default: 16.
-.TP
-.BR --cell " " PX
-Generator: cell size in pixels (patch size). Default: 40.
-.TP
-.BR --margin " " PX
-Generator: outer margin in pixels (white area around grid). Default: 80.
-.TP
-.BR --line " " PX
-Generator: internal grid line thickness in pixels. Default: 1.
-.TP
-.BR --border " " PX
-Generator: outer border thickness in pixels (black). Default: 10.
-.TP
-.BR --invert-chart
-Generator: invert patch levels (0 <-> 255) before shuffling. Default: off.
+chart. Default: 32.
 .TP
 .BR --shuffle " " METHOD
 Select the shuffle/permutation method. Default:
@@ -112,19 +205,71 @@ See
 .B SHUFFLE METHODS
 below.
 .TP
-.BR --size " " PX
-Reader: warped canvas size (pixels) used after perspective correction. Default: 1000.
+.BR --invert-chart
+Generator: invert patch levels (0 <-> 255) before shuffling. Default: off.
+.TP
+.BR --cell " " PX
+Generator: cell size in pixels (patch size). Default: 40. Hidden.
+.TP
+.BR --margin " " PX
+Generator: outer margin in pixels (white area around grid). Default: 40.
+In apply mode this is the white padding added around the image before it is
+resized. Hidden.
+.TP
+.BR --line " " PX
+Generator: internal grid line thickness in pixels. Default: 1. Hidden.
+.TP
+.BR --border " " PX
+Generator: outer border thickness in pixels (black). Default: 10. Hidden.
+.TP
+.BR --segments " " N
+Step wedge: number of segments. Default: 21. This must match between generating
+a wedge and reading it back.
+.B --read-wedge
+derives the whole wedge geometry from it \(em the detected bar column spans
+.IR segments-2
+segments, and the warped wedge is divided into
+.IR segments
+bands to measure \(em so a mismatch misplaces both the crop and every
+measurement. Hidden.
+.TP
+.BR --warpsize " " PX
+Reader: warped canvas size (pixels) used after perspective correction.
+Default: 1000. Hidden. In v1.0 this option was called
+.BR --size ,
+which now means something else \(em see
+.B COMPATIBILITY
+below.
 .TP
 .BR --debug " " PATH
 Reader: save the warped grayscale image to
 .IR PATH
-(for inspection/debug).
+(for inspection/debug). In read wedge mode it also writes the detected vertical
+lines to a
+.I _lines
+variant of the same path. Hidden.
 .TP
 .BR --variance " " OUT_IMAGE
 Reader: after reading the chart, write a variance chart image to
 .IR OUT_IMAGE
-and a matching CSV alongside it.
-This is intended to visualize spatial falloff/illumination variance when multiple samples per level exist.
+and a matching CSV alongside it. Each patch shows how far its measurement sits
+from the mean of the other patches printed at the same level, as a fraction of
+that mean, offset so that no deviation is mid grey. This visualizes spatial
+falloff/illumination variance when there are multiple samples per level. Hidden.
+.SH STEP WEDGE PROGRESSIONS
+.TP
+.B linear
+Patch values step evenly from 255 down to 0.
+.TP
+.B stops
+Patch values halve every third segment, i.e. one third of a stop per segment,
+starting at 255.
+.TP
+.B inv_stops
+The complement of
+.BR stops :
+each patch is 255 minus the value it would have had, while the density printed on
+the label is still that of the uncomplemented value.
 .SH SHUFFLE METHODS
 These methods permute the association between patch location (row-major position)
 and patch value:
@@ -161,6 +306,34 @@ to reduce contamination from grid lines.
 Normalization is performed on measured medians so the darkest measured patch becomes 0 and
 the lightest becomes 255. This makes output robust to exposure differences, but it does not
 recover absolute reflectance/irradiance.
+.IP \[bu] 3
+Step wedge measurements are not normalized. The CSV holds raw medians against
+the expected values, so a wedge read back tells you about absolute placement in
+a way a chart does not.
+.SH COMPATIBILITY
+Charts are not interchangeable between versions of
+.BR chart .
+The
+.B blue_noise
+ordering changed after v1.0, so a chart printed with v1.0 and read with a later
+version has every patch attributed to the wrong intended level, silently. Generate
+and read a chart with the same version, or pass the same
+.B --shuffle
+method other than
+.B blue_noise
+at both ends.
+.PP
+.B --size
+also changed meaning after v1.0. It used to be the reader's warped canvas size and
+is now the apply-mode output size; the reader option is
+.BR --warpsize .
+A v1.0 reader command line using
+.B --size
+is still accepted but the option now has no effect there.
+.PP
+.B --margin
+defaulted to 80 in v1.0 and now defaults to 40, so generated charts are 80 pixels
+smaller in each dimension than they used to be.
 .SH DEPENDENCIES
 .B chart
 requires:
@@ -184,6 +357,21 @@ chart photo.jpg measurements.csv --grid 16 --shuffle blue_noise --debug warped.p
 
 # Read and generate a variance visualization
 chart photo.jpg measurements.csv --grid 32 --shuffle blue_noise --variance variance.png
+
+# Generate a 21-segment step wedge
+chart --step-wedge wedge.tif
+
+# Generate a step wedge in third-stop steps
+chart --step-wedge wedge.tif --progression stops
+
+# Apply a correction curve to an image
+chart photo.tif --apply correction.acv photo-corrected.tif
+
+# Apply a curve, resize to 2000px, and append a corrected step wedge
+chart photo.tif --apply correction.acv print.tif --size 2000 --step-wedge
+
+# Read the step wedge back from a photograph of the print
+chart print-photo.jpg --read-wedge wedge.csv
 .fi
 .SH SEE ALSO
 .BR acv (1)

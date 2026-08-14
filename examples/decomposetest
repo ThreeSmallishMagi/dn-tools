@@ -1,6 +1,11 @@
 #!/usr/bin/bash -v
+. "$(dirname "$0")/checks.sh"
+
+rm -f npd4i.amp npd4i.csv npd4id.csv npd4ilinearresidual.csv npd4irecon.csv
 # Test dividing out an estimation of the lcd response
 # npd4i is the inverse of NewPaperDev4 correction curve, so my best estimate of the lcd response curve
+acv -q inverse NewPapDev4.acv npd4i.amp
+acv -q inverse NewPapDev4.acv npd4i.csv
 acv show -w 60 npd4i.amp
 read
 
@@ -25,4 +30,12 @@ read
 
 # See how close the reconstruction is to the actual response
 acv diff -q -w 60 npd4i.amp npd4irecon.csv %
+
+# The model's output leaves 0..255, so this depends on divide keeping the residual
+# points out there.
+check "decompose reconstruction" "$(acv -q error npd4i.amp npd4irecon.csv) < 2"
+v=$(acv -q at 128 npd4irecon.csv)
+check "reconstruction at x=128" "$v > 81 && $v < 84"
+
+rm -f npd4i.amp npd4i.csv npd4id.csv npd4ilinearresidual.csv npd4irecon.csv
 

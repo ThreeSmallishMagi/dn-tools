@@ -1,6 +1,11 @@
 #!/usr/bin/bash -x
+. "$(dirname "$0")/checks.sh"
+
+rm -f npd4i.amp id.amp gamma2_2.amp npd4igamma.amp npd4il.amp npd4iestimate.amp \
+      npd4idecomp.amp npd4iEstimateResidual.amp npd4irecon.amp
+acv -q inverse NewPapDev4.acv npd4i.amp
 # Test dividing out an estimation of the lcd response that is made up of
-# a gamma component composed witha linear component. jpeg data is typically in a color space 
+# a gamma component composed with a linear component. jpeg data is typically in a color space 
 # that has a gamma 1/2.2 encoding/gamma compression curve. Computer monitors have the 
 # 2.2/decoding/gamma expansion curve built into their response, so that the image data is shown
 # correctly/linearly
@@ -19,8 +24,10 @@ acv divide npd4i.amp gamma2_2.amp npd4igamma.amp
 echo it is much straighter
 acv show npd4igamma.amp
 
-echo Assuming the curve is monotonic, find the central x range where  2<y<255-2
-acv linear 2 npd4igamma.amp npd4il.amp
+echo Fit a line to the middle of the curve, ignoring the outer 10 percent at each end.
+# The argument is a fraction of the range, and 0.1 is what decompose uses, so the
+# manual estimate below can be compared against it.
+acv linear 0.1 npd4igamma.amp npd4il.amp
 acv show npd4il.amp
 
 echo compose the gamma and linear parts to get the estimated response
@@ -44,4 +51,12 @@ acv show npd4irecon.amp
 
 echo See how close the reconstruction is to the actual response
 acv diff npd4i.amp npd4irecon.amp %
+
+# decompose should agree with doing the gamma and linear steps by hand. It is not
+# exact because every .amp file in the manual chain rounds to integers.
+check "decompose matches manual gamma+linear" "$(acv -q error npd4iestimate.amp npd4idecomp.amp) < 3"
+check "gamma reconstruction" "$(acv -q error npd4i.amp npd4irecon.amp) < 12"
+
+rm -f npd4i.amp id.amp gamma2_2.amp npd4igamma.amp npd4il.amp npd4iestimate.amp \
+      npd4idecomp.amp npd4iEstimateResidual.amp npd4irecon.amp
 

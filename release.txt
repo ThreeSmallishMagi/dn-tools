@@ -1,0 +1,70 @@
+DN-Tools v1.1   12 Aug 2026    (v1.0: 26 Feb 2026)
+
+acv
+   acv invert  <input> <output>
+             Flip a curve around the line x=128. Simulates the effects of inverting before printing.
+
+   acv gradient <span> <input> <output>
+             Return 128 plus the gradient of curve using points within <span> of x.
+
+  -v, --pivot VALUE     Pivot value for contrast (default 128)
+
+   With no arguments acv now drops into the interactive prompt after printing
+   the usage text. invert and gradient tab-complete there.
+chart
+  --step-wedge          Generate a 21-segment step wedge or append one when
+                        using --apply
+  --read-wedge OUT_CSV  Read step wedge values from image and output CSV
+  --apply CURVE OUTPUT  Apply curve to an image
+  --size SIZE           Apply: resize maximum dimension to this size before
+                        applying curve
+  --progression PROGRESSION
+                        Step wedge progression: linear, stops, inv_stops
+                        (default linear)
+
+   Wedge segments are numbered and labelled with value and density, beside a
+   gradient strip and the white/black bars that --read-wedge uses to find the
+   wedge in a photograph and square it up. linear steps evenly, stops steps in
+   1/3 stop, inv_stops is the complement of stops.
+
+   --apply reads .acv, .amp and .csv itself, so chart no longer needs acv. It
+   rotates to portrait, pads with --margin, resizes with --size, applies the
+   curve through an 8- or 16-bit LUT, and writes grayscale, 16-bit for .tif.
+   With --step-wedge the wedge gets the same curve and is appended on the right.
+
+   Blue noise shuffle retuned for better separation of adjacent levels. The
+   variance chart reports deviation as a fraction of the estimated level rather
+   than an absolute difference. --help hides the tuning options (--cell --line
+   --border --margin --debug --variance --warpsize --segments); they still work.
+
+plot
+   Black background, square canvas, axes labelled Input and Output, white
+   points.
+
+expose
+   New, and still a beginning. An SDL3 program that shows a sequence of images
+   for one vsynced frame each. Build with make in expose/; not installed.
+
+examples
+   chartapplytest: generate a chart, apply a gamma curve with chart --apply,
+   re-linearize and compare.
+
+Fixed since v1.0
+   -q/--quiet toggled debug output instead of turning it off, so a second -q at
+   the prompt turned it back on. It is still sticky: once given, output stays
+   off until acv restarts.
+   acv linear's <error> is a fraction of the range, not a number of levels. The
+   usage text, the man page and the parameter name all said otherwise.
+   env.sh printed its paths every time it was sourced.
+
+Incompatible with v1.0
+   The blue noise ordering changed. A chart printed with v1.0 must be read with
+   v1.0, or use the same --shuffle method other than blue_noise at both ends.
+   chart --size is now the apply output size; the reader's warp canvas is
+   --warpsize. --size is accepted and ignored in reader mode.
+   chart --margin defaults to 40, was 80. It also sets --apply's white padding.
+   acv writes the CSV header channel,x,y, was curve,x,y. Old files still read.
+
+Documentation
+   Both man pages and the README cover the new modes and options. man chart has
+   a COMPATIBILITY section for the three chart changes above.

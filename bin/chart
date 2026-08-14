@@ -5,6 +5,8 @@ NxN grayscale ramp chart generator + reader.
 Modes:
 1) Generate a printable NxN ramp chart (8-bit grayscale image).
 2) Read a photographed/scan grayscale NxN ramp grid and emit CSV points.
+3) Generate a step wedge.
+4) Apply a curve to an image.
 
 Output CSV columns: channel,x,y
 - channel is always 0
@@ -18,10 +20,12 @@ from __future__ import annotations
 from collections import defaultdict
 from math import gcd, log2
 
+from contextlib import contextmanager
 import argparse
 import os
 import csv
 import sys
+import struct
 import random
 
 import cv2
@@ -29,6 +33,230 @@ import numpy as np
 
 def dbg(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+# ---------- ACV File I/O ----------
+
+@contextmanager
+def open_file(filename, mode):
+    """Open file or return stdin/stdout for '-'"""
+    if filename == "-":
+        streams = {'r': sys.stdin, 'rb': sys.stdin.buffer, 'w': sys.stdout, 'wb': sys.stdout.buffer}
+        yield streams.get(mode, sys.stdout)
+    else:
+        with open(filename, mode) as f:
+            yield f
+
+# -- Read --
+def read_acv(filename):
+    """Read a Photoshop ACV file.
+       return data in curve format [ [(i1,o1),...], ... ] """
+    if not os.path.isfile(filename):
+        if os.path.isfile(filename + ".acv"):
+            filename = filename + ".acv"
+        else:
+            raise ValueError(f"ACV file not found: {filename}")
+    with open_file(filename, "rb") as f:
+        data = f.read()
+    offset = 0
+    if len(data) < 4:
+        raise ValueError("Invalid ACV file.")
+    version = struct.unpack_from(">H", data, offset)[0]
+    offset += 2
+    num_curves = struct.unpack_from(">H", data, offset)[0]
+    offset += 2
+    curves = []
+    for _ in range(num_curves):
+        if offset + 2 > len(data): break
+        point_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2
+        pts = []
+        for _ in range(point_count):
+            if offset + 4 > len(data): break
+            output_val, input_val = struct.unpack_from(">HH", data, offset)
+            offset += 4
+            pts.append((input_val, output_val))
+        curves.append(pts)
+    #if debug: print(f"read {curves} from {filename}")
+    if len(curves) == 0:
+        raise ValueError("No curves found in file.")
+    return version, curves
+
+def read_amp(filename):
+    """Read a Photoshop pencil curve .amp file.
+    The .amp file is expected to contain 256 bytes, one output value per input level.
+    return data in curve format [ [(i1,o1),...], ... ]
+    """
+    if not os.path.isfile(filename):
+        if os.path.isfile(filename + ".amp"):
+            filename = filename + ".amp"
+        else:
+            raise ValueError(f"AMP file not found: {filename}")
+    curves = []
+    with open_file(filename, "rb") as f:
+        data = f.read()
+    if len(data) < 256:
+        raise ValueError(f"AMP pencil curve must be 256 bytes, got {len(data)} bytes")
+    while len(data) >= 256:
+        # Each byte is the output for input 0..255
+        pts = [(i, data[i]) for i in range(256)]
+        curves.append(pts)
+        data = data[256:]
+    # assume version 4 for acv compatability
+    if len(data) > 0:
+        dbg(f"WARNING:Extra data in AMP file: {filename}. {len(data)} extra bytes")
+    return 4, curves
+
+def read_csv(filename):
+    """Read a CSV file containing curves.
+    The file is expected to contain a header line followed by lines of the form:
+        channel,x,y
+    where channel is the curve index, x is the input, and y is the output.
+    """
+    with open_file(filename, "r") as f:
+        lines = f.readlines()
+    curves, current_ix, comments = [], None, []
+
+    for line in lines:  # Skip header
+        line = line.strip()
+        if line.startswith('channel,') or line.startswith('curve'):
+            continue
+        if line.startswith('#'):
+            comments.append(line[1:].strip())
+            continue
+
+        ix, input, output  = line.split(",")
+
+        if current_ix != ix:
+            curves.append([])
+            current_ix = ix
+
+        curves[-1].append((float(input), float(output)))
+
+    return 4, curves, comments
+
+history = {}
+
+def read_curve(filename):
+    """Read a single curve from a file.
+    If the filename ends with .amp, it is interpreted as a Photoshop pencil curve.
+    Otherwise it is read as a standard ACV file.
+    """
+    if filename in history:
+        return history[filename]
+    if filename.lower().endswith(".amp"):
+        _,curves =  read_amp(filename)
+    elif filename.lower().endswith(".acv"):
+        _, curves = read_acv(filename)
+    else:
+        _, curves, _ = read_csv(filename)
+    if not curves:
+        raise ValueError("No curves found in file.")
+    return curves
+
+#-- end ACV File I/O ----------
+
+# ---------- Curve filling, cloned verbatim from acv ----------
+# So that chart --apply interprets a curve file exactly as acv does.
+# Keep in step with bin/acv if that ever changes.
+
+# ---------- Spline Interpolation ----------
+
+def compute_spline_coefficients(points):
+    """
+    Compute the coefficients for a cubic spline interpolation.
+    Returns: X, Y, b, c, d where
+        X[i], Y[i] are the original points
+        b[i], c[i], d[i] are the coefficients for the spline between points i and i+1
+    """
+    n = len(points)
+    if n < 2:
+        X = [points[0][0]]; Y = [points[0][1]]
+        return X, Y, [], [], []
+    unique_points = []
+    for p in points:
+        if not unique_points or p[0] != unique_points[-1][0]:
+            unique_points.append(p)
+
+    points = unique_points
+    n = len(points)
+
+    X = [p[0] for p in points]
+    Y = [p[1] for p in points]
+    h = [X[i+1] - X[i] for i in range(n-1)]
+    alpha = [0]*n
+    for i in range(1, n-1):
+        alpha[i] = (3/h[i])*(Y[i+1]-Y[i]) - (3/h[i-1])*(Y[i]-Y[i-1])
+    l = [1] + [0]*(n-1)
+    mu = [0]*n
+    z = [0]*n
+    for i in range(1, n-1):
+        l[i] = 2*(X[i+1]-X[i-1]) - h[i-1]*mu[i-1]
+        mu[i] = h[i]/l[i]
+        z[i] = (alpha[i]-h[i-1]*z[i-1])/l[i]
+    c = [0]*n
+    b = [0]*(n-1)
+    d = [0]*(n-1)
+    for j in range(n-2, -1, -1):
+        c[j] = z[j] - mu[j]*c[j+1]
+        b[j] = (Y[j+1]-Y[j])/h[j] - h[j]*(c[j+1]+2*c[j])/3
+        d[j] = (c[j+1]-c[j])/(3*h[j])
+    return X, Y, b, c, d
+
+
+def spline_eval(x, coeffs):
+    X, Y, b, c, d = coeffs
+    n = len(X)
+    if x <= X[0]: return Y[0]
+    if x >= X[-1]: return Y[-1]
+    i = 0
+    while i < n-2 and x > X[i+1]: i += 1
+    dx = x - X[i]
+    return Y[i] + b[i]*dx + c[i]*dx*dx + d[i]*dx*dx*dx
+
+
+def fill_curve(curves):
+    """ Fill in the gaps between curve points using a spline interpolation """
+    if is_mapping(curves): return curves
+    dbg(f"Fill {[len(c) for c in curves]} point curves")
+    mappings = []
+    curves = cmd_average(curves,0) # average duplicate x values
+    for curve in curves:
+        coeffs = compute_spline_coefficients(curve)
+        mappings.append( [ (i,spline_eval(i, coeffs)) for i in range(256)])
+    return mappings
+
+def is_mapping(curves):
+    """ Return True if the x range is the range 0..255 """
+    return ([[x for x,_ in curve] for curve in curves] ==
+           [[x for x in range(256)] for _ in curves])
+
+def unique(curves):
+    return [list(dict.fromkeys(curve)) for curve in curves]
+
+def cmd_average(curves, span=5):
+    """ Average points within span of x """
+    def average_point_x(curve, i, x):
+        y_sum,count = 0,0
+        sp =  min(span, x, 255-x)
+        for cx, cy in curve:
+            if abs(cx - x) <= sp:
+                y_sum += cy
+                count += 1
+        return (x, y_sum / count if count > 0 else curve[i][1])
+
+    def average_point_i(curve, i, x):
+        """ Average points within span of index """
+        start = max(0, i - span)
+        end = min(len(curve), i + span + 1)
+        y_sum = sum(curve[j][1] for j in range(start, end))
+        return (x, y_sum / (end - start))
+
+    dbg(f"Smoothing curves by averaging points within {span} of x ")
+    curves = [sorted(c) for c in curves]
+    return unique([[average_point_x(curve, i, round(x)) for i, (x, _) in enumerate(curve)]
+            for curve in curves])
+
+#-- end curve filling ----------
 
 def bit_reverse(x,width=8):
     result = 0
@@ -133,8 +361,8 @@ def blue_noise(size: int) -> list[int]:
     half = n // 2
 
     # Kernel radius scales mildly with size; tuned to work well at 32.
-    rad = max(2, s // 6)            # 32 -> 4
-    sigma = rad / 2.0               # 4 -> 2.0
+    rad = max(2, s // 6)            # 32 -> 4   #4
+    sigma = rad / 3.0               # 4 -> 2.0  #3 # 2.0 in v1
 
     # Precompute periodic Gaussian "influence" offsets (center weight = 0).
     offsets = []
@@ -181,8 +409,8 @@ def blue_noise(size: int) -> list[int]:
     # --- Optimize the 50% pattern via "remove tightest cluster, add largest void" ---
     # A few multiples of n is typically enough at these sizes.
     opt_iters = 4 * n
+    bf = b2.ravel()
     for _ in range(opt_iters):
-        bf = b2.ravel()
         df = density.ravel()
 
         idx1 = argmax_on(df, bf.astype(bool))          # most clustered 1
@@ -231,14 +459,99 @@ def blue_noise(size: int) -> list[int]:
         add_kernel(d_add, rr, cc, +1.0)
 
     # Safety check (should always hold)
-    # assert np.all(np.sort(ranks) == np.arange(n, dtype=np.int32))
+    assert np.all(np.sort(ranks) == np.arange(n, dtype=np.int32))
 
     return ranks.tolist()
 
 def permute_blue_noise(x):
     side = int(len(x) ** 0.5)
     order = blue_noise(side)
+    #test_noise_quality(side,blue_noise,"blue noise")
     return [x[i] for i in order]
+
+def test_noise_quality(size, noise_fn,name):
+    """
+    Compare blue_noise spatial distribution quality against pure random.
+    Measures: nearest-neighbor distances, spatial autocorrelation.
+    """
+    #size = 16  # Use smaller size for faster testing
+    n = size * size
+    
+    # Generate blue_noise ordering
+    bn_order = noise_fn(size)
+    
+    # Generate pure random ordering
+    rng = np.random.default_rng(42)
+    random_order = list(range(n))
+    rng.shuffle(random_order)
+    
+    def analyze_spatial_distribution(order, size):
+        """Compute spatial quality metrics for a given ordering."""
+        n = len(order)
+        # Create inverse mapping: rank -> position
+        pos_of_rank = [0] * n
+        for pos, rank in enumerate(order):
+            pos_of_rank[rank] = pos
+        
+        # Compute nearest-neighbor distances for consecutive ranks
+        nn_distances = []
+        for rank in range(n - 1):
+            pos1 = pos_of_rank[rank]
+            pos2 = pos_of_rank[rank + 1]
+            r1, c1 = divmod(pos1, size)
+            r2, c2 = divmod(pos2, size)
+            # Euclidean distance
+            dist = np.sqrt((r1 - r2)**2 + (c1 - c2)**2)
+            nn_distances.append(dist)
+        
+        # Compute spatial autocorrelation (Moran's I approximation)
+        # Check if nearby positions have similar ranks
+        autocorr_sum = 0.0
+        count = 0
+        for pos in range(n):
+            r, c = divmod(pos, size)
+            rank = order[pos]
+            # Check 4-neighbors
+            for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < size and 0 <= nc < size:
+                    npos = nr * size + nc
+                    nrank = order[npos]
+                    autocorr_sum += abs(rank - nrank)
+                    count += 1
+        
+        avg_autocorr = autocorr_sum / count if count > 0 else 0
+        
+        return {
+            'min_nn_dist': np.min(nn_distances),
+            'mean_nn_dist': np.mean(nn_distances),
+            'std_nn_dist': np.std(nn_distances),
+            'avg_rank_diff': avg_autocorr,  # Higher = less correlated = better
+        }
+    
+    bn_stats = analyze_spatial_distribution(bn_order, size)
+    rand_stats = analyze_spatial_distribution(random_order, size)
+    
+    print(f"\n{'Metric':<20} {name:>12} {'Pure Random':>12} {'Winner':>12}")
+    print("-" * 60)
+    
+    # Compare metrics (higher mean_nn_dist and avg_rank_diff are better)
+    for metric in ['min_nn_dist', 'mean_nn_dist', 'std_nn_dist', 'avg_rank_diff']:
+        bn_val = bn_stats[metric]
+        rand_val = rand_stats[metric]
+        
+        if metric in ['mean_nn_dist', 'avg_rank_diff']:
+            winner = 'Noise' if bn_val > rand_val else 'Random'
+        else:
+            winner = '-'
+        
+        print(f"{metric:<20} {bn_val:>12.3f} {rand_val:>12.3f} {winner:>12}")
+    
+    print("\nInterpretation:")
+    print("- mean_nn_dist: Higher = consecutive ranks are farther apart (BETTER)")
+    print("- avg_rank_diff: Higher = neighbors have different ranks (BETTER)")
+    print("\nIf Blue Noise wins both, it's better than random.")
+    print("If Random wins, your algorithm has spatial correlation (waves).")
 
 #---------------------
 def hilbert_indices(n: int):
@@ -331,7 +644,7 @@ def split_image(w, h, pixels):
 
 def recursive_split(w, h, pixels):
     """Recursively split image until one dimension is 1. Returns list of split images."""
-    if w == 1 or h == 1:
+    if w <= 1 or h <= 1:
         return [(w, h, pixels)]
 
     axis, left, right = split_image(w, h, pixels)
@@ -462,7 +775,7 @@ def best_stride_maximin_manhattan(
             idx = nxt
         else:
             davg = dsum / moves
-            key = (davg, dmin,  -s)  # maximize min, then average; tie -> smaller s
+            key = (davg, dmin, -s)  # maximize min, then average; tie -> smaller s
             if best_key is None or key > best_key:
                 best_key = key
                 best_s = s
@@ -526,9 +839,11 @@ def find_grid_quad(gray: np.ndarray) -> np.ndarray | None:
         for c in cnts:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if(len(approx) !=4):
+                continue
             area = cv2.contourArea(approx)
             area_ratio = area / img.size
-            #dbg(f"{label}: {len(approx)} points, ratio={area_ratio:.3f}")
+            #dbg(f"{label}: {len(approx)} points, ratio={area_ratio:.3f} {approx}")
 
             if len(approx) == 4 and area_ratio > 0.10:
                 return order_points(approx)
@@ -643,25 +958,26 @@ def write_chart(data: list[tuple[int, int]], out_path: str, cell: int, margin: i
     dbg(f"Saved chart image: {out_path}")
 
 
-def generate_chart(out_path: str, cell: int, margin: int, grid: int, line: int, border: int, invert: bool, shuffle: str) -> None:
+def generate_chart(a) -> None:
     """
     Create a printable grid x grid ramp chart:
     - Outer thick black border (easy quad detection)
     - Thin internal grid lines
     - Patches filled with x levels 0..255 (row-major)
     """
+    out_path = a.generate
     # Patch levels
-    levels = np.rint(np.linspace(0, 255, grid * grid)).astype(np.uint8)
-    if invert:
+    levels = np.rint(np.linspace(0, 255, a.grid * a.grid)).astype(np.uint8)
+    if a.invert_chart:
         levels = (255 - levels).astype(np.uint8)
 
-    shuffled = permute(levels, shuffle)
+    shuffled = permute(levels, a.shuffle)
 
     # Create data as (intended, actual) pairs
     data = [(int(levels[i]), int(shuffled[i])) for i in range(len(levels))]
 
-    label = f"shuffle={shuffle} invert={invert} grid={grid} cell={cell} border={border} file={out_path}"
-    write_chart(data, out_path, cell, margin, grid, line, border, label)
+    label = f"shuffle={a.shuffle} invert={a.invert_chart} grid={a.grid} cell={a.cell} border={a.border} file={out_path}"
+    write_chart(data, out_path, a.cell, a.margin, a.grid, a.line, a.border, label)
 
 def write_csv(filename: str, curve: list[tuple[int, int]]) -> None:
     """Write (x, y) data pairs to CSV file in the format used by acv."""
@@ -671,8 +987,10 @@ def write_csv(filename: str, curve: list[tuple[int, int]]) -> None:
         for x, y in curve:
             w.writerow([0, x, y])
 
-def read_chart(image_path: str, out_csv: str, grid: int, size: int, shuffle: str, debug: str, border: int, cell: int ) -> list[tuple[int, int]]:
+def read_chart(a) -> list[tuple[int, int]]:
+#def read_chart(image_path: str, out_csv: str, grid: int, size: int, shuffle: str, debug: str, border: int, cell: int ) -> list[tuple[int, int]]:
     """Read and analyze a ramp chart from an image."""
+    image_path = a.image
 
     gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
@@ -683,19 +1001,19 @@ def read_chart(image_path: str, out_csv: str, grid: int, size: int, shuffle: str
     if quad is None:
         dbg("Warning: could not detect outer grid border; using full image.")
 
-    warped = warp_to_square(gray, quad, size)
+    warped = warp_to_square(gray, quad, a.warpsize)
 
     # Crop out half the margin
-    chart_side = grid * cell +  border
-    margin_pixels = int(border/2 *size/chart_side )
+    chart_side = a.grid * a.cell +  a.border
+    margin_pixels = int(a.border/2 *a.warpsize/chart_side )
     warped = warped[margin_pixels:-margin_pixels, margin_pixels:-margin_pixels]
 
 
-    med = measure_patches(warped, grid=grid, roi_frac=2 / 3)
+    med = measure_patches(warped, grid=a.grid, roi_frac=2 / 3)
 
-    if debug:
-        cv2.imwrite(debug, warped)
-        dbg(f"Debug image written to: {debug}")
+    if a.debug:
+        cv2.imwrite(a.debug, warped)
+        dbg(f"Debug image written to: {a.debug}")
 
     # y: normalize so darkest measured = 0 and lightest measured = 255
     y = normalize_to_0_255(med)
@@ -705,16 +1023,16 @@ def read_chart(image_path: str, out_csv: str, grid: int, size: int, shuffle: str
     #    y = (255 - y).astype(np.uint8)
 
     # x: intended ramp levels 0..255 across 100 patches (row-major)
-    x = np.rint(np.linspace(0, 255, grid * grid)).astype(np.uint8)
-    x = permute(x, shuffle)
+    x = np.rint(np.linspace(0, 255, a.grid * a.grid)).astype(np.uint8)
+    x = permute(x, a.shuffle)
 
     data = [(int(xi), int(yi)) for xi, yi in zip(x, y)]
-    write_csv(out_csv, data)
+    write_csv(a.out_csv, data)
 
-    dbg(f"Read {len(x)} patches from {image_path} and wrote to {out_csv}")
+    dbg(f"Read {len(x)} patches from {image_path} and wrote to {a.out_csv}")
     return data
 
-def generate_variance_chart( data: list[tuple[int, int]], out_path: str, grid: int) -> None:
+def generate_variance_chart( data: list[tuple[int, int]], a) -> None:
     """
      Some variance in chart values is due to enlarger light falloff. With a 32x32 chart and
      shuffled patches there are 4 samples per level spread across the image. The average
@@ -723,6 +1041,8 @@ def generate_variance_chart( data: list[tuple[int, int]], out_path: str, grid: i
      This function writes a chart where each patch is the difference between the measured
      value and the best estimate value.
     """
+    out_path = a.variance
+    grid = a.grid
     #`dbg(f"Generating variance chart from {(data)} measurements")
     # Group data by intended level (x value)
     level_groups = defaultdict(list)
@@ -737,7 +1057,7 @@ def generate_variance_chart( data: list[tuple[int, int]], out_path: str, grid: i
         if len(group) > 1 and y != 0 :
             # Leave-one-out mean: exclude this specific measurement
             leave_one_out_mean = (sum(group) - y) / (len(group) - 1)
-            variance = (y - leave_one_out_mean)
+            variance = (y - leave_one_out_mean)/leave_one_out_mean
             #dbg(f"variance {x} y:{y} m:{leave_one_out_mean} v:{variance:.0f}")
         else:
             # Single measurement: no variance to calculate
@@ -752,63 +1072,504 @@ def generate_variance_chart( data: list[tuple[int, int]], out_path: str, grid: i
     csvfile = os.path.splitext(out_path)[0] + ".csv"
     write_csv(csvfile, variance_data)
 
+
+def white_value(dtype):
+    """Full-scale value for a bit depth. 255 is nearly black in 16-bit."""
+    return 65535 if dtype == np.uint16 else 255
+
+def generate_bar_image(width, height, segments, dtype) -> np.ndarray:
+    """Generate a black/white bar image with black center and a white segment on each end."""
+    img = np.full((height, width), 0, dtype=dtype)  # Start with black
+    white = white_value(dtype)
+
+    segment_height = height / segments
+
+    # Top white bar (1 segment)
+    top_end = int(segment_height)
+    img[0:top_end, :] = white
+
+    # Bottom white bar (1 segment)
+    bottom_start = int((segments-1) * segment_height)
+    img[bottom_start:height, :] = white
+
+    return img
+
+def generate_step_wedge_image(a) -> np.ndarray:
+    #out_path: str, segments: int = 21, progression: str = "linear", width: int = 200, height: int = 1000, 
+    #                    include_gradient: bool = True, include_bars: bool = True) -> None:
+    """
+    Generate a step wedge chart with N segments (default 21).
+    Optionally includes a vertical gradient and black/white bars.
+    """
+    include_gradient = True
+    include_bars = True
+    segments = a.segments
+    stops_per_segment = 1/3
+    total_width = 200
+    width = total_width
+    height = 1000
+    grad_width = 50
+    bar_width = 20
+
+    
+    # Add space for gradient and bars if requested
+    if include_gradient:
+        width -= grad_width
+    if include_bars:
+        width -= bar_width
+    
+    img = np.full((height, total_width), 255, dtype=np.uint8)
+    
+    # Draw step wedge
+    segment_height = height / segments
+    for j in range(segments):
+        y_start = int(j * segment_height)
+        y_end = int((j + 1) * segment_height + 1)
+        if a.progression == "linear":
+            value = round(255 - 255 * (j / (segments - 1)))
+            reflectance = value / 255.0
+        if a.progression == "stops":
+            value = round(255 * (2 ** (-j * stops_per_segment)))
+            reflectance = value / 255.0
+        if a.progression == "inv_stops":
+            inverted_value = round(255 * (2 ** (-j * stops_per_segment)))
+            value = 255 - inverted_value
+            reflectance = inverted_value / 255.0
+
+        density = -np.log10(reflectance) if reflectance > 0 else float('inf')
+        img[y_start:y_end, 0:width] = value
+        
+        # Add segment number text
+        text_value = 0 if value >= 128 else 255
+        cv2.putText(img, str(j + 1), (10, y_start + 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_value, 1, cv2.LINE_AA)
+        # Add value at bottom left
+        cv2.putText(img, f"{value:.0f} D:{density:.2f}", (10, y_end - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, text_value, 1, cv2.LINE_AA)
+    
+    x_offset = width
+    
+    # Draw vertical gradient if requested
+    if include_gradient:
+        for y in range(height):
+            value = int(255 * (1 - y / height))
+            img[y, x_offset:x_offset + grad_width] = value
+        x_offset += grad_width
+    
+    # Draw black/white bars if requested
+    if include_bars:
+        bar_img = generate_bar_image(bar_width, height, segments, np.uint8)
+        img[0:height, x_offset:x_offset + bar_width] = bar_img
+
+    return img
+    
+def generate_step_wedge(a) -> None:
+    out_path = a.image
+    img = generate_step_wedge_image(a)
+    if not cv2.imwrite(out_path, img):
+        raise RuntimeError(f"Failed to write step wedge: {out_path}")
+    dbg(f"Saved step wedge: {out_path}")
+
+
+def apply_curve_to_image(image: np.ndarray, curves: list[list[tuple[int, int]]]) -> np.ndarray:
+    """Apply curve(s) to an image using OpenCV LUT.
+    
+    If curves has 1 channel, apply to all image channels.
+    If curves has multiple channels, apply each to corresponding image channel.
+    """
+    # Determine bit depth
+    dbg(f"apply_curve_to_image: image.dtype={image.dtype}")
+    lut_size, scale = (65536, 257) if (image.dtype == np.uint16) else (256, 1)
+ 
+    def build_lut(curve):
+        lut = np.arange(lut_size, dtype=np.float32)
+        
+        if len(curve) > 0:
+            # Scale curve points to match bit depth
+            x_vals = np.array([x * scale for x, _ in curve], dtype=np.float32)
+            y_vals = np.array([y * scale for _, y in curve], dtype=np.float32)
+            
+            # Extend to full range if needed
+            if x_vals[0] > 0:
+                x_vals = np.insert(x_vals, 0, 0)
+                y_vals = np.insert(y_vals, 0, y_vals[0])
+            if x_vals[-1] < lut_size - 1:
+                x_vals = np.append(x_vals, lut_size - 1)
+                y_vals = np.append(y_vals, y_vals[-1])
+            
+        return np.clip(np.interp(lut, x_vals, y_vals), 0, lut_size - 1).astype(image.dtype)
+        
+    # Spline fill first, the way acv does, so a 16 point .acv means the same curve
+    # here as it does to acv, Photoshop and ffmpeg. fill_curve is a no-op on a curve
+    # that is already a 0..255 mapping.
+    luts = [build_lut(curve) for curve in fill_curve(curves)]
+
+    # Apply LUTs to image channels
+    if len(image.shape) == 2:
+        return luts[0][image]
+    
+    channels = cv2.split(image)
+    if len(luts) == 1:
+        result_channels = [luts[0][ch] for ch in channels]
+    else:
+        result_channels = [luts[min(i, len(luts)-1)][ch] for i, ch in enumerate(channels)]
+    
+    return cv2.merge(result_channels)
+
+
+def ensure_portrait(img: np.ndarray) -> np.ndarray:
+    """Rotate image to portrait orientation if it's landscape."""
+    h, w = img.shape[:2]
+    if w > h:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    return img
+
+
+def apply_curve(a) -> None:
+    """Apply a curve file to an image."""
+    input_path = a.image
+    curve_path, output_path = a.apply
+    # Read image
+    img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Cannot read image: {input_path}")
+
+    img = ensure_portrait(img)
+
+    # Create step wedge if requested
+    if a.step_wedge:
+        wedge = generate_step_wedge_image(a)
+        wedge_width = wedge.shape[1]
+    else:
+        wedge_width = 0
+
+    # Add margin before resizing
+    if a.margin > 0:
+        h, w = img.shape[:2]
+        new_shape = (h + 2*a.margin, w + 2*a.margin) + (img.shape[2:] if len(img.shape) == 3 else ())
+        new_img = np.full(new_shape, white_value(img.dtype), dtype=img.dtype)
+        new_img[a.margin:a.margin+h, a.margin:a.margin+w] = img
+        img = new_img
+        dbg(f"Added {a.margin}px margin: {w}x{h} -> {img.shape[1]}x{img.shape[0]}")
+
+    # Resize if requested
+    if a.size:
+        h, w = img.shape[:2]
+        scale_w, scale_h = (a.size - wedge_width) / w, a.size / h
+        scale = min(scale_w, scale_h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LANCZOS4
+        img = cv2.resize(img, (new_w, new_h), interpolation=interp)
+        dbg(f"Resized from {w}x{h} to {new_w}x{new_h}")  
+
+    curves = read_curve(curve_path)
+    
+    dbg(f"Applying {len(curves)} curve channel(s) with {len(curves[0])} points to image")
+
+    # Apply curves
+    result = apply_curve_to_image(img, curves)
+
+    # Append step wedge if requested
+    if a.step_wedge:
+        # Apply curves to wedge too
+        wedge = apply_curve_to_image(wedge, curves)
+
+        # Pad wedge height to match result height if needed
+        pad_height = result.shape[0] - wedge.shape[0]
+        if pad_height > 0:
+            half_pad = pad_height // 2
+            bottom_pad = np.zeros((half_pad, wedge.shape[1]), dtype=wedge.dtype)
+            top_pad = np.full((pad_height - half_pad, wedge.shape[1]), 255, dtype=wedge.dtype)
+            wedge = np.vstack([top_pad, wedge, bottom_pad])
+        if pad_height < 0:
+            pad = generate_bar_image(result.shape[1], -pad_height, a.segments, result.dtype)
+            if len(result.shape) == 3:
+                pad = cv2.cvtColor(pad, cv2.COLOR_GRAY2BGR)
+            result = np.vstack([result, pad])
+
+        # Match bit depth
+        if result.dtype == np.uint16:
+            wedge = (wedge.astype(np.uint16) * 257)
+
+
+        # Match channels
+        if len(result.shape) == 3:
+            wedge = cv2.cvtColor(wedge, cv2.COLOR_GRAY2BGR)
+
+        result = np.hstack([result, wedge])
+ 
+    # Convert to grayscale before saving
+    if len(result.shape) == 3:
+        dbg(f"Converting data to grayscale")
+        result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+
+
+    # apply_curve_to_image preserves the input depth, so 16-bit data is already scaled
+    if output_path.endswith(".tif") and result.dtype != np.uint16:
+        dbg(f"Converting data to 16-bit")
+        result = (result.astype(np.float32) * 257).astype(np.uint16)  # Scale 8-bit to 16-bit
+    
+    # Write output
+    if not cv2.imwrite(output_path, result):
+        raise RuntimeError(f"Failed to write image: {output_path}")
+    
+    dbg(f"Applied curve to {output_path}")
+
+def find_step_wedge_region(gray: np.ndarray,a) -> tuple[np.ndarray, int] | None:
+    """Detect the step wedge region by finding the white/black/white bar pattern. Returns (quad, wedge_width) or None."""
+    h, w = gray.shape
+    
+    # Search in rightmost 30% of image for the bar pattern
+    search_width = int(w * 0.3)
+    right_region = gray[:, -search_width:]
+    
+    # Use edge detection to find vertical structures
+    blur = cv2.GaussianBlur(right_region, (11,11), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=2)
+    
+    # Find vertical lines
+    thr = int(h*0.6)
+    mll = int(h*0.3)
+    xlg = int(h*0.02)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=thr,
+                            minLineLength=mll, maxLineGap=xlg)
+    #dbg(f"HoughLinesP thr:{thr} mll:{mll} xlg:{xlg} lines{len(lines)}")
+    
+    if lines is None:
+        return None
+    
+    # Find rightmost vertical line (right edge of bar)
+    vertical_lines = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+        if angle > 80 and angle < 100:
+            vertical_lines.append((max(x1, x2), min(y1, y2), max(y1, y2), x1, y1, x2, y2))
+    
+    if not vertical_lines:
+        return None
+    
+    # Sort by x position and get rightmost line
+    vertical_lines.sort(key=lambda x: x[0], reverse=True)
+    right_edge_x, top_y, bottom_y, x1, y1, x2, y2 = vertical_lines[0]
+    right_edge_x += (w - search_width)  # Convert to full image coordinates
+
+    # Calculate angle of the detected line
+    angle_rad = np.arctan2(y2 - y1, x2 - x1)    
+
+    # Debug: draw detected lines
+    if a.debug:
+        debug_img = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        v=0
+        for i, (x, y1, y2, *_) in enumerate(reversed(vertical_lines)):
+            c=(0,v,0)
+            v=v+255/len(vertical_lines)
+            if i==len(vertical_lines)-1:
+                c=(0,0,255)
+            cv2.line(debug_img, (x, y1), (x, y2), c, 2)
+        debug_path = a.debug.replace('.', '_lines.')
+        cv2.imwrite(debug_path, debug_img)
+        dbg(f"Drew {len(vertical_lines)} vertical lines to {debug_path}")
+    
+    # Bar height from detected vertical line
+    segments = a.segments
+    bar_height = int( (bottom_y - top_y)*segments/(segments - 2))
+    segment_height = bar_height/segments
+    wedge_width = int(bar_height / 5)
+    
+    # Left edge of wedge
+    left_edge_x = right_edge_x - wedge_width
+    
+    # Create rotated quad using the detected angle
+    # Direction perpendicular to the line
+    dx = np.cos(angle_rad)
+    dy = np.sin(angle_rad)
+    # Direction along the line
+    px = -dy
+    py = dx
+    
+    # Center point of the right edge (in full image coordinates)
+    center_x = right_edge_x
+    center_y = top_y 
+    # Extend vertically by one segment on each side
+    half_height = (bottom_y - top_y)  +  segment_height
+    
+    # Build quad corners following the rotation
+    # Start from center and move along/perpendicular to the detected line
+    quad = np.array([
+        [center_x - wedge_width * px + segment_height * dx, center_y - wedge_width * py + segment_height * dy],  # top-left
+        [center_x + segment_height * dx, center_y + segment_height * dy],  # top-right
+        [center_x - half_height * dx, center_y - half_height * dy],  # bottom-right
+        [center_x - wedge_width * px - half_height * dx, center_y - wedge_width * py - half_height * dy]   # bottom-left
+    ], dtype=np.float32)
+
+    return quad, wedge_width
+
+def read_step_wedge(a) -> list[tuple[int, int]]:
+    """Read step wedge values from an image and output CSV."""
+    input_path = a.image
+    output_csv = a.read_wedge
+    
+    img = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Cannot read image: {input_path}")
+    
+    dbg(f"Image shape: {img.shape}")
+    
+    # Try to detect the step wedge region
+    detection = find_step_wedge_region(img,a)
+    
+    if detection is None:
+        # Fallback: assume wedge is rightmost 200px (or proportional)
+        h, w = img.shape
+        wedge_width = min(200, int(w * 0.15))
+        dbg(f"Could not detect wedge region, using rightmost {wedge_width}px")
+        wedge = img[:, -wedge_width:]
+        warp_size = 1000
+    else:
+        quad, detected_width = detection
+        dbg(f"Detected wedge region with width ~{detected_width}px")
+        
+        # Warp to standard size
+        warp_size = 1000
+        wedge_target_width = 200
+        dst = np.array([
+            [0, 0],
+            [wedge_target_width - 1, 0],
+            [wedge_target_width - 1, warp_size - 1],
+            [0, warp_size - 1]
+        ], dtype=np.float32)
+        
+        M = cv2.getPerspectiveTransform(quad, dst)
+        wedge = cv2.warpPerspective(img, M, (wedge_target_width, warp_size), 
+                                     flags=cv2.INTER_CUBIC)
+        wedge_width = wedge_target_width
+    
+    # Create debug image if requested
+    if a.debug:
+        debug_img = cv2.cvtColor(wedge, cv2.COLOR_GRAY2BGR)
+
+    # Step wedge parameters
+    segments = a.segments
+    h = wedge.shape[0]
+    
+    # Measure each segment
+    segment_height = h / segments
+    data = []
+    
+    # Determine sampling area (avoid gradient and bars on the right)
+    step_width = int(wedge_width * 0.65)  # Use left 65% of wedge
+    
+    for j in range(segments):
+        y_start = int(j * segment_height)
+        y_end = int((j + 1) * segment_height)
+        
+        # Add vertical margin to avoid segment boundaries
+        y_margin = max(1, int(segment_height * 0.1))
+        y_start += y_margin
+        y_end -= y_margin
+        
+        roi = wedge[y_start:y_end, 0:step_width]
+        
+        # Measure median value
+        measured_value = int(np.median(roi))
+        
+        # Draw ROI rectangle on debug image
+        if a.debug:
+            cv2.rectangle(debug_img, (0, y_start), (step_width, y_end), (0, 255, 0), 1)
+
+        # Expected value based on progression
+        if a.progression == "linear":
+            expected_value = round(255 - 255 * (j / (segments - 1)))
+        elif a.progression == "stops":
+            expected_value = round(255 * (2 ** (-j / 3)))
+        elif a.progression == "inv_stops":
+            inverted = round(255 * (2 ** (-j / 3)))
+            expected_value = 255 - inverted
+        else:
+            expected_value = round(255 - 255 * (j / (segments - 1)))
+        
+        data.append((expected_value, measured_value))
+    
+    # Save debug image
+    if a.debug:
+        if not cv2.imwrite(a.debug, debug_img):
+            raise RuntimeError(f"Failed to write debug image: {a.debug}")
+        dbg(f"Debug image written to: {a.debug}")
+    
+    write_csv(output_csv, data)
+    dbg(f"Read {len(data)} step wedge segments from {input_path} and wrote to {output_csv}")
+    return data
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     def usage(message: str):
         print(__doc__)
         ap.print_help()
-        print(f"Error: {message}", file=sys.stderr)
+        print(f"\nError: {message}", file=sys.stderr)
         sys.exit(1)
 
     ap.error = usage
-    ap.add_argument("--generate", metavar="OUT_IMAGE", help="Generate a printable ramp chart image and exit")
-    ap.add_argument("--grid", type=int, default=32, help="Chart: size for a grid x grid chart (default 32)")
-    ap.add_argument("--invert-chart", action="store_true", help="Chart: invert patch levels ")
-    ap.add_argument("--shuffle", type=str, default='blue_noise', 
-                    help="Chart: shuffle methods: none, blue_noise, gcd, hilbert, split, shuffle, maximize_closest (default blue_noise)")
-
+    ap.add_argument("--generate", metavar="OUT_IMAGE", help="Generate a printable ramp chart image")
+    ap.add_argument("--step-wedge", action="store_true", help="Generate a 21-segment step wedge or append one when using --apply")
+    ap.add_argument("--read-wedge", metavar="OUT_CSV", help="Read step wedge values from image and output CSV")
+    ap.add_argument("--apply", nargs=2, metavar=("CURVE", "OUTPUT"), help="Apply curve to an image")
+    ap.add_argument("--size", type=int, help="Apply: resize maximum dimension to this size before applying curve")
+    ap.add_argument("--progression", type=str, default='linear', help="Step wedge progression: linear, stops, inv_stops (default linear)")
     ap.add_argument("image", nargs="?", help="Input photo/scan containing the NxN ramp grid (reader mode)")
     ap.add_argument("out_csv", nargs="?", help="Output CSV path (reader mode)")
-    ap.add_argument("--size", type=int, default=1000, help="Reader: warp canvas size (pixels), default 1000")
-    ap.add_argument("--debug", help="Reader: optional path to save the warped grayscale image")
-    ap.add_argument("--variance", type=str, default=None, help="Reader: optional path to save a variance chart")
-    ap.add_argument("--cell", type=int, default=40, help="Chart: cell size in pixels (default 40)")
-    ap.add_argument("--margin", type=int, default=80, help="Chart: outer margin in pixels (default 80)")
-    ap.add_argument("--line", type=int, default=1, help="Chart: internal grid line thickness (default 1)")
-    ap.add_argument("--border", type=int, default=10, help="Chart: outer border thickness (default 10)")
+    ap.add_argument("--warpsize", type=int, default=1000, help=argparse.SUPPRESS) #help="Reader: warp canvas size (pixels), default 1000"
+    ap.add_argument("--debug", help=argparse.SUPPRESS) #help="Reader: optional path to save the warped grayscale image")
+    ap.add_argument("--variance", type=str, default=None, help=argparse.SUPPRESS) #help="Reader: optional path to save a variance chart")
+    ap.add_argument("--grid", type=int, default=32, help="Chart: size for a grid x grid chart (default 32)")
+    ap.add_argument("--shuffle", type=str, default='blue_noise', 
+                    help="Chart: shuffle methods: none, blue_noise, gcd, hilbert, split, shuffle, maximize_closest (default blue_noise)")
+    ap.add_argument("--cell", type=int, default=40, help=argparse.SUPPRESS) #help="Chart: cell size in pixels (default 40)")
+    ap.add_argument("--invert-chart", action="store_true", help="Chart: invert patch levels ")
+    ap.add_argument("--margin", type=int, default=40, help=argparse.SUPPRESS) #help="Chart: outer margin in pixels (default 80)")
+    ap.add_argument("--line", type=int, default=1, help=argparse.SUPPRESS) #help="Chart: internal grid line thickness (default 1)")
+    ap.add_argument("--border", type=int, default=10, help=argparse.SUPPRESS) #help="Chart: outer border thickness (default 10)")
+    ap.add_argument("--segments", type=int, default=21, help=argparse.SUPPRESS) #"Step wedge: number of segments (default 21)")
+    #ap.add_argument("--wedge-width", type=int, default=200, help="Step wedge: width in pixels (default 200)")
+    #ap.add_argument("--wedge-height", type=int, default=1000, help="Step wedge: height in pixels (default 1000)")
+    #ap.add_argument("--no-gradient", action="store_true", help="Step wedge: exclude gradient")
+    #ap.add_argument("--no-bars", action="store_true", help="Step wedge: exclude black/white bars")
     args = ap.parse_args( )
 
+    # Apply mode
+    if args.apply:
+        if not args.image:
+            ap.error("Apply mode requires: image --apply CURVE OUTPUT")
+        apply_curve(args)
+        return 0
+
+    # Read step wedge mode
+    if args.read_wedge:
+        if not args.image:
+            ap.error("Read wedge mode requires: image --read-wedge OUT_CSV")
+        read_step_wedge(args)
+        return 0    
 
     # Generator mode
     if args.generate:
-        generate_chart(
-            out_path=args.generate,
-            cell=args.cell,
-            margin=args.margin,
-            grid=args.grid,
-            line=args.line,
-            border=args.border,
-            invert=args.invert_chart,
-            shuffle=args.shuffle,
-        )
+        generate_chart(args)
         return 0
+
+    if args.step_wedge:
+        if not args.image:
+            ap.error("Step wedge generation requires output path as first argument")
+        generate_step_wedge(args)
+        return 0
+
 
     # Reader mode
     if not args.image or not args.out_csv:
         ap.error("Reader mode requires: image out_csv (or use --generate OUT_IMAGE).")
 
-    data = read_chart(
-        image_path=args.image,
-        out_csv=args.out_csv,
-        grid=args.grid,
-        size=args.size,
-        shuffle=args.shuffle,
-        debug=args.debug,
-        border=args.border,
-        cell=args.cell,
-    )
+    data = read_chart(args)
     if args.variance:
-        generate_variance_chart(data, args.variance, args.grid)
+        generate_variance_chart(data, args)
     return 0
 
 
