@@ -1,21 +1,26 @@
-#!/bin/bash -x
-. "$(dirname "$0")/checks.sh"
+#!/bin/bash
+. "$(dirname "$0")/checks.sh" 
 
 rm -f testchart.tif gamma045.acv testchart045.tif
+set -v
 
-# create a chart, apply  a curve to it, read the chart and re-create the curve
+# create a chart, 
 chart --grid 32 --generate testchart.tif
 read
 
+# apply  a curve to it, 
 acv identity | acv gamma 0.4545 - gamma045.acv
 acv show -w 40 gamma045.acv
+chart --apply gamma045.acv testchart045.tif testchart.tif
 read
 
-chart --apply gamma045.acv testchart045.tif testchart.tif
 
+# read the chart and re-create the curve
 chart --grid 32 testchart045.tif testchart045.csv
-
 acv -w 60 show testchart045.csv gamma045.acv
+read
+
+# difference between the original and the recovered curve
 acv error testchart045.csv gamma045.acv
 
 v=$(acv -q at 128 gamma045.acv)

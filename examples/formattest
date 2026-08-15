@@ -1,30 +1,33 @@
-#!/bin/bash -v
-. "$(dirname "$0")/checks.sh"
+#!/bin/bash
+. "$(dirname "$0")/checks.sh" >/dev/null
 
 rm -f weird.{csv,acv} c[0-9]*.{amp,csv} saw.csv testchart*.{tif,csv} gamma045.csv
+set -v
 
 # Make a spiky curve. Points beyond 0 and 255 are not truncated
-acv identity |acv gamma -s 0.45 - gamma045.csv
-acv identity |acv contrast 4 - c4.csv
+acv -q identity |acv -q gamma -s 0.45 - gamma045.csv
+acv -q identity |acv -q contrast 4 - c4.csv
 # use the fact that amp files clamp to 0-255
-acv offset 384 c4.csv c41.amp
-acv offset 128 c4.csv c42.amp
-acv offset -128 c4.csv c43.amp
-acv offset -384 c4.csv c44.amp
-acv diff c41.amp c42.amp |acv diff c44.amp - |acv diff c43.amp - |acv offset -128 - |acv contrast 0.5 - saw.csv
-acv diff gamma045.csv saw.csv weird.csv
-acv identity  |acv contrast 0.5 - |acv adjust - weird.csv | acv offset -88.6 - |acv max 255 - weird.csv
+acv -q offset 384 c4.csv c41.amp
+acv -q offset 128 c4.csv c42.amp
+acv -q offset -128 c4.csv c43.amp
+acv -q offset -384 c4.csv c44.amp
+acv -q diff c41.amp c42.amp |acv -q diff c44.amp - |acv -q diff c43.amp - |acv -q offset -128 - |acv -q contrast 0.5 - saw.csv
+acv -q diff gamma045.csv saw.csv weird.csv
+acv -q identity  |acv -q contrast 0.5 - |acv -q adjust - weird.csv | acv -q offset -88.6 - |acv -q max 255 - weird.csv
 
-# how well can it be represented with a 16 point acv curve?
+# How well can it be represented with a 16 point acv curve?
 acv offset -s 0 weird.csv weird.acv
 acv -w 60 show weird.csv weird.acv
+read
+
 acv diff -w 40 weird.csv weird.acv
 acv error weird.csv weird.acv
 # 16 control points cannot follow a spiky curve, so this error is meant to be large.
 check "16-point acv approximation" "$(acv -q error weird.csv weird.acv) < 16"
 read
 
-# create a chart, apply  a curve to it, read the chart and re-create the curve
+# Create a chart, apply  a curve to it,
 chart --grid 32 --generate testchart.tif
 chart --apply weird.acv testchart-weird.tif testchart.tif
 
@@ -37,5 +40,5 @@ acv error testchart-weird.csv weird.acv
 # The chart round trip should not lose much beyond what the 16 points already cost.
 check "curve recovered from chart" "$(acv -q error testchart-weird.csv weird.acv) < 2"
 
-read
+set +v
 rm -f weird.{csv,acv} c[0-9]*.{amp,csv} saw.csv testchart*.{tif,csv} gamma045.csv

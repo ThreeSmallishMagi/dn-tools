@@ -36,4 +36,4 @@ check "linear reconstruction" "$(acv -q error npd4i.csv npd4irecon.csv) < 2"
 v=$(acv -q at 128 npd4irecon.csv)
 check "reconstruction at x=128" "$v > 81 && $v < 84"
 
-#rm -f npd4i.csv npd4il.csv npd4ilinearresidual.csv npd4irecon.csv
+rm -f npd4i.csv npd4il.csv npd4ilinearresidual.csv npd4irecon.csv
