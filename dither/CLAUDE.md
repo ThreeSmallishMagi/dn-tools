@@ -39,7 +39,7 @@ Three executables are produced: `dither`, `srgbtest`, `temporaldither`.
 - `srgb.h` — the `vision::` namespace: inline sRGB curve primitives
   (`srgb_to_linear`, `linear_to_srgb`, `decode_pixel`, `encode_pixel`,
   `level_to_pixel`) plus declarations of the Mat-level helpers.
-- `srgb.cpp` — Mat-level implementations: `to_gray8`, `decode_gray`,
+- `srgb.cpp` — Mat-level implementations: `to_gray`, `decode_gray`,
   `encode_levels`, `average_gray`, and the 3-channel converters used by `srgbtest`.
 - `srgbtest.cpp`, `temporaldither.cpp` — small independent test/demo executables.
 
@@ -47,18 +47,23 @@ Three executables are produced: `dither`, `srgbtest`, `temporaldither`.
 
 All dithering operates in **linear light**. `main()`'s pipeline is:
 
-1. `vision::decode_gray(image, useSrgb)` — coerce any input to `CV_8U` grayscale and decode to `CV_32F` linear `[0, 1]` (folded into step 2 by `decode_display`).
+1. `vision::decode_gray(image, useSrgb)` — coerce any input to 8- or 16-bit
+   grayscale at its own depth and decode to `CV_32F` linear `[0, 1]` (folded into
+   step 2 by `decode_display`). `imread` needs `IMREAD_ANYDEPTH` or it returns 8 bits.
 2. `vision::decode_display(image, ladder, useSrgb)` — decode, then place each value
    on the `LevelSet` ladder built by `make_levels(levels, useSrgb, srgb_spaced)`,
    giving display units in `[0, levels-1]`.
-3. `ditherPass(target, dither_fn, spatial_fn, spatial, levels, frames, debug_row, debug_col)`
+3. `ditherPass(target, ladder, dither_fn, spatial_fn, spatial, levels, frames, debug_row, debug_col)`
    — returns a `std::vector<cv::Mat>` of `frames` images, each `CV_8U` raw level
    indices in `[0, levels-1]`.
 4. `vision::encode_levels(f, ladder)` per frame — LUT-encode level indices to the ladder's pixel values.
 5. `vision::average_gray(frames, useSrgb)` — linear-light mean, then re-encode. With
    `--save-frames` the individual frames are also written as `<stem>-N.png`.
 
-The output type is `CV_8U` (single-channel) end-to-end. The sRGB curve is applied exactly at the encode/decode boundaries and never inside the dither loop.
+Output is `CV_8U` (single-channel); input is 8- or 16-bit. An 8-bit input on an
+8-bit ladder has no tone between levels for diffusion or the budget to render. The
+sRGB curve is applied exactly at the encode/decode boundaries and never inside the
+dither loop.
 
 ## Dither mechanism
 
@@ -73,17 +78,31 @@ The output type is `CV_8U` (single-channel) end-to-end. The sRGB curve is applie
   — deposit `value` into neighbouring cells of `spatial_err` (or discard). `dir` is
   `+1` on left→right rows and `-1` on right→left rows. `spatial_none` is a no-op;
   `spatial_floydsteinberg` uses the 7/16, 3/16, 5/16, 1/16 pattern, mirrored
-  by `dir` so it always pushes error towards not-yet-visited pixels.
+  by `dir` so it always pushes error towards not-yet-visited pixels, and
+  renormalised over the columns inside the image so none is lost at a row end.
 
 Scanning is **serpentine**: `for_serpentine` walks even rows left→right and odd rows
 right→left, which avoids the directional worming that a pure raster scan produces.
 
 `quantize_scan` is the shared workhorse — one serpentine pass with its own private
-`spatial_err` channel. Per pixel it computes `v = value_fn(row, col) + spatial_err`,
-clamps `dither_fn(v, row, col)` to `[0, max_level]`, hands `spatial * residual`
-to `spatial_fn`, and reports the chosen level to a `sink` callback. `ditherPass` uses
-it twice: once for the goal pass and once per output frame; only `value_fn` and `sink`
-differ.
+`spatial_err` channel. Per pixel it hands `dither_fn` the value
+`target + spatial * err`, clamps the level to `[0, max_level]`, diffuses the whole
+residual against `target + err`, and reports the level to a `sink` callback.
+`ditherPass` uses it twice: once for the goal pass and once per output frame; only
+`value_fn` and `sink` differ.
+
+`--spatial` therefore scales how much accumulated error the threshold *sees*; the
+error passed on is always the whole residual, so the ledger is exact at any value.
+A mask threshold's residuals are not zero-mean, so discarding a share of them
+shifts the tone.
+
+A threshold rule works in **display levels**; what the eye and `average_gray` add up
+is **linear light**. `Space` converts between them, and both ledgers — diffusion
+and budget — run in linear light, because `--level-spacing srgb` rungs are uneven
+in light and a display-unit ledger raises the mean there. `Space` is the identity
+for a uniform ladder, and `to_display` snaps to a rung within 1e-5 so a budget paid
+down to whole rungs reads back whole. `DitherFn` takes a `double`, since the goal
+pass rounds `target * frames`, which can pass 2^24.
 
 The CLI exposes these as two orthogonal axes:
 
@@ -114,26 +133,25 @@ dithered (by the same `dither_fn`/`spatial_fn`, at full `spatial = 1`) to an int
 ideal = (goal - displayed) / (frames - f) + spatial_err
 ```
 
-where `displayed` is the running sum of levels already shown. Because the shortfall
-stays in `goal - displayed`, the sum of displayed levels converges *exactly* to the
-integer goal on the final frame — no separate accumulator is needed, and stochastic
-thresholds need no special-casing.
+where `displayed` is the running total of light already shown. Because the
+shortfall stays in `goal - displayed`, the total converges *exactly* to the goal on
+the final frame — no separate accumulator is needed, and stochastic thresholds need
+no special-casing. The goal is snapped to an integer in display units, the nearest
+total its two bracketing rungs can reach, and then converted to linear light.
 
 For `frames == 1` the goal pass is skipped, `goal = target * 1` stays a float, and
 the formula collapses to the classical `ideal = target + spatial_err`.
 
-`--spatial` is the fraction of each pixel's quantization residual handed to
-spatial diffusion (1 = full FS, 0 = none); it scales the per-frame passes only,
-never the goal pass. The withheld remainder is not discarded in multi-frame runs:
-it stays in `goal - displayed` and is therefore paid back by a later frame.
+`--spatial` scales the per-frame passes only, never the goal pass.
 
 ## Blue noise
 
 `build_blue_noise_mask` in `bluenoise.cpp` runs progressive void-and-cluster: repeatedly place a pixel at the lowest-energy empty location and update a toroidal Gaussian energy map with a min-heap (`O(N·K·log N)` where `K` is the sparse kernel size).
 
-`BlueDither` thresholds `frac(v) * 255` against
-`mask[(row + sy) % rows][(col + sx) % cols]`. The modulo indexing handles both cases
-uniformly:
+`BlueDither` thresholds `frac(v) * 254` against
+`mask[(row + sy) % rows][(col + sx) % cols]`, with `frac` taken from `floor(v)`.
+A mask cell holding `t` is the rank at quantile `t/254`, so this fires with
+probability `frac`. The modulo indexing handles both cases uniformly:
 - `--mask-size` unset: mask is the image size capped at 256 per side (building one
   is `O(N·K·log N)`, so an uncapped 1200×1600 mask costs ~60s against ~1s for the
   tile). At or below the cap the modulo is just a toroidal shift; above it, it tiles.
@@ -145,7 +163,7 @@ the first `new_frame()`, so it always uses offset `(0, 0)`.
 
 The mask is written only when `--mask-out <path>` is given, and `--mask-in <path>`
 loads one instead of building it (`cv::IMREAD_GRAYSCALE`, raw values — `BlueDither`
-compares against `frac(v) * 255`, so no sRGB decode applies). Building uses its own
+compares against `frac(v) * 254`, so no sRGB decode applies). Building uses its own
 `std::mt19937_64(seed)` inside `bluenoise.cpp` and never touches the global `rng`, so
 loading a mask leaves the per-frame offsets identical to the run that produced it —
 `--mask-out` then `--mask-in` reproduces a result byte for byte.
@@ -154,15 +172,14 @@ loading a mask leaves the per-frame offsets identical to the run that produced i
 
 - `--linear` disables the sRGB curve entirely (input treated as raw linear, output written raw). Everything else in the pipeline is unaffected.
 - `--levels 2` (default) produces only `0` and `255`, which are sRGB-invariant — the choice of `useSrgb` doesn't affect the pixel values, only the linear-light interpretation of intermediate values (which are absent). `--level-spacing` is likewise a no-op there.
-- `--level-spacing srgb` moves the rungs but not the maths: `LevelSet::lin` holds each
-  level's true linear value and `to_display` interpolates between rungs *in linear
-  light*, so a fraction `f` between levels still averages to `(1-f)·lin[k] + f·lin[k+1]`.
-  Interpolating in sRGB instead would look right and quietly break density preservation.
-  For a uniform ladder `to_display` short-circuits to `linear * (levels-1)`, which is the
-  arithmetic the pipeline used before ladders existed — keeping default output bit-identical.
-- `goals` and `displayed` (`CV_32F`) live for the whole `ditherPass` and carry the
-  temporal budget across frames. `spatial_err` (`CV_32F`) is freshly zeroed inside
-  every `quantize_scan` — it's a within-scan diffusion channel only.
+- `LevelSet::lin` holds each level's true linear value and `to_display` interpolates
+  between rungs *in linear light*, so a fraction `f` between levels averages to
+  `(1-f)·lin[k] + f·lin[k+1]`. Error accumulated across intervals runs in linear
+  light, via `Space`.
+- `goals` and `displayed` (`CV_64F`) live for the whole `ditherPass` and carry the
+  temporal budget across frames; double, since at high frame counts a float error
+  in their sum exceeds the smallest rung step. `spatial_err` (`CV_32F`) is freshly
+  zeroed inside every `quantize_scan` — a within-scan diffusion channel only.
 - Output frames are `CV_8U` grayscale. `average_gray` averages them in linear light (decode → mean → encode) — averaging raw pixel means would be perceptually wrong.
 
 ## Verification
@@ -173,6 +190,15 @@ loading a mask leaves the per-frame offsets identical to the run that produced i
 
 `budgettest` checks the multi-frame invariant directly: with `--spatial 0` (per-frame
 FS off), `sum_f display_f[r,c] == goal[r,c]` exactly for every threshold.
+
+`maskstats <mask>` measures a blue-noise mask: the mandatory properties (flat value
+histogram, endpoints spanning 0..254) and then, per level set, low-frequency energy,
+spectral knee, anisotropy and largest void — all normalised so uncorrelated noise
+reads 1.0. It classifies the arrangement as blue/white/clustered independently of
+whether the mask is usable, which is the split that matters if the generator is ever
+aimed at a non-blue target. `--field` reports the spectrum of an ordinary image, and
+`--highpass <px>` removes structure coarser than that first — a photograph's spectrum
+is otherwise dominated by its subject rather than its grain.
 
 `dither --debug-pixel <row,col>` prints per-frame `ideal`/`display`/`displayed` for
 that pixel, which is the quickest way to see the budget converge.

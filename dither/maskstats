@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Measure a dither threshold mask.
+
+  maskstats <mask.png> [--levels g,g,…] [--bins n] [--csv out.csv] [--field]
+
+Two tiers of measurement, matching what the mask is actually asked to do.
+
+Mandatory (a mask failing these dithers wrongly, whatever it looks like):
+  uniform   the value histogram must be flat, or output density stops tracking
+            input tone. Reported as the largest CDF deviation, in % of pixels.
+  ends      values must span 0..254: 255 could never fire against `frac*255 >
+            thr`, and a missing 0 leaves the darkest step dead.
+
+Descriptive (what the arrangement looks like, per level set at density g).
+All power is normalised so uncorrelated noise reads 1.0 at every frequency:
+  low       mean power below 0.1 cycles/px — structure 10 px and coarser, where
+            the eye is most sensitive. ~0 for blue noise, 1 for white, and well
+            above 1 for anything clumped.
+  knee      lowest frequency reaching half the white-noise level, in cycles/px:
+            where the pattern's energy starts. Compare against fg, the ideal
+            principal frequency sqrt(g) — a knee far below fg means a softer
+            transition than blue noise theory wants.
+  flat      mean power above the knee. Blue noise is flat and slightly above 1.
+  aniso     angular variance of power / mean², in dB, averaged over rings above
+            the knee. A single periodogram speckles, so ~0 dB reads as
+            isotropic; sustained values above ~+3 dB mean real directionality.
+  void      largest distance from an empty pixel to the nearest lit one, over
+            the ideal spacing 1/sqrt(g). Blue noise sits near or below 1; white
+            noise runs 1.2-1.8 because it leaves holes.
+
+--field skips the level-set analysis and reports the spectrum of the image as a
+continuous field, for measuring a grain sample you want to imitate. A photograph
+is dominated by its subject rather than its grain, so --highpass P first removes
+structure coarser than about P pixels, leaving the grain riding on top of it.
+"""
+import os, sys, argparse
+import cv2
+import numpy as np
+
+ap = argparse.ArgumentParser()
+ap.add_argument('mask')
+ap.add_argument('--levels', default='0.1,0.25,0.5,0.75,0.9',
+                help='densities to analyse (default 0.1,0.25,0.5,0.75,0.9)')
+ap.add_argument('--bins', type=int, default=64, help='radial bins (default 64)')
+ap.add_argument('--csv', help='write the radial spectra here')
+ap.add_argument('--field', action='store_true',
+                help='treat the input as a continuous field, not a threshold mask')
+ap.add_argument('--highpass', type=float, metavar='PX',
+                help='remove structure coarser than PX pixels (implies --field)')
+args = ap.parse_args()
+args.field = args.field or args.highpass is not None
+
+img = cv2.imread(args.mask, cv2.IMREAD_GRAYSCALE)
+if img is None:
+    sys.exit(f"could not read {args.mask}")
+H, W = img.shape
+N = H * W
+
+
+def radial(power, bins):
+    """Radially average a centred power spectrum; returns (freq, mean, aniso_dB, count)."""
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.fftfreq(W)[None, :]
+    fr = np.sqrt(fy ** 2 + fx ** 2)
+    # Out to the corner of the frequency plane, not just 0.5: the principal
+    # frequency sqrt(g) exceeds the axis Nyquist for any g above 0.25.
+    edges = np.linspace(0, np.sqrt(0.5), bins + 1)
+    idx = np.digitize(fr.ravel(), edges) - 1
+    p = power.ravel()
+    idx[0] = -1                                   # drop DC
+    freq, mean, aniso, count = [], [], [], []
+    for b in range(bins):
+        sel = p[idx == b]
+        if sel.size < 4:
+            continue
+        m = sel.mean()
+        freq.append(0.5 * (edges[b] + edges[b + 1]))
+        mean.append(m)
+        aniso.append(10 * np.log10(sel.var() / m ** 2) if m > 0 else np.nan)
+        count.append(sel.size)
+    return map(np.asarray, (freq, mean, aniso, count))
+
+
+def highpass(field, px):
+    """Toroidal Gaussian high-pass, half power at 1/px cycles/px."""
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.fftfreq(W)[None, :]
+    sigma = 0.1874 * px                       # G(f) = exp(-2 pi^2 sigma^2 f^2) = 1/2
+    gauss = np.exp(-2 * np.pi ** 2 * sigma ** 2 * (fy ** 2 + fx ** 2))
+    return np.real(np.fft.ifft2(np.fft.fft2(field) * (1 - gauss)))
+
+
+def level_set(k):
+    """The k lowest-threshold pixels, i.e. the pattern shown at that density."""
+    order = np.argsort(img.ravel(), kind='stable')
+    on = np.zeros(N, bool)
+    on[order[:k]] = True
+    return on.reshape(H, W)
+
+
+def void_radius(on):
+    """Largest empty-to-lit distance, measured toroidally by tiling 3x3."""
+    tile = np.tile((~on).astype(np.uint8), (3, 3)) * 255
+    dist = cv2.distanceTransform(tile, cv2.DIST_L2, 5)
+    return float(dist[H:2 * H, W:2 * W].max())
+
+
+rows, csv_rows = [], []
+if args.field:
+    f = img.astype(np.float64)
+    f -= f.mean()
+    if args.highpass:
+        f = highpass(f, args.highpass)
+    power = np.abs(np.fft.fft2(f)) ** 2 / (N * max(f.var(), 1e-12))
+    freq, mean, aniso, count = radial(power, args.bins)
+    peak = freq[int(np.argmax(mean))]
+    # Energy median: robust where the spectrum has no peak to find, which is the
+    # usual case once a low-pass grain has been high-passed.
+    energy = np.cumsum(mean * count)
+    median = freq[int(np.searchsorted(energy, energy[-1] / 2))]
+    print(f"field: {W}x{H}, mean {img.mean():.1f}, sd {img.std():.1f}"
+          + (f", high-passed above {args.highpass:g} px (residual sd {f.std():.1f})"
+             if args.highpass else ""))
+    print(f"  peak at {peak:.3f} cycles/px (~{1/peak:.1f} px), "
+          f"energy median {median:.3f} (~{1/median:.1f} px), "
+          f"aniso {np.nanmean(aniso):+.1f} dB")
+    csv_rows = [(0.0, f, m, a) for f, m, a in zip(freq, mean, aniso)]
+    trailer = (f"RESULT kind=field peak={peak:.4f} median={median:.4f} "
+               f"aniso={np.nanmean(aniso):+.2f}"
+               + (f" highpass={args.highpass:g}" if args.highpass else ""))
+else:
+    # Mandatory properties.
+    counts = np.bincount(img.ravel(), minlength=256)
+    cdf = np.cumsum(counts) / N
+    uniform = 100 * np.abs(cdf - np.linspace(0, 1, 256)).max()
+    lo, hi, distinct = int(img.min()), int(img.max()), int((counts > 0).sum())
+    ends_ok = (lo == 0 and hi <= 254)
+    print(f"mask: {W}x{H} ({N} px), values {lo}..{hi}, {distinct} distinct, "
+          f"histogram deviation {uniform:.2f}%")
+    if not ends_ok:
+        print(f"  ENDS: expected min 0 and max <= 254 "
+              f"(255 can never fire against `frac*255 > thr`)")
+    if uniform > 1.0:
+        print(f"  UNIFORM: {uniform:.2f}% CDF deviation will bend tone reproduction")
+
+    print(f"\n{'g':>6} {'low':>7} {'knee':>7} {'fg':>7} {'flat':>7} "
+          f"{'aniso dB':>9} {'void/ideal':>11}")
+    for g in [float(x) for x in args.levels.split(',')]:
+        on = level_set(int(round(g * N)))
+        b = on.astype(np.float64)
+        b -= b.mean()
+        power = np.abs(np.fft.fft2(b)) ** 2 / (N * g * (1 - g))
+        freq, mean, aniso, _ = radial(power, args.bins)
+
+        fg = np.sqrt(g if g <= 0.5 else 1 - g)
+        crossed = np.flatnonzero(mean >= 0.5)
+        knee = freq[crossed[0]] if crossed.size else np.nan
+        above = freq >= knee if crossed.size else np.zeros_like(freq, bool)
+        low = mean[freq < 0.1].mean() if (freq < 0.1).any() else np.nan
+        flat = mean[above].mean() if above.any() else np.nan
+        an = np.nanmean(aniso[above]) if above.any() else np.nan
+        void = void_radius(on) * np.sqrt(g)
+
+        rows.append((g, low, knee, fg, flat, an, void))
+        csv_rows += [(g, f, m, a) for f, m, a in zip(freq, mean, aniso)]
+        print(f"{g:6.2f} {low:7.3f} {knee:7.3f} {fg:7.3f} {flat:7.2f} "
+              f"{an:+9.1f} {void:11.2f}")
+
+    low = float(np.nanmean([r[1] for r in rows]))
+    kn = float(np.nanmean([r[2] for r in rows]))
+    kind = 'blue' if low < 0.25 else 'white' if low < 1.5 else 'clustered'
+    ok = ends_ok and uniform <= 1.0
+    print(f"\n{'usable as a threshold mask' if ok else 'NOT a usable threshold mask'}"
+          f"; arrangement reads as {kind} noise")
+    trailer = (f"RESULT kind={kind} usable={'yes' if ok else 'no'} "
+               f"uniform={uniform:.3f} low={low:.3f} knee={kn:.3f}")
+
+if args.csv:
+    with open(args.csv, 'w') as fh:
+        fh.write('g,freq,power,aniso_db\n')
+        for g, f, m, a in csv_rows:
+            fh.write(f"{g},{f:.6f},{m:.6f},{a:.3f}\n")
+
+print(trailer)

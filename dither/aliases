@@ -33,7 +33,7 @@ deploy() #         Copy the git-tracked files to the public repo
 
 md() #             Read a markdown file
 { 
-    pandoc -s -f gfm -t man $* | man -l -
+    pandoc -s -t man $* | man -l -
 }
 
 icat() #           Display an image in the terminal
@@ -188,7 +188,6 @@ examples()
     rm ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png
 
     rm ex.png
-    mv examples*.png images/
 }
 
 examples0()

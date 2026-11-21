@@ -7,24 +7,29 @@
 
 namespace vision {
 
-cv::Mat to_gray8(const cv::Mat& img) {
+cv::Mat to_gray(const cv::Mat& img) {
 	cv::Mat g;
 	if      (img.channels() == 3) cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
 	else if (img.channels() == 4) cv::cvtColor(img, g, cv::COLOR_BGRA2GRAY);
 	else                          g = img;
-	if (g.depth() != CV_8U) {
-		double mn, mx; cv::minMaxLoc(g, &mn, &mx);
-		double s = (mx > mn) ? 255.0 / (mx - mn) : 1.0;
-		g.convertTo(g, CV_8U, s, -mn * s);
-	}
+	if (g.depth() != CV_8U && g.depth() != CV_16U)
+		g.convertTo(g, CV_16U, g.depth() == CV_32F || g.depth() == CV_64F ? 65535.0 : 1.0);
 	return g;
 }
 
 cv::Mat decode_gray(const cv::Mat& img, bool srgb) {
-	cv::Mat gray = to_gray8(img);
+	cv::Mat gray = to_gray(img);
 	cv::Mat out(gray.size(), CV_32F);
-	gray.forEach<uint8_t>([&](uint8_t pixel, const int* pos) {
-		out.at<float>(pos[0], pos[1]) = decode_pixel(pixel, srgb);
+	if (gray.depth() == CV_8U) {
+		gray.forEach<uint8_t>([&](uint8_t pixel, const int* pos) {
+			out.at<float>(pos[0], pos[1]) = decode_pixel(pixel, srgb);
+		});
+		return out;
+	}
+	std::vector<float> lut(65536);
+	for (int i = 0; i < 65536; i++) lut[i] = srgb ? srgb_to_linear_unit(i / 65535.0f) : i / 65535.0f;
+	gray.forEach<uint16_t>([&](uint16_t code, const int* pos) {
+		out.at<float>(pos[0], pos[1]) = lut[code];
 	});
 	return out;
 }
@@ -110,7 +115,7 @@ cv::Mat linear_to_srgb(const cv::Mat& linear) {
 			auto& dest = srgb.at<cv::Vec<unsigned char, 3>>(r, c);
 			auto& source = linear.at<cv::Vec<float, 3>>(r, c);
 			for (int channel = 0; channel < 3; ++channel) {
-				dest[channel] = cv::saturate_cast<unsigned char>(linear_to_srgb(source[channel]) + 0.5f);
+				dest[channel] = cv::saturate_cast<unsigned char>(linear_to_srgb(source[channel]));
 			}
 		}
 	}

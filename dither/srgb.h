@@ -12,17 +12,12 @@
 
 namespace vision {
 
-// Converts an sRGB value in the range [0, 255] to a linear value in
-// the range [0, 1].
-inline float srgb_to_linear(float srgb) {
-	auto linear = srgb / 255.0f;
-	if (linear <= 0.04045f) {
-		linear = linear / 12.92f;
-	} else {
-		linear = std::pow((linear + 0.055f) / 1.055f, 2.4f);
-	}
-	return linear;
+// Converts an sRGB value in the range [0, 1] (or [0, 255], for srgb_to_linear)
+// to a linear value in the range [0, 1].
+inline float srgb_to_linear_unit(float code) {
+	return code <= 0.04045f ? code / 12.92f : std::pow((code + 0.055f) / 1.055f, 2.4f);
 }
+inline float srgb_to_linear(float srgb) { return srgb_to_linear_unit(srgb / 255.0f); }
 
 // Converts a linear value in the range [0, 1] to an sRGB value in
 // the range [0, 255].
@@ -80,11 +75,11 @@ LevelSet make_levels(int levels, bool srgb, bool srgb_spaced);
 // what makes dithering between two levels average back to `linear`.
 float to_display(const LevelSet& levels, float linear);
 
-// Coerce any image (color/gray, any depth) to CV_8U single-channel.
-// Non-CV_8U depths are min-max normalized to fit the 8-bit range.
-cv::Mat to_gray8(const cv::Mat& img);
+// Coerce any image to single-channel CV_8U or CV_16U, keeping its depth.
+// Floating-point input is taken as [0,1]: scaled by a constant, never by content.
+cv::Mat to_gray(const cv::Mat& img);
 
-// Decode any image to CV_32F linear grayscale in [0,1].
+// Decode any image to CV_32F linear grayscale in [0,1], at its own bit depth.
 cv::Mat decode_gray(const cv::Mat& img, bool srgb);
 
 // Decode any image straight to CV_32F display units on the given ladder.

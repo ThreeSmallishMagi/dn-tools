@@ -4,23 +4,28 @@
 #include <math.h>
 #include <algorithm>
 
-#define bitmax(depth) ((1u<<depth)-1u)
+// 64-bit, since `value * targetmax` overflows 32 bits inside the depths accepted.
+#define bitmax(depth) ((1ull << (depth)) - 1ull)
 
 // Dithering strategies
 typedef enum { DITHER_ROUND=0, DITHER_FLOOR =1, DITHER_RANDOM=2 } dither_strategy;
 
-unsigned dither_round(float accumulator) {
-    return (unsigned)(accumulator + 0.5f);
+// Double, since a float cannot hold a 31-bit level exactly. Signed, since the
+// accumulator goes below zero; dither() clamps to the display's levels.
+typedef unsigned long long level;
+
+long long dither_round(double accumulator) {
+    return (long long)floor(accumulator + 0.5);
 }
 
-unsigned dither_floor(float accumulator) {
-    return (unsigned)accumulator;
+long long dither_floor(double accumulator) {
+    return (long long)floor(accumulator);
 }
 
-unsigned dither_random(float accumulator) {
-    float fractional = accumulator - (int)accumulator;
-    float random_threshold = (float)rand() / RAND_MAX;
-    return (unsigned)accumulator + (fractional > random_threshold ? 1 : 0);
+long long dither_random(double accumulator) {
+    const double whole = floor(accumulator);
+    const double random_threshold = (double)rand() / RAND_MAX;
+    return (long long)whole + (accumulator - whole > random_threshold ? 1 : 0);
 }
 
  /*  e.g. 3bit image to 2bit display
@@ -29,42 +34,43 @@ unsigned dither_random(float accumulator) {
   *     therefore desired display brightness is  value * targetmax / sourcemax  e.g. d=2*3/7
   *     this is tracked in desired_brightness
   */
-void dither(unsigned value, unsigned sourcedepth, unsigned targetdepth, unsigned frames,
-                        unsigned (*dither_fn)(float) = dither_round)
+void dither(level value, unsigned sourcedepth, unsigned targetdepth, unsigned frames,
+                        long long (*dither_fn)(double) = dither_round)
 {
-    const unsigned sourcemax = bitmax(sourcedepth);
-    const unsigned targetmax = bitmax(targetdepth);
-    const float desired_brightness = (float)(value * targetmax) / sourcemax;
+    const level sourcemax = bitmax(sourcedepth);
+    const level targetmax = bitmax(targetdepth);
+    const double desired_brightness = (double)value * targetmax / sourcemax;
+    const auto shown = [&](double v) { return (level)std::clamp(dither_fn(v), 0LL, (long long)targetmax); };
 
-    float accumulator = 0.0f;
-    unsigned total_displayed_acc = 0;
-    unsigned total_displayed_ave = 0;
+    double accumulator = 0.0;
+    level total_displayed_acc = 0;
+    level total_displayed_ave = 0;
 
-    printf("value:%d/%d ideal target:%.2f\n", value, sourcemax, desired_brightness);
+    printf("value:%llu/%llu ideal target:%.2f\n", value, sourcemax, desired_brightness);
     printf("%-5s %-7s %-13s %-13s | %-10s %-13s %-13s %-13s\n", "frame", "display", "accumulator", "overall error",
         "display_ave", "da_average", "error ave", "total error");
 
     for (unsigned frame = 1; frame <= frames; frame++) {
         // accumulator method
         accumulator += desired_brightness;
-        unsigned display_acc = dither_fn(accumulator); // Use dithering strategy
+        level display_acc = shown(accumulator);   // Use dithering strategy
         accumulator -= display_acc;               // Keep fractional error
         // ---
         total_displayed_acc += display_acc;           // unused for calculation
-        float display_average_acc = (float)total_displayed_acc / frame;
-        float overall_error_acc = desired_brightness - display_average_acc;
+        double display_average_acc = (double)total_displayed_acc / frame;
+        double overall_error_acc = desired_brightness - display_average_acc;
 
         // average display method
-        unsigned display_ave  = dither_fn(desired_brightness);
-        if (  (display_ave + total_displayed_ave) < desired_brightness*frame - 0.5f)
+        level display_ave = shown(desired_brightness);
+        if (display_ave < targetmax && (display_ave + total_displayed_ave) < desired_brightness*frame - 0.5)
             display_ave++;
-        else if (display_ave > 0 && (display_ave + total_displayed_ave) > desired_brightness*frame + 0.5f)
+        else if (display_ave > 0 && (display_ave + total_displayed_ave) > desired_brightness*frame + 0.5)
             display_ave--;
         total_displayed_ave += display_ave;
-        float display_average_ave = (float)total_displayed_ave/frame;
-        float overall_error_ave=  (desired_brightness - display_average_ave)/frame;
+        double display_average_ave = (double)total_displayed_ave/frame;
+        double overall_error_ave=  (desired_brightness - display_average_ave)/frame;
 
-        printf("%-5d %-7d %-13.2f %-13.4f | %-10d %-13.2f %-13.3f %-13.2f\n", 
+        printf("%-5u %-7llu %-13.2f %-13.4f | %-10llu %-13.2f %-13.3f %-13.2f\n", 
                frame, display_acc, accumulator, overall_error_acc,
             display_ave, display_average_ave, overall_error_ave, overall_error_ave*frame*sourcemax);
     }
@@ -78,7 +84,7 @@ int main(int argc, char *argv[])
     }
     int source = atoi(argv[1]);
     int target = atoi(argv[2]);
-    int value = atoi(argv[3]);
+    level value = strtoull(argv[3], nullptr, 10);
     dither_strategy strategy = (dither_strategy)atoi(argv[4]);
     if( argc ==6)
         srand(atoi(argv[5]));

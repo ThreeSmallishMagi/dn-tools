@@ -17,10 +17,9 @@
 std::mt19937 rng;
 
 // ===========================================================================
-// All work happens in "display units": linear-light brightness on a scale of
-// [0, levels-1]. The dither functions pick an integer level given a float
-// accumulator value; the residual is what's left after that choice and is
-// carried forward (across pixels via --spatial, across frames via the budget).
+// The dither functions pick a level from a value in "display units", [0, levels-1]
+// on the ladder. The residual is carried forward (across pixels by diffusion,
+// across frames by the budget) in linear light; see Space.
 // ===========================================================================
 
 // `dir` is +1 for left-to-right scans, -1 for right-to-left (serpentine).
@@ -32,20 +31,20 @@ using SpatialFn = void (*)(int row, int col, int dir, cv::Mat& spatial_err, floa
 class DitherFn {
 public:
     virtual ~DitherFn() = default;
-    virtual int operator()(float v, int row, int col) = 0;
+    virtual int operator()(double v, int row, int col) = 0;
     virtual void new_frame() {}
 };
 
 class RoundDither : public DitherFn {
 public:
-    int operator()(float v, int /*row*/, int /*col*/) override {
+    int operator()(double v, int /*row*/, int /*col*/) override {
         return (int)std::lround(v);
     }
 };
 
 class RandomDither : public DitherFn {
 public:
-    int operator()(float v, int /*row*/, int /*col*/) override {
+    int operator()(double v, int /*row*/, int /*col*/) override {
         int lo = (int)std::floor(v);
         float frac = v - lo;
         return lo + (frac > dist(rng) ? 1 : 0);
@@ -55,15 +54,16 @@ private:
 };
 
 // Blue-noise dither: threshold frac(v) against a precomputed mask value with
-// per-frame toroidal (sx, sy) offsets drawn in new_frame().
+// per-frame toroidal (sx, sy) offsets drawn in new_frame(). A cell holding t is
+// the rank at quantile t/254, so frac*254 > t fires with probability frac.
 class BlueDither : public DitherFn {
 public:
     explicit BlueDither(cv::Mat m) : mask(std::move(m)) {}
-    int operator()(float v, int row, int col) override {
-        int lo = (int)v;
+    int operator()(double v, int row, int col) override {
+        int lo = (int)std::floor(v);
         float frac = v - lo;
         uint8_t thr = mask.at<uint8_t>((row + sy) % mask.rows, (col + sx) % mask.cols);
-        return frac * 255.0f > thr ? lo + 1 : lo;
+        return frac * 254.0f > thr ? lo + 1 : lo;
     }
     void new_frame() override {
         sx = std::uniform_int_distribution<int>(0, mask.cols - 1)(rng);
@@ -79,21 +79,21 @@ static void spatial_none(int /*row*/, int /*col*/, int /*dir*/,
 
 // Floyd-Steinberg diffusion, serpentine-aware. On the current row the "next"
 // pixel we haven't visited yet is (row, col+dir); the "previous" is col-dir.
+// Weights are renormalised over the columns inside the image, so no error is
+// lost at a row end.
 static void spatial_floydsteinberg(int row, int col, int dir,
                                    cv::Mat& spatial_err, float value)
 {
-    const int W = spatial_err.cols;
-    const int next_col = col + dir;
-    const int prev_col = col - dir;
-    if (0 <= next_col && next_col < W)
-        spatial_err.at<float>(row, next_col) += value * 7.0f / 16;
-    if (row + 1 < spatial_err.rows) {
-        if (0 <= prev_col && prev_col < W)
-            spatial_err.at<float>(row + 1, prev_col) += value * 3.0f / 16;
-        spatial_err.at<float>(row + 1, col) += value * 5.0f / 16;
-        if (0 <= next_col && next_col < W)
-            spatial_err.at<float>(row + 1, next_col) += value * 1.0f / 16;
-    }
+    const int W = spatial_err.cols, H = spatial_err.rows;
+    struct Tap { int r, c; float w; };
+    const Tap taps[4] = {{row, col + dir, 7.0f / 16}, {row + 1, col - dir, 3.0f / 16},
+                         {row + 1, col, 5.0f / 16},   {row + 1, col + dir, 1.0f / 16}};
+    float total = 0;
+    for (const Tap& t : taps)
+        if (0 <= t.c && t.c < W) total += t.w;
+    for (const Tap& t : taps)
+        if (t.r < H && 0 <= t.c && t.c < W)
+            spatial_err.at<float>(t.r, t.c) += value * t.w / total;
 }
 
 // Serpentine iteration over a `size` grid: even rows go left→right, odd rows
@@ -109,21 +109,51 @@ static void for_serpentine(cv::Size size, Body&& body)
     }
 }
 
+// What the ledgers conserve: linear light, since srgb-spaced rungs are uneven in
+// light and conserving display units raises the mean. Identity on a uniform ladder.
+struct Space {
+    const vision::LevelSet* ladder = nullptr;
+    explicit Space(const vision::LevelSet* l = nullptr) : ladder(l && !l->uniform ? l : nullptr) {}
+
+    double to_conserved(double display) const {
+        if (!ladder) return display;
+        const auto& L = ladder->lin;
+        const int k = std::clamp((int)std::floor(display), 0, (int)L.size() - 2);
+        return L[k] + (display - k) * (L[k + 1] - (double)L[k]);
+    }
+    // Snaps to a rung within 1e-5, so a budget paid down to whole rungs reads back whole.
+    double to_display(double conserved) const {
+        if (!ladder) return conserved;
+        const auto& L = ladder->lin;
+        const int top = (int)L.size() - 1;
+        const int k = conserved < L.front() ? 0 : conserved >= L.back() ? top - 1
+                    : (int)(std::upper_bound(L.begin(), L.end(), conserved) - L.begin()) - 1;
+        const double span = L[k + 1] - (double)L[k];
+        double t = span > 0 ? (conserved - L[k]) / span : 0.0;
+        if (std::abs(t) < 1e-5) t = 0; else if (std::abs(t - 1) < 1e-5) t = 1;
+        return k + t;
+    }
+    double of_level(int level) const { return ladder ? ladder->lin[level] : level; }
+};
+
 // One serpentine quantizing scan over a `size` grid, with its own private
-// spatial-error channel. Per pixel: `v = value_fn(row, col) + spatial_err`, which
-// dither_fn quantizes to a level in [0, max_level]; `spatial` of the residual is
-// handed to spatial_fn and the rest withheld. `sink(row, col, level, v)` records
-// the result. Used for both the goal pass and each output frame.
+// spatial-error channel, in `space`. dither_fn quantizes `target + spatial * err`
+// to a level in [0, max_level] and the whole residual against `target + err` is
+// diffused, so the ledger stays exact at any --spatial. `sink(row, col, level,
+// display)` records the result. Used for the goal pass and each output frame.
 template <typename ValueFn, typename Sink>
 static void quantize_scan(cv::Size size, DitherFn& dither_fn, SpatialFn spatial_fn,
-                          float spatial, int max_level, ValueFn value_fn, Sink sink)
+                          float spatial, int max_level, const Space& space,
+                          ValueFn value_fn, Sink sink)
 {
     cv::Mat spatial_err = cv::Mat::zeros(size, CV_32F);
     for_serpentine(size, [&](int row, int col, int dir) {
-        float v = value_fn(row, col) + spatial_err.at<float>(row, col);
-        int level = std::clamp(dither_fn(v, row, col), 0, max_level);
-        spatial_fn(row, col, dir, spatial_err, spatial * (v - (float)level));
-        sink(row, col, level, v);
+        const double target = value_fn(row, col);
+        const float err = spatial_err.at<float>(row, col);
+        const double shown = space.to_display(target + spatial * err);
+        const int level = std::clamp(dither_fn(shown, row, col), 0, max_level);
+        spatial_fn(row, col, dir, spatial_err, (float)(target + err - space.of_level(level)));
+        sink(row, col, level, shown);
     });
 }
 
@@ -131,47 +161,46 @@ static void quantize_scan(cv::Size size, DitherFn& dither_fn, SpatialFn spatial_
 // the caller applies vision::encode_levels() to encode to pixel values.
 //
 // Each pixel is given a per-frame-total budget `goal = target * frames`. For
-// multi-frame runs the goal is dithered to an integer in [0, frames*(levels-1)]
-// so the running sum of displays converges exactly to it; for single-frame
-// runs the raw float target*1 is used, and the ideal formula
+// multi-frame runs the goal is dithered in display units to an integer in
+// [0, frames*(levels-1)], then converted to linear light, so the running total
+// converges exactly to it. Every frame aims at
 //
 //     ideal = (goal - displayed) / (frames - f) + spatial_err
 //
-// reduces to the classical `ideal = target + spatial_err`. `--spatial` is the
-// fraction of quantization residual passed to spatial neighbours via
-// `spatial_fn` (default 1 = full FS diffusion, 0 = none). The goal pass always
-// diffuses in full; only the per-frame passes are scaled.
-static std::vector<cv::Mat> ditherPass(const cv::Mat& target,
+// which for a single frame is the classical `ideal = target + spatial_err`.
+// The goal pass always diffuses in full; only the per-frame passes are scaled.
+// goals and displayed are double: a float error in a sum of `frames` rungs
+// exceeds the smallest rung step at high frame counts.
+static std::vector<cv::Mat> ditherPass(const cv::Mat& target, const vision::LevelSet& ladder,
                           DitherFn& dither_fn, SpatialFn spatial_fn,
                           float spatial, int levels,
                           int frames, int debug_row, int debug_col)
 {
-    // Per-pixel budget across all frames. Multi-frame dithers it to an integer
-    // via the chosen threshold; single-frame leaves target*1 as a float so the
-    // main loop's formula collapses to `ideal = target + sp`.
+    const Space space(&ladder);
     cv::Mat goals;
-    target.convertTo(goals, CV_32F, frames);
+    target.convertTo(goals, CV_64F, frames);
     if (frames > 1)
-        quantize_scan(goals.size(), dither_fn, spatial_fn, 1.0f, frames * (levels - 1),
-                      [&](int row, int col) { return goals.at<float>(row, col); },
+        quantize_scan(goals.size(), dither_fn, spatial_fn, spatial, frames * (levels - 1), Space(),
+                      [&](int row, int col) { return goals.at<double>(row, col); },
                       [&](int row, int col, int goal, float) {
-                          goals.at<float>(row, col) = (float)goal;
+                          goals.at<double>(row, col) = goal;
                       });
+    goals.forEach<double>([&](double& g, const int*) { g = frames * space.to_conserved(g / frames); });
 
-    cv::Mat displayed = cv::Mat::zeros(target.size(), CV_32F);
+    cv::Mat displayed = cv::Mat::zeros(target.size(), CV_64F);
     std::vector<cv::Mat> outputs;
     outputs.reserve(frames);
     for (int f = 0; f < frames; f++) {
         dither_fn.new_frame();
         cv::Mat output(target.size(), CV_8U);
-        quantize_scan(target.size(), dither_fn, spatial_fn, spatial, levels - 1,
+        quantize_scan(target.size(), dither_fn, spatial_fn, spatial, levels - 1, space,
             [&](int row, int col) {
-                return (goals.at<float>(row, col) - displayed.at<float>(row, col))
-                       / (float)(frames - f);
+                return (goals.at<double>(row, col) - displayed.at<double>(row, col))
+                       / (frames - f);
             },
             [&](int row, int col, int display, float ideal) {
-                float d = displayed.at<float>(row, col) + (float)display;
-                displayed.at<float>(row, col) = d;
+                double d = displayed.at<double>(row, col) + space.of_level(display);
+                displayed.at<double>(row, col) = d;
                 output.at<uint8_t>(row, col) = (uint8_t)display;
                 if (row == debug_row && col == debug_col)
                     fprintf(stderr, "  frame=%d ideal=%+.4f display=%d displayed=%+.4f\n",
@@ -190,7 +219,7 @@ struct Options {
     int levels = 2;
     int frames = 1;
     bool saveFrames = false;
-    double spatial = 1.0;   // fraction of residual diffused spatially (1 = full FS, 0 = none);
+    double spatial = 1.0;   // share of diffused error the threshold sees (1 = full FS, 0 = none);
                             // resolved in parseOptions, which defaults it to 0 when
                             // --threshold names a threshold explicitly
     uint64_t seed = 42;
@@ -317,9 +346,9 @@ Thresholds (--threshold):
 
 Options:
   --threshold <name>  threshold rule to use (default: round)
-  --spatial <frac>    fraction of each pixel's residual diffused to its
-                      neighbours by Floyd-Steinberg (1 = full FS, 0 = none).
-                      Defaults to 1, or to 0 when --threshold is given
+  --spatial <frac>    how much Floyd-Steinberg error each pixel's threshold
+                      sees (1 = full FS, 0 = none); the error is always passed
+                      on in full. Defaults to 1, or 0 when --threshold is given
   --out <path>        output file path (default: dither.png)
   --linear            treat pixel values as raw linear light (skip the sRGB
                       ↔ linear conversion that normally wraps the dither)
@@ -364,7 +393,7 @@ int main(int argc, char** argv)
     // With --spatial 0 the residual would be scaled to zero anyway; skip the
     // deposit entirely so no-diffusion runs don't pay for it.
     SpatialFn spatial_fn = (opt.spatial > 0.0) ? spatial_floydsteinberg : spatial_none;
-    cv::Mat image = cv::imread(opt.inPath, cv::IMREAD_GRAYSCALE);
+    cv::Mat image = cv::imread(opt.inPath, cv::IMREAD_GRAYSCALE | cv::IMREAD_ANYDEPTH);
     if (image.empty()) { fprintf(stderr, "Could not read %s\n", opt.inPath.c_str()); return -1; }
     if      (opt.threshold == "round")  { dither_fn = std::make_unique<RoundDither>(); }
     else if (opt.threshold == "random") { dither_fn = std::make_unique<RandomDither>(); }
@@ -412,7 +441,7 @@ int main(int argc, char** argv)
                 opt.frames, opt.spatial);
     }
 
-    std::vector<cv::Mat> frames = ditherPass(target, *dither_fn, spatial_fn,
+    std::vector<cv::Mat> frames = ditherPass(target, ladder, *dither_fn, spatial_fn,
                                              opt.spatial, opt.levels, opt.frames,
                                              opt.debug_row, opt.debug_col);
     for (cv::Mat& f : frames)

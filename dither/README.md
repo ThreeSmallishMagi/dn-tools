@@ -4,8 +4,10 @@ Start by running "source aliases"
 
 A command-line image dithering tool. All quantization happens in linear light, with the
 sRGB curve applied only at the encode and decode boundaries, so the dot density
-of the output averages back to the tone of the input. Supports multi-level
-output, blue-noise masks, and averaging over several dithered frames.
+of the output averages back to the tone of the input. Supports 8- and 16-bit
+input, multi-level output, blue-noise masks, and averaging over several
+dithered frames. Output is 8-bit; a 16-bit input carries the tones between
+8-bit codes that diffusion and `--frames` exist to render.
 
 ## Synopsis
 
@@ -62,10 +64,11 @@ you picked deliberately is usually one you want to see on its own. Pass
     `round`.
 
 `--spatial <frac>`
-:   Fraction of each pixel's quantization residual diffused to its neighbours.
-    `1` is full Floyd-Steinberg, `0` none, in between damps the diffusion and
-    softens FS worming. Defaults to `1`, or to `0` when `--threshold` is given;
-    an explicit value always wins.
+:   How much of the error diffused from its neighbours each pixel's threshold
+    sees. `1` is full Floyd-Steinberg, `0` none, in between damps the diffusion
+    and softens FS worming. The error itself is always passed on in full, so the
+    tone is right at any value. Defaults to `1`, or to `0` when `--threshold` is
+    given; an explicit value always wins.
 
 `--out <path>`
 :   Output file path. Default `dither.png`.
@@ -83,9 +86,8 @@ you picked deliberately is usually one you want to see on its own. Pass
 
 `--frames <n>`
 :   Dither *n* independent frames and average them; for `blue`, each frame uses
-    a random shift of the same mask. Error withheld by `--spatial` is not lost
-    across frames — it stays in the pixel's budget and is paid back later, so
-    the average still converges on the target tone.
+    a random shift of the same mask. A shortfall in one frame is paid back by a
+    later one, so the average converges on the target tone.
 
 `--save-frames`
 :   Also write each frame beside the average, as `<stem>-N.png`.
@@ -208,6 +210,14 @@ Without it `coltest` reports `COLSTATS PARSE FAIL` on every row, which means
 `./budgettest`
 :   Verifies the multi-frame invariant — with `--spatial 0`, the levels
     displayed for a pixel sum exactly to its budget.
+
+`./maskstats <mask>`
+:   Measures a threshold mask: histogram flatness and endpoints (the properties
+    a mask must have to dither correctly), then per level set the low-frequency
+    energy, spectral knee, anisotropy, and largest void. `--field` reports the
+    spectrum of an ordinary image instead, for measuring a grain sample to aim
+    at; `--highpass <px>` first strips structure coarser than that, so the grain
+    is measured rather than the subject.
 
 `gnuplot colplot`
 :   Plots `colstats --csv` output as sixels.
