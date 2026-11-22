@@ -1,3 +1,10 @@
+DN-Tools v21Nov2026 21 Nov 2026 
+
+Accuracy fixes. The next version adds masks that simulate film grain
+and is considerably larger. This change includes only a few small accuracy
+fixes that were found during development. The film grain version is coming
+soon.
+
 DN-Tools v1.1   12 Aug 2026    (v1.0: 26 Feb 2026)
 
 acv
