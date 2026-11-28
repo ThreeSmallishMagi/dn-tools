@@ -1,0 +1,67 @@
+Triage of code_improvement_suggestions.txt. One line per suggestion, keyed by the
+line its heading sits on in that file. Status is Accepted / Rejected / Ask / Done.
+
+Line 37:Done: Cache inpaint.rate when measuring build speed. Fixed already; the saved list is now derived from the registry rather than typed out.
+Line 46:Done: Add a small shared mask utility module (rank, threshold conversion, wrap, sample high-pass/scale).
+Line 77:Done: Centralize generator work/rate calculation behind one mask_work().
+Line 86:Done: Helper for constant parameter rules, so derived rules stand out.
+Line 104:Done: makeSparseGaussian clearer names and a reserve.
+Line 119:Done: Extract fill_jitter and the stale-heap pop from build_blue_noise_mask.
+Line 136:Done: Progress output caller-owned, matching how inpaint already takes a log stream.
+Line 144:Done: One naming style for keys inside register_blue_params.
+Line 156:Rejected: std::visit for format(). Three alternatives and a four-line get_if chain; a visitor needs an overload helper, which is more machinery than it removes.
+Line 164:Done: Factor the numeric extraction shared by check_range, num and integer.
+Line 173:Done: Simplify set() with a direct slot lookup.
+Line 184:Done: RAII guard for the resolve stack and the applicability probe.
+Line 193:Done: Split reconcile() into named steps.
+Line 208:Done: Lift trim out of the load_config loop.
+Line 216:Rejected: Split explain() rendering from collection. It is straight-line printing; helpers used once each would add indirection, not clarity.
+Line 229:Done: Include inpaint.rate in saved cache keys. Same as line 37.
+Line 239:Done: Replace the mask_seconds ternary with the shared mask_work().
+Line 247:Done: Extract parse_budget, parse_set, report_reconciliation, report_conflicts and the Options fill from parseOptions. Keeping the option if-chain, as the suggestion allows.
+Line 268:Rejected: Group Options into nested structs. Options is documented as a flat read-only cache of Params and is read from a dozen places; nesting churns every use site to buy nothing.
+Line 277:Rejected: Extract helpers from ditherPass(). The budget arithmetic is subtle and the comments explaining it are attached to the flow; splitting may scatter the explanation rather than clarify it.
+Line 290:Done: Share the ladder-interval lookup between Space::to_conserved and to_display.
+Line 298:Done: Extract generator dispatch from obtain_mask().
+Line 313:Done: Extract the markov calibration block out of run().
+Line 321:Rejected: Avoid reading the markov sample twice on calibrated runs. Real waste, but moving calibration inside obtain_mask changes when it runs relative to --explain and to the run summary.
+Line 330:Done: Name the run() setup steps, in as far as lines 298 and 313 do not already cover it.
+Line 344:Done: --help still says "blue, dft or markov" for --mask-method. A real documentation bug.
+Line 352:Done: config_path() via std::filesystem::path joins.
+Line 359:Done: write_image() should print the OpenCV message after the friendly one.
+Line 371:Done: inpaint to use the shared rank/high-pass helpers.
+Line 379:Rejected: Block averaging via cv::resize INTER_AREA. Verified as the triage said to: it is not bit-identical to the block mean, and because the field is re-ranked every sweep any perturbation reorders it — 99.6% of the mask changed, worst case by 254 levels. Correct either way, but not a no-op, so not a cleanup.
+Line 387:Done: Split build_inpaint_mask() into phases.
+Line 403:Done: A PatchDatabase holding the PCA basis, projected rows, index and centres.
+Line 411:Done: Report which level failed and why, rather than returning empty and having the caller guess.
+Line 420:Done: Constant-rule helper in register_inpaint_params. Part of line 86.
+Line 431:Done: markov to use the shared rank/high-pass/wrap helpers.
+Line 439:Rejected: Use to_logp() inside fit_markov_model(). Only if the two are arithmetically identical; if they are not this changes every mask.
+Line 447:Rejected: One accumulate_expert_logits helper for the three sites. They want different things from the accumulator (sample, score, fit), so a shared one may end up with flags.
+Line 456:Done: Return a PairSelection struct instead of an out pointer.
+Line 467:Done: Break down pick_pairs().
+Line 480:Done: Split report_fit() into its three sections; fix the over-indented centres declaration.
+Line 494:Done: Make sample_markov_mask() take the model by const reference with local weights. This is also what blocks calibration from running its probes in parallel.
+Line 503:Done: Route the per-probe line through a caller-supplied log, so calibration stops repeating it.
+Line 511:Done: unique_ptr rather than shared_ptr from fit_markov_model(); nothing shares it.
+Line 519:Done: Compute both marginals in one pass in mutual_information().
+Line 527:Done: reference_mask() to use the shared threshold conversion.
+Line 534:Done: Constant-rule helper in the markov registration block. Part of line 86.
+Line 545:Done: spectralmask to use the shared helpers.
+Line 554:Done: Extract the bilinear amplitude lookup from amplitude_grid().
+Line 563:Done: Extract impose_amplitude() so the alternating projection reads as two projections.
+Line 577:Done: spectralmask to use the shared threshold conversion.
+Line 583:Rejected: A shared blur_toroidal(). smooth_power blurs a spectrum with a reflected border and markov's high-pass blurs a field toroidally; they may not be the same operation under the same name.
+Line 594:Done: Grayscale decode/encode helpers in srgb.cpp.
+Line 603:Done: A 256-entry LUT for the 8-bit decode, and pointer loops instead of forEach plus at().
+Line 611:Done: downsample_gray and average_gray to read as decode, combine in linear, encode.
+Line 624:Done: Assert the channel count in the 3-channel converters, or say so in the name.
+Line 631:Done: Reserve in make_levels().
+Line 642:Rejected: Is srgbtest a test or a diagnostic? It asserts nothing today. Which it should be is your call, and it decides whether it gains checks or a rename.
+Line 650:Done: Drop the unused argc/argv.
+Line 657:Done: Extract the three print sections in srgbtest.
+Line 670:Done: Qualify cv:: in srgbtest, as the rest of the project does.
+Line 681:Rejected: Modernize temporaldither (C headers, macro, atoi, rand). Worth doing if the demo is meant to stay; churn if it is a relic.
+Line 692:Rejected: Split temporaldither's two demonstrations. Same question as line 681.
+Line 700:Done: A default case for the strategy switch. Invalid input currently prints a header and exits successfully.
+Line 707:Done: Name the repeated frame count in temporaldither.

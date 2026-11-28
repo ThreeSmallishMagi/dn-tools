@@ -1,0 +1,79 @@
+# bash completion for dither and maketexture
+#
+# Install by sourcing it, or by dropping it in a completion directory:
+#
+#   source completion/dither                     # this shell
+#   install_completion                           # from `source aliases`
+#
+# Nothing here restates what the program accepts. Options come from
+# --list-options and films from --list-samples, so the completion cannot offer
+# a flag the parser rejects — which is worse than no completion, because it
+# reads as a promise. Scraping --help could not do this: the generator ceilings
+# are documented as a --<gen>-max-size grid, so their concrete flags appear
+# nowhere in the prose.
+
+_dither_options() {
+    "$1" --list-options 2>/dev/null
+}
+
+_dither_samples() {
+    "$1" --list-samples 2>/dev/null
+}
+
+# Candidates arrive one per line and stay one per line: a film name or a path
+# may contain spaces, which word splitting would break into separate entries.
+# Callers must therefore pass newline-separated lists, not space-separated ones.
+_dither_words() {
+    local IFS=$'\n'
+    COMPREPLY=( $(compgen -W "$1" -- "$2") )
+}
+
+_dither_files() {
+    local IFS=$'\n'
+    COMPREPLY=( $(compgen -f -- "$1") )
+}
+
+_dither() {
+    local cur prev cmd
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cmd="${COMP_WORDS[0]}"
+
+    case "$prev" in
+        --mask-sample)
+            # Films in the library by name, and paths too: a sample may live
+            # anywhere, and the library is a convenience rather than the only
+            # way in. Directories get a trailing slash so a film directory can
+            # be descended into for one scan of it.
+            _dither_words "$(_dither_samples "$cmd")" "$cur"
+            compopt -o plusdirs 2>/dev/null
+            local IFS=$'\n'
+            COMPREPLY+=( $(compgen -f -- "$cur") )
+            return 0 ;;
+        --mask-method)
+            # maketexture rejects blue and direct, so it must not be offered them.
+            if [[ "${cmd##*/}" == maketexture ]]; then
+                _dither_words "$(printf '%s\n' dft markov inpaint)" "$cur"
+            else
+                _dither_words "$(printf '%s\n' blue dft markov inpaint direct)" "$cur"
+            fi
+            return 0 ;;
+        --threshold)
+            _dither_words "$(printf '%s\n' round random mask blue)" "$cur"; return 0 ;;
+        --level-spacing)
+            _dither_words "$(printf '%s\n' srgb linear device)" "$cur"; return 0 ;;
+        --markov-weights)
+            _dither_words "$(printf '%s\n' flat mi ml)" "$cur"; return 0 ;;
+        --out|--mask-out|--mask-in|--config|--paste)
+            _dither_files "$cur"; return 0 ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        _dither_words "$(_dither_options "$cmd")" "$cur"
+    else
+        _dither_files "$cur"
+    fi
+}
+
+complete -F _dither dither
+complete -F _dither maketexture

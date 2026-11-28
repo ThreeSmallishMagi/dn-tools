@@ -1,0 +1,772 @@
+Second-Pass Code Improvement Report
+===================================
+
+Scope
+-----
+
+Reviewed the current tracked `.cpp` files:
+
+  bluenoise.cpp
+  defaults.cpp
+  dither.cpp
+  inpaint.cpp
+  markov.cpp
+  maskutil.cpp
+  spectralmask.cpp
+  srgb.cpp
+  srgbtest.cpp
+  temporaldither.cpp
+
+Excluded untracked scratch/artifact files. The previous cleanup pass has clearly
+landed in several places: `maskutil` now exists, config directory creation uses
+`std::filesystem`, Markov calibration respects user-set `markov.temp`, Markov
+logging is caller-controlled, and several long blocks have been split.
+
+Priority key:
+
+  P1: correctness or real maintenance risk
+  P2: worthwhile cleanup with clear readability/duplication payoff
+  P3: optional polish
+
+
+Highest Priority
+----------------
+
+P1 - `spatial_floydsteinberg()` still drops residual on the final row.
+
+  File: dither.cpp:252
+
+  The denominator still counts every tap with a valid column:
+
+    if (0 <= t.c && t.c < W) total += t.w;
+
+  but the deposit only happens when the row is valid too:
+
+    if (t.r < H && 0 <= t.c && t.c < W)
+
+  On the last row, the below-row taps are counted in `total` and then skipped, so
+  residual is silently lost. The clean fix is also shorter: define one predicate
+  and use it in both loops.
+
+    auto valid = [&](const Tap& t) {
+        return 0 <= t.r && t.r < H && 0 <= t.c && t.c < W;
+    };
+
+  Then sum and deposit only valid taps.
+
+P1 - `maskutil::rank_order()` silently assumes continuous `CV_32F` input.
+
+  File: maskutil.cpp:11
+
+  `rank_order()` flattens with `const float* v = f.ptr<float>()` and indexes as
+  if the matrix has no row stride. Current callers mostly pass freshly allocated
+  Mats, but this is now a shared utility and the signature does not document or
+  enforce that contract. A future ROI/non-contiguous Mat would rank the wrong
+  memory.
+
+  Either:
+
+    - add `CV_Assert(f.type() == CV_32F && f.isContinuous())`, or
+    - make the helper stride-safe by comparing through `(idx / cols, idx % cols)`.
+
+  If performance matters, the assert is enough for this codebase's current usage.
+
+
+Cross-Cutting Improvements
+--------------------------
+
+P2 - Define one helper for padded toroidal Gaussian blur.
+
+  Files: spectralmask.cpp:41, markov.cpp:448
+
+  `smooth_power()` and `highpass_field()` both implement "wrap pad, Gaussian
+  blur, crop back". The data and post-processing differ, but the border policy is
+  the same hard-won rule. A `maskutil::toroidal_gaussian_blur()` helper would make
+  the behavior consistent and reduce repeated OpenCV boilerplate.
+
+P2 - Move shared frequency helpers into `maskutil`.
+
+  Files: spectralmask.cpp:31, markov.cpp:824
+
+  `spectralmask.cpp` has `bin_freq()`, while Markov calibration computes the same
+  signed DFT bin frequency inline in `level_set_low()`. A shared
+  `maskutil::bin_freq(i, n)` would make the calibration and spectral code agree
+  by construction.
+
+P2 - Add a tiny range builder for parameter registration.
+
+  Files:
+    dither.cpp:111
+    bluenoise.cpp:163
+    spectralmask.cpp:185
+    markov.cpp:1130
+    inpaint.cpp:260
+
+  `params::add_const()` helped, but calls still carry noisy `{{lo, hi}}` and
+  `(long long)` casts. A helper like `params::range(lo, hi)` plus overloads
+  `add_const_i`, `add_const_d`, and `add_const_s` would make registration blocks
+  more data-like and avoid the blank-line artifacts visible in several files.
+
+P2 - Use one complete-number parser.
+
+  Files: dither.cpp:570, dither.cpp:661, defaults.cpp:457
+
+  CLI numeric parsing, `--set` numeric parsing, and config parsing each do the
+  same `stod` plus "all characters consumed" dance. A small helper such as
+  `parse_complete_double()` and `parse_complete_integer()` would reduce repeated
+  exception handling and keep error behavior aligned.
+
+P3 - Keep all private helper linkage consistent.
+
+  Files: bluenoise.cpp:19, inpaint.cpp:155, markov.cpp:800
+
+  Some files use an anonymous namespace, some use `static`, and `markov.cpp`
+  currently leaves several helper functions with external linkage. Pick one
+  convention per file; anonymous namespaces read best for these implementation
+  helpers.
+
+
+maskutil.cpp
+------------
+
+P1 - Assert or support non-contiguous inputs in `rank_order()`.
+
+  File: maskutil.cpp:11
+
+  This is the main maskutil issue. The helper should either enforce
+  `CV_32F && isContinuous()` or become row-stride aware.
+
+P2 - Factor the two rank projection bodies.
+
+  Files: maskutil.cpp:21, maskutil.cpp:29
+
+  `rank_uniform_unit()` and `rank_uniform_signed()` only differ in the formula
+  used to map rank to float. A private helper:
+
+    assign_rank_values(f, order, value_for_rank)
+
+  would reduce duplication without hiding intent.
+
+P2 - Validate `threshold_mask()` inputs.
+
+  File: maskutil.cpp:38
+
+  Since this is now the common threshold-mask exit path, add a debug assertion
+  that `order.size() == sz.area()`. Optional: assert each index is inside range
+  when debugging. That catches generator bugs at the boundary where they become
+  corrupted images.
+
+P2 - Name the high-pass sigma constant.
+
+  File: maskutil.cpp:53
+
+  The `0.1874` half-power conversion also appears in spectral and Markov-related
+  comments. A `constexpr double kHalfPowerSigmaPerPixel = 0.1874;` in `maskutil`
+  would make the convention searchable.
+
+P3 - Consider offering `rank_bins()` here too.
+
+  File: markov.cpp:97
+
+  Markov's `rank_bins()` is still local because it maps ranks to quantization
+  bins rather than a uniform float field. It is general enough to live beside the
+  other rank helpers if another generator or test starts needing it.
+
+
+bluenoise.cpp
+-------------
+
+P2 - Put `Tap`, `Heap`, and helpers in an anonymous namespace.
+
+  Files: bluenoise.cpp:19, bluenoise.cpp:52
+
+  Most helper functions are `static`, but the file-scope types still sit in the
+  global namespace. An anonymous namespace around the implementation helpers
+  would match `spectralmask.cpp`, `markov.cpp`, and the newer project style.
+
+P2 - Track rank order directly instead of storing a rank matrix.
+
+  Files: bluenoise.cpp:80, bluenoise.cpp:126, bluenoise.cpp:140
+
+  The algorithm chooses one pixel for each rank. It can push the selected linear
+  index into `std::vector<int> order` as it goes, then return
+  `maskutil::threshold_mask(order, sz)`. That removes the `CV_32S rank` Mat and
+  the final nested scan over it.
+
+P2 - Extract heap seeding and neighbour re-push.
+
+  Files: bluenoise.cpp:111, bluenoise.cpp:130
+
+  Two small helpers would make the core loop read as placement logic:
+
+    seed_heap_with_empty_pixels()
+    push_updated_empty_neighbors()
+
+  The current code is correct, but the loop still mixes policy with heap
+  maintenance.
+
+P3 - Normalize style in `makeSparseGaussian()`.
+
+  File: bluenoise.cpp:25
+
+  The rest of the project mostly uses spaced operators and multi-line simple
+  loops. This function still has compact expressions like `mul*sigma`,
+  `dy=-radius`, and `for (auto& t: kernel)`. A light formatting pass would make
+  it match nearby code.
+
+P3 - Remove blank-line artifacts in the registration block.
+
+  Files: bluenoise.cpp:179, bluenoise.cpp:185
+
+  Several `params::add_const()` calls have empty lines between arguments. This is
+  pure polish, but cleaning it now keeps future diffs readable.
+
+
+defaults.cpp
+------------
+
+P2 - Replace `format()` with a visitor.
+
+  File: defaults.cpp:64
+
+  `format()` still manually probes the variant. A small overloaded visitor would
+  keep all `Value` alternatives handled in one expression and make future
+  alternatives harder to forget.
+
+P2 - Pull "complete numeric parse" into helpers.
+
+  File: defaults.cpp:457
+
+  `load_config()` repeats the same complete-parse pattern used in CLI parsing.
+  A file-scope `parse_double(std::string_view)` returning `optional<double>` is
+  cleaner and can be reused from `dither.cpp` if it moves into a small CLI/util
+  helper.
+
+P2 - Reduce private reconciliation declarations in `defaults.h`.
+
+  Files: defaults.h:198, defaults.cpp:267
+
+  `Movable`, `movable_defaults()`, and `apply_trial()` are private but still add
+  implementation detail to the public header. If you want the header to stay
+  focused on the parameter API, move the reconciliation search into a small
+  `.cpp` helper class or private free functions that operate through a narrow
+  friend.
+
+P2 - Split `explain()` rendering from row collection.
+
+  File: defaults.cpp:372
+
+  `explain()` still does data collection, applicability partitioning, width
+  calculation, table printing, idle-key printing, and docs printing in one block.
+  A local `ParamRow` vector plus `print_explain_table()`/`print_docs()` would be
+  easier to test and change.
+
+P2 - Consider adding `Params::pinned()` or `Params::origin_is()`.
+
+  Files: defaults.cpp:213, defaults.cpp:219
+
+  `measured()` and `user_set()` are nearly identical. A generic helper would make
+  future origin checks less likely to repeat this pattern.
+
+P3 - Update stale explanatory text.
+
+  File: defaults.cpp:381
+
+  The `explain()` comment says "with three generators registered"; the project
+  now has four.
+
+P3 - Make `StackFrame` non-copyable.
+
+  File: defaults.cpp:48
+
+  It is only used as an automatic guard, so deleting copy/move constructors would
+  encode that intent. This is defensive polish, not an active bug.
+
+
+dither.cpp
+----------
+
+P1 - Fix `spatial_floydsteinberg()` row validity.
+
+  File: dither.cpp:252
+
+  Same P1 as above. This should be the first source change in the next pass.
+
+P2 - Make `mask_work()` fail closed for unknown methods.
+
+  File: dither.cpp:42
+
+  The helper currently falls through to `markov_work()` for any method that is
+  not `blue`, `dft`, or `inpaint`. Today callers validate before using it, but
+  the helper itself is now the central generator work function and should not
+  encode "unknown means Markov". End with an exception or explicit `if
+  (method == "markov")`.
+
+P2 - Introduce an `ArgCursor` for option parsing.
+
+  File: dither.cpp:634
+
+  `parseOptions()` is improved but still has local lambdas that close over
+  `index`, `argc`, `argv`, `k`, and `bad`. A tiny `ArgCursor` with `option()`,
+  `need()`, `number()`, and `integer()` would make the option table cleaner and
+  isolate parse errors.
+
+P2 - Extract parsers for structured option values.
+
+  Files: dither.cpp:697, dither.cpp:734, dither.cpp:761
+
+  `--mask-size`, `--set key=value`, and `--debug-pixel` still parse inline.
+  Helpers returning `optional<cv::Size>`, `optional<pair<string,string>>`, and
+  `optional<cv::Point>` would cut the long option chain down without changing
+  command behavior.
+
+P2 - Group `Options` by concern.
+
+  File: dither.cpp:522
+
+  `Options` is still one flat bag: input/output, color/levels, temporal/spatial,
+  mask generation, debug, and explain/calibration. Nested structs such as
+  `ImageOptions`, `DitherOptions`, `MaskOptions`, and `DebugOptions` would make
+  downstream helper signatures clearer.
+
+P2 - Extract frame preparation and output writing.
+
+  Files: dither.cpp:1263, dither.cpp:1291, dither.cpp:1299
+
+  The bottom of `run()` still does target construction, supersampling, debug
+  bounds checks, pass execution, level encoding, downsampling, averaging, primary
+  write, and frame writes. Split into:
+
+    prepare_target(image, ladder, opt)
+    validate_debug_pixel(target.size(), opt)
+    encode_downsample_frames(frames, ladder, opt)
+    write_outputs(result, frames, opt)
+
+P2 - Avoid reading a calibrated Markov sample twice.
+
+  Files: dither.cpp:1157, dither.cpp:1070
+
+  Calibrated Markov runs read `opt.maskSample` once in
+  `maybe_calibrate_markov_temp()` and again in `build_with_method()`. Moving
+  calibration into the build path after the sample is read, or returning the
+  loaded sample from calibration, would reduce I/O and remove a small split in
+  ownership.
+
+P2 - Move the run-summary print into a helper.
+
+  File: dither.cpp:1202
+
+  The summary print has its own conditional formatting rules. A
+  `print_run_summary(opt)` helper would shorten `run()` and make it easier to
+  keep output formatting consistent.
+
+P3 - Fix help text drift and punctuation.
+
+  Files: dither.cpp:938, dither.cpp:956
+
+  The sample-options heading says "dft or markov", but `inpaint` also imitates a
+  sample. The `--mask-pairs` help line also opens a parenthesis and does not close
+  it. These are small docs fixes.
+
+P3 - Clean indentation in `Space`.
+
+  File: dither.cpp:314
+
+  The `Space` block uses tab indentation while most surrounding code uses spaces.
+  It is readable, but a format pass would reduce visual noise.
+
+P3 - Simplify `report_conflicts()` grammar.
+
+  File: dither.cpp:627
+
+  If `blocked_by` is empty, the current expression can produce awkward grammar
+  around "this run rule out". Build the subject string and verb separately.
+
+
+inpaint.cpp
+-----------
+
+P2 - Either use `cv::resize(..., INTER_AREA)` in `downsample()` or fix the comment.
+
+  File: inpaint.cpp:55
+
+  The comment says `INTER_AREA` on an exact integer factor is the block mean, but
+  the code still implements the block mean manually with four nested loops. If
+  the OpenCV result is byte-equivalent after the following rank projection, use
+  `cv::resize`. If there is a reason not to, the comment should say why the
+  manual loop remains.
+
+P2 - Pass radius directly into `PatchDatabase`.
+
+  File: inpaint.cpp:81
+
+  `PatchDatabase` recovers radius from `-ring.front().y`, relying on the exact
+  ordering produced by `ring_offsets()`. Passing `radius` explicitly is clearer
+  and avoids a brittle hidden contract between two helpers.
+
+P2 - Avoid materializing a `group` vector for every inpaint group.
+
+  Files: inpaint.cpp:191, inpaint.cpp:196
+
+  `sweep_level()` clears and refills `group` for each group in each sweep. A
+  `gather_queries_strided(field, all, group_index, groups, ring, query)` helper
+  could read from `all` by stride and return/update the matching indices without
+  allocating another vector.
+
+P2 - Keep private helpers in one anonymous namespace.
+
+  Files: inpaint.cpp:38, inpaint.cpp:155
+
+  `prepare_sample`, `downsample`, and `PatchDatabase` are in an anonymous
+  namespace, while `ring_offsets`, `gather_queries`, and `sweep_level` are
+  `static` after that namespace closes. Both work, but one private-helper section
+  would read cleaner.
+
+P2 - Extract field initialization/upscaling.
+
+  File: inpaint.cpp:240
+
+  The coarse-to-fine loop would read more directly with:
+
+    field = initial_or_upscaled_field(field, W, H, rng)
+
+  This is small, but it separates level setup from the inpaint sweep.
+
+P3 - Remove blank-line artifacts in registration.
+
+  File: inpaint.cpp:265
+
+  The `Radius` rule has empty lines between arguments. Same polish issue as the
+  other registration blocks.
+
+P3 - Consider making `inpaint.rate` applicability match the other generator rates.
+
+  File: inpaint.cpp:302
+
+  Blue, DFT, and Markov rates are registered under `mask::generator(...)`.
+  `inpaint.rate` is always applicable. If that is not intentional, use
+  `mask::generator("inpaint")` so `--explain` treats all generator rates the same.
+
+
+markov.cpp
+----------
+
+P2 - Move calibration helpers back under internal linkage.
+
+  Files: markov.cpp:765, markov.cpp:800, markov.cpp:839, markov.cpp:856,
+  markov.cpp:880, markov.cpp:978
+
+  The anonymous namespace closes before `level_set_low()`, `clump_distance()`,
+  `reference_mask()`, `fit_markov_model()`, and `sample_markov_mask()`. These are
+  not declared in the header and should not have external linkage. Keeping them
+  in the anonymous namespace reduces the exported symbol surface and matches
+  their real ownership.
+
+P2 - Use `to_logp()` in `fit_markov_model()`.
+
+  Files: markov.cpp:338, markov.cpp:945
+
+  `to_logp()` exists for the blur/prior/log-probability recipe, but
+  `fit_markov_model()` still repeats the same blur and log-prob code manually.
+  Reuse `to_logp()` after computing `e.mi` from the smoothed table, or split the
+  smoothing step from the log conversion so both paths share the same operations.
+
+P2 - Extract expert-logit accumulation.
+
+  Files: markov.cpp:359, markov.cpp:391, markov.cpp:698
+
+  `pooled_logloss()`, `fit_weights_ml()`, and `gibbs_field()` all:
+
+    - read two neighbour bins for every expert
+    - index the expert's `logp` table
+    - add weighted logits over `Qv`
+
+  One helper such as `accumulate_logits(...)` would reduce repeated indexing and
+  make the sampler and diagnostics harder to drift apart.
+
+P2 - Compute/report flat weights independently in `report_weights()`.
+
+  File: markov.cpp:647
+
+  The report labels `llFlat` as flat 1/K, but the `weights` argument is whatever
+  the current run is using. With the default `flat` mode this is fine; with
+  internal `markov.weights=mi` or `ml`, the report text becomes misleading. Build
+  explicit flat weights for this comparison, and optionally label the current
+  mode separately.
+
+P2 - Remove stale unused parameters and `(void)` suppressions.
+
+  Files: markov.cpp:535, markov.cpp:987
+
+  `report_occupancy()` takes `experts` but does not use it. `sample_markov_mask()`
+  has a `(void)` line for variables that are now actually referenced in logging
+  or diagnostics. Both are residue from earlier shapes of the code.
+
+P2 - Return `MarkovModel` without heap allocation.
+
+  File: markov.cpp:880
+
+  `fit_markov_model()` now uses `unique_ptr`, which is clearer than the old
+  shared ownership. Since there is no polymorphism or ownership transfer beyond
+  "maybe failed", `std::optional<MarkovModel>` would be still simpler and avoid
+  one heap allocation.
+
+P2 - Split `fit_markov_model()` one more time.
+
+  File: markov.cpp:880
+
+  This block still does radius clamping, quantization, pair selection, occupancy
+  capture, expert fitting, and model assembly. Good extraction points:
+
+    clamp_radius(sample_size, mask_size, requested)
+    choose_quantization(p.bins)
+    collect_occupancy(tbl, cells, Qv)
+    fit_expert(qn, qv, ...)
+
+P2 - Consolidate "rank to flat bins" with maskutil conventions.
+
+  File: markov.cpp:97
+
+  `rank_bins()` correctly differs from `rank_uniform_unit()`, but it shares the
+  same rank-order assumptions. If it stays local, at least assert `nbins <= 256`
+  and input type/continuity. If moved to `maskutil`, it can share the same
+  safeguards as other rank helpers.
+
+P2 - Make `PairSelection` carry selected candidate indices only if needed.
+
+  Files: markov.cpp:468, markov.cpp:521
+
+  `select_pairs()` builds selected candidate indices, then immediately expands
+  them to offset pairs. That is fine. If more diagnostics are planned, consider
+  keeping MI or candidate ids in the result; if not, the comments about candidate
+  bookkeeping can be shortened because callers never see it now.
+
+P3 - Remove duplicated/stale comments around `Expert` and `select_pairs()`.
+
+  Files: markov.cpp:185, markov.cpp:459
+
+  The `Expert` comment says the same thing twice, with the second version now
+  more accurate. The `select_pairs()` comment similarly blends the function
+  summary with the `PairSelection` summary. Delete the stale half rather than
+  carrying both.
+
+P3 - Tighten `report_holdout()` after splitting report sections.
+
+  File: markov.cpp:643
+
+  The trailing comment "What would the weights be..." belongs to the old
+  monolithic `report_fit()` and can be removed.
+
+P3 - Rename calibration output "probes" to "temperatures".
+
+  File: markov.cpp:1114
+
+  The log says "over N probes", but each temperature is averaged over multiple
+  realizations. "over N temperatures" is clearer.
+
+P3 - Clean blank lines in registration.
+
+  Files: markov.cpp:1142, markov.cpp:1150, markov.cpp:1160, markov.cpp:1166,
+  markov.cpp:1172
+
+  Several `params::add_const()` calls now have extra blank lines between
+  arguments. This is harmless but makes the parameter table harder to scan.
+
+
+spectralmask.cpp
+----------------
+
+P2 - Share `bin_freq()` with Markov calibration.
+
+  File: spectralmask.cpp:31
+
+  This belongs in `maskutil` now that two files need the same DFT-bin convention.
+
+P2 - Split spectral sample preparation into reusable high-pass plus spectral-only mean behavior.
+
+  File: spectralmask.cpp:57
+
+  `sample_amplitude()` cannot use `prepare_texture_sample()` directly because DFT
+  intentionally handles scale in frequency space and subtracts the mean when
+  high-pass is off. But the Gaussian high-pass itself can still be a shared
+  helper, leaving this function to express the spectral-specific policy.
+
+P2 - Move bilinear wrapping read to `maskutil` only if another caller appears.
+
+  File: spectralmask.cpp:91
+
+  `sample_amplitude_at()` is clean now. I would keep it local unless Markov or a
+  test starts needing frequency-grid interpolation too.
+
+P2 - Consider combining `wrapped()` and `sample_amplitude_at()`.
+
+  Files: spectralmask.cpp:80, spectralmask.cpp:91
+
+  `wrapped()` is only used by `sample_amplitude_at()`. Inlining the two
+  `maskutil::wrap_any()` calls inside `sample_amplitude_at()` would remove a
+  helper without making the interpolation harder to read.
+
+P3 - Clarify the comment boundary above `sample_amplitude_at()`.
+
+  Files: spectralmask.cpp:84, spectralmask.cpp:87
+
+  The `amplitude_grid()` summary and the bilinear-read summary currently sit
+  back-to-back before `sample_amplitude_at()`, so it reads like one comment for
+  two functions. Move the `amplitude_grid()` comment down to the actual
+  `amplitude_grid()` function.
+
+P3 - Clean blank-line artifacts in registration.
+
+  Files: spectralmask.cpp:194, spectralmask.cpp:202
+
+  Same formatting issue as other `params::add_const()` blocks.
+
+
+srgb.cpp
+--------
+
+P2 - Cache decode tables.
+
+  File: srgb.cpp:26
+
+  `decode_gray8()` rebuilds the 256-entry table on every call. That is small, but
+  this function is called for every frame average and supersample downsample.
+  Static tables for sRGB and linear modes would be simpler at call time and avoid
+  repeated setup.
+
+P2 - Make `decode_display()` use explicit row loops.
+
+  File: srgb.cpp:88
+
+  Most conversion code now uses pointer loops. `decode_display()` still uses
+  `forEach`, which is fine, but a row loop would match the rest of the file and
+  avoid lambda overhead.
+
+P2 - Pointer-loop the 3-channel converters.
+
+  Files: srgb.cpp:123, srgb.cpp:136
+
+  `linear_to_srgb()` still uses nested `at<>()` calls, and `srgb_to_linear()`
+  uses iterators. Pointer row loops would be consistent with the grayscale
+  helpers and faster without changing behavior.
+
+P3 - Decide whether 3-channel converters belong in this library.
+
+  Files: srgb.cpp:123, srgb.cpp:136
+
+  The comment says `srgbtest` is the only caller. If true, the project could
+  either keep them as test/diagnostic helpers or move them next to the diagnostic
+  program. Keeping them is fine, but their role is different from the production
+  grayscale pipeline.
+
+P3 - `to_gray8()` could return a clone for gray input if aliasing matters.
+
+  File: srgb.cpp:10
+
+  Today returning `g = img` is efficient and appears safe. If later callers
+  mutate the returned Mat expecting isolation, this can surprise them. No change
+  needed unless that ownership expectation appears.
+
+
+srgbtest.cpp
+------------
+
+P2 - Either keep the fixed 256x256 ramp contract or validate the optional path.
+
+  Files: srgbtest.cpp:73, srgbtest.cpp:20
+
+  `main()` now accepts an optional image path, but the printing helpers still
+  assume at least column 255 and row 127. Either validate dimensions before
+  calling them or remove the optional path and keep this explicitly tied to the
+  known ramp.
+
+P2 - Make it a real test or move it under diagnostics/tools.
+
+  File: srgbtest.cpp:1
+
+  The header now says it "checks nothing", which is honest. Because it is still a
+  CMake target named `srgbtest`, it looks like a test. Either add assertions and
+  failure conditions, or rename/move it so the build surface is clear.
+
+P3 - Replace repeated indexed sample reads with named sample points.
+
+  Files: srgbtest.cpp:19, srgbtest.cpp:23, srgbtest.cpp:28
+
+  A small helper `sample(linear, y, x)` or a list of named points would make the
+  fixed ramp probes easier to adjust.
+
+
+temporaldither.cpp
+------------------
+
+P2 - Modernize the C-style demo code.
+
+  Files: temporaldither.cpp:2, temporaldither.cpp:7, temporaldither.cpp:10
+
+  This file still uses C headers, a macro, a C enum, `atoi`, `rand`, and
+  function-pointer strategy dispatch. Cleaner C++17:
+
+    constexpr unsigned bitmax(unsigned depth)
+    enum class DitherStrategy
+    checked `std::strtoul` or `std::from_chars`
+    std::mt19937 with std::uniform_real_distribution
+    switch-to-callable helper for strategies
+
+P2 - Split accumulator and average-display state.
+
+  File: temporaldither.cpp:32
+
+  `dither()` still updates and prints two algorithms in one loop using local
+  variables. Two small state structs, each with `step()`, would make the table
+  generation easier to understand and compare.
+
+P2 - Parse frame count as an optional argument.
+
+  File: temporaldither.cpp:88
+
+  The frame count is now a named local constant, which is better than three
+  repeated literals. Since this is a diagnostic program, making it an optional
+  CLI argument would be more useful and still simple.
+
+P3 - Normalize formatting.
+
+  Files: temporaldither.cpp:43, temporaldither.cpp:59, temporaldither.cpp:67
+
+  The file has mixed spacing and long `printf` calls. A light formatting pass
+  would make it easier to read even before deeper modernization.
+
+
+Recommended Next Cleanup Order
+------------------------------
+
+1. Fix `spatial_floydsteinberg()` tap validity in `dither.cpp`.
+
+2. Add assertions or stride-safe logic to `maskutil::rank_order()` and the
+   rank-projection helpers.
+
+3. Clean registration formatting and add small registration/range overloads.
+   This is low risk and will remove a lot of visual noise across files.
+
+4. Move remaining private helpers under consistent internal linkage, especially
+   the non-public Markov helpers currently outside the anonymous namespace.
+
+5. Refactor Markov's repeated expert-logit accumulation and `fit_markov_model()`
+   table fitting path.
+
+6. Finish `dither.cpp` structural cleanup around parsing, run-summary printing,
+   target preparation, and output writing.
+
+7. Decide whether `srgbtest.cpp` and `temporaldither.cpp` are tests,
+   diagnostics, or experiments, then make their names/build placement match.
+
+
+Verification
+------------
+
+Configured and built the current tree in a clean build directory:
+
+  cmake -S . -B /tmp/opencv-review2-build
+  cmake --build /tmp/opencv-review2-build
+
+Both commands completed successfully. No source files were changed by this
+review; this file is the only new artifact.

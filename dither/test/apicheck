@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Does every public header compile on its own, and does what it declares exist?
+
+Two defects, both found by the October 2026 coverage review, both invisible to
+every other check here:
+
+  markov.h declared `calibrate_markov(const cv::Mat&, ...)` while
+  markovcalib.cpp defined the samples::Set version. A client following the
+  header compiles and then fails to link. The CLI never noticed because its
+  caller sits in the same translation unit as the definition.
+
+  experiments/markov-20260927/draw.cpp still passed a cv::Mat to
+  fit_markov_model after that interface took a samples::Set. Not a CMake
+  target, so nothing built it.
+
+Neither is a wrong answer; both are a declaration and an implementation that
+have stopped describing the same function. The suite could not see either,
+because every test links the whole library and calls through the CLI, where a
+stale declaration is simply never instantiated.
+
+So: compile one translation unit per header, alone, and link it against the
+library. Alone matters -- a header that silently depends on another being
+included first is the same class of defect, and including them all together
+hides it. Linking matters more: a declaration with no definition survives
+compilation and dies at link time, which is exactly what F09 was.
+
+**Every declared function is named, not just the ones a test happens to use.**
+A compile proves the syntax; taking the address of a function is what demands
+that the definition exist. The probe below therefore references each public
+entry point rather than calling it -- calling would need fixtures and would
+test the behaviour, which other checks already do.
+
+The archived experiments are compiled too, syntax only. They are not targets
+and will not be built by accident, so without this they rot silently -- which
+is what F11 was, found by a reviewer rather than by us.
+"""
+import concurrent.futures
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+BUILD = os.path.join(ROOT, 'build')
+LIB = os.path.join(BUILD, 'libdither_lib.a')
+
+failures = []
+checked = 0
+
+
+def shell(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+
+def cxxflags():
+    r = shell('pkg-config --cflags opencv4')
+    return r.stdout.strip() if r.returncode == 0 else ''
+
+
+def libs():
+    # What dither_lib links against: OpenCV, and TBB for its parallel sorts.
+    r = shell('pkg-config --libs opencv4 tbb')
+    return r.stdout.strip() if r.returncode == 0 else ''
+
+
+def report(name, ok, detail=''):
+    global checked
+    checked += 1
+    if ok:
+        print(f"  ok   {name}")
+    else:
+        print(f"  FAIL {name}")
+        for line in (detail or '').strip().split('\n')[:6]:
+            print(f"       {line}")
+        failures.append(name)
+
+
+# Headers that are not meant to stand alone, and why. Everything else must.
+INTERNAL = {
+    # markovmodel.h is markov.cpp's interior, shared with markovcalib.cpp and
+    # nothing else; its own comment says so.
+    'markovmodel.h': 'private to markov.cpp and markovcalib.cpp',
+}
+
+
+def declared_functions(path):
+    """Free functions a client could call, with the namespaces they live in.
+
+    Statements, not lines. Nearly every declaration in this project spans
+    several lines, and a line-based scan silently matched only the one-liners
+    -- it found two of markov.h's declarations and neither was the one F09 was
+    about, so reinstating that defect did not fail this check. Splitting on
+    `;` outside any body is what makes the scan see what a client sees.
+
+    Inline definitions are skipped: they cannot fail to link, which is the
+    thing being tested. Namespaces are returned rather than resolved, because
+    tracking a namespace stack by counting braces is writing a C++ parser
+    inside a test; `using namespace` asks the compiler to do it instead."""
+    src = open(path).read()
+    src = re.sub(r'//[^\n]*', '', src)
+    src = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+    # Directives too, continuation lines and all. Left in, `#pragma once` and
+    # the includes became the head of the first statement, the declaration
+    # pattern cannot match a `#`, and so every header's first declaration was
+    # dropped: four of them linked none at all and still passed.
+    src = re.sub(r'^[ \t]*#(?:[^\n]*\\\n)*[^\n]*', '', src, flags=re.M)
+
+    spaces = [m.group(1) for m in re.finditer(r'^\s*namespace\s+([\w:]+)\s*\{',
+                                              src, re.M)]
+
+    # Split into top-level statements, skipping anything inside a body. A
+    # namespace's braces are not a body: what is in one is still reachable.
+    stmts, cur, depth = [], [], 0
+    i = 0
+    while i < len(src):
+        c = src[i]
+        if c == '{':
+            # a namespace opening does not start a body
+            if re.search(r'namespace\s+[\w:]*\s*$', ''.join(cur)):
+                cur = []
+            else:
+                depth += 1
+                cur = []
+        elif c == '}':
+            depth = max(0, depth - 1)
+            cur = []
+        elif c == ';' and depth == 0:
+            stmts.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+
+    names = []
+    for st in stmts:
+        flat = ' '.join(st.split())
+        m = re.match(r'^(?:[\w:<>,\s&*\[\]]+?)\b(\w+)\s*\(.*\)$', flat)
+        if not m:
+            continue
+        if any(w in flat for w in ('typedef', 'using ', 'return', 'operator')):
+            continue
+        names.append(m.group(1))
+
+    # Overloads: counted over the whole header, inline definitions included,
+    # because an inline overload still makes `&name` ambiguous.
+    overloaded = {n for n in names
+                  if len(re.findall(r'\b' + re.escape(n) + r'\s*\(', src)) > 1}
+    return spaces, names, overloaded
+
+
+# The scanner's own fixtures: what each must find. A scanner that misses a
+# declaration does not fail, it just stops asking for that definition, so the
+# only way to know it sees what a client sees is to show it headers whose
+# answer is known.
+FIXTURES = [
+    ("the first declaration, after a pragma and includes",
+     '#pragma once\n#include <string>\n#include <vector>\nint first_api(int);\n',
+     ['first_api']),
+    ("a directive continued over two lines",
+     '#pragma once\n#define TWO_LINES(x) \\\n    ((x) + 1)\nint after_macro();\n',
+     ['after_macro']),
+    ("a declaration inside a namespace",
+     '#pragma once\nnamespace fx {\nvoid in_space(double);\n}\n', ['in_space']),
+    ("a declaration over several lines",
+     '#pragma once\n#include <string>\nstd::string multi_line(const std::string& a,\n'
+     '                       int b,\n                       double c);\n', ['multi_line']),
+    ("an inline definition, which cannot fail to link",
+     '#pragma once\ninline int has_body() { return 1; }\nint no_body();\n', ['no_body']),
+]
+
+
+def self_test(work, cf, lf):
+    for name, text, want in FIXTURES:
+        h = os.path.join(work, 'fixture.h')
+        open(h, 'w').write(text)
+        _, names, _ = declared_functions(h)
+        report(f"the scanner finds {name}", names == want, f"found {names}, want {want}")
+    # And the probe has to fail when the first declaration has no definition,
+    # which is the defect that went unseen: the scan found nothing to ask for.
+    h = os.path.join(work, 'undefined_api.h')
+    open(h, 'w').write(FIXTURES[0][1])
+    _, names, _ = declared_functions(h)
+    refs = ''.join(f'    (const void*)&{n},\n' for n in names)
+    cpp = os.path.join(work, 'undefined_api.cpp')
+    open(cpp, 'w').write(f'#include "undefined_api.h"\n'
+                         f'const void* const api[] = {{\n{refs}    nullptr\n}};\n'
+                         f'int main() {{ return 0; }}\n')
+    r = shell(f'c++ -std=c++17 -I{work} {cf} {cpp} {LIB} {lf} -o {cpp}.bin 2>&1')
+    report("a probe of an undefined first declaration fails to link",
+           r.returncode != 0, "linked, so the probe never asked for the definition")
+
+
+def main():
+    if not os.path.exists(LIB):
+        print(f"  cannot find {LIB}; build first")
+        return 2
+
+    cf, lf = cxxflags(), libs()
+    work = subprocess.run(['mktemp', '-d'], capture_output=True, text=True).stdout.strip()
+    self_test(work, cf, lf)
+
+    # One compiler per header, run concurrently: they share nothing but the
+    # library they link against, which nothing writes. Serial this was most of
+    # the check's time and all of its wall clock.
+    def probe(h):
+        spaces, names, overloaded = declared_functions(os.path.join(ROOT, h))
+        # Reference each declared name so the linker must find a definition.
+        # `(void)` a pointer rather than calling: a call needs arguments, and
+        # the behaviour is other checks' business.
+        #
+        # An overloaded name has no address without saying which overload, and
+        # resolving that means parsing the signature -- so overloads are
+        # compiled but not linked, and the count says how many. srgb.h's
+        # scalar/Mat pairs are the only ones.
+        once = [n for n in dict.fromkeys(names) if n not in overloaded]
+        over = len(set(names)) - len(once)
+        # A namespace-scope array, because the addresses have to survive to the
+        # linker. `(void)&f;` inside main does not: the compiler discards a
+        # discarded expression and emits no relocation, so the first version of
+        # this check linked happily against a declaration with no definition --
+        # the one defect it was written for. An initialiser at namespace scope
+        # cannot be folded away.
+        refs = ('const void* const api[] = {\n'
+                + ''.join(f'    (const void*)&{n},\n' for n in once)
+                + '    nullptr\n};\n') if once else ''
+        using = '\n'.join(f'using namespace {n};' for n in dict.fromkeys(spaces))
+        src = f'#include "{h}"\n{using}\n{refs}int main() {{ return 0; }}\n'
+        cpp = os.path.join(work, h.replace('.', '_') + '.cpp')
+        open(cpp, 'w').write(src)
+        r = shell(f'c++ -std=c++17 -I{ROOT} {cf} {cpp} {LIB} {lf} '
+                  f'-o {cpp}.bin 2>&1')
+        return (f"{h} compiles alone and links {len(once)} declarations"
+                + (f" ({over} overloaded, compiled only)" if over else ""),
+                r.returncode == 0, r.stdout)
+
+    headers = sorted(f for f in os.listdir(ROOT) if f.endswith('.h'))
+    todo = []
+    for h in headers:
+        if h in INTERNAL:
+            print(f"  --   {h} not checked: {INTERNAL[h]}")
+        else:
+            todo.append(h)
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, os.cpu_count() or 4)) as pool:
+        for name, ok, detail in pool.map(probe, todo):
+            report(name, ok, detail)
+
+    # The archived drivers: syntax only, since they are not targets and have no
+    # main the suite would run. Counted, because `experiments/` is in
+    # .gitignore -- the files in it are tracked, but a check that walks a
+    # directory which might not be there would pass by finding nothing, and a
+    # check that cannot fail is worse than none.
+    paths = [os.path.join(root, f)
+             for root, _, files in os.walk(os.path.join(ROOT, 'experiments'))
+             for f in sorted(files) if f.endswith('.cpp')]
+
+    def syntax(p):
+        r = shell(f'c++ -std=c++17 -fsyntax-only -I{ROOT} {cf} {p} 2>&1')
+        return f"{os.path.relpath(p, ROOT)} still compiles", r.returncode == 0, r.stdout
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, os.cpu_count() or 4)) as pool:
+        for name, ok, detail in pool.map(syntax, sorted(paths)):
+            report(name, ok, detail)
+    drivers = len(paths)
+    report("the archived drivers were found at all", drivers > 0,
+           "experiments/ holds no .cpp; this check would pass by doing nothing")
+
+    shell(f'rm -rf {work}')
+    print(f"  {len(failures)} failure(s) of {checked}")
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

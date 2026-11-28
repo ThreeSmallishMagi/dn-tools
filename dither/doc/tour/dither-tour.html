@@ -1,0 +1,554 @@
+<title>dither — rendering tone with fewer levels</title>
+
+<style>
+  :root {
+    --ink:      #16191C;
+    --paper:    #F4F3F0;
+    --plate:    #E7E5E0;
+    --silver:   #878E93;
+    --quiet:    #5E666B;
+    --accent:   #3E7B86;
+    --rule:     rgba(62,123,134,.28);
+    --shadow:   rgba(22,25,28,.10);
+
+    --serif: 'Iowan Old Style','Palatino Linotype',Palatino,'Book Antiqua',Georgia,serif;
+    --sans:  system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    --mono:  ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;
+
+    --col: 68ch;
+    --s1: .5rem; --s2: 1rem; --s3: 1.75rem; --s4: 3rem; --s5: 5rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink:    #E4E6E7;
+      --paper:  #121517;
+      --plate:  #1C2023;
+      --silver: #79828A;
+      --quiet:  #9BA4AA;
+      --accent: #78B8C4;
+      --rule:   rgba(120,184,196,.26);
+      --shadow: rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink:#E4E6E7; --paper:#121517; --plate:#1C2023; --silver:#79828A;
+    --quiet:#9BA4AA; --accent:#78B8C4; --rule:rgba(120,184,196,.26); --shadow:rgba(0,0,0,.45);
+  }
+  :root[data-theme="light"] {
+    --ink:#16191C; --paper:#F4F3F0; --plate:#E7E5E0; --silver:#878E93;
+    --quiet:#5E666B; --accent:#3E7B86; --rule:rgba(62,123,134,.28); --shadow:rgba(22,25,28,.10);
+  }
+
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    background: var(--paper); color: var(--ink);
+    font-family: var(--sans); font-size: 17px; line-height: 1.65;
+    margin: 0; padding: 0 var(--s3) var(--s5);
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  .col  { max-width: var(--col); }
+
+  h1,h2,h3 { font-family: var(--serif); font-weight: 600; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(2.6rem, 6vw, 4.1rem); line-height: 1.02; letter-spacing: -.02em; }
+  h2 { font-size: clamp(1.6rem, 3vw, 2.1rem); line-height: 1.15; letter-spacing: -.01em; }
+  h3 { font-size: 1.12rem; line-height: 1.3; }
+  p  { margin: 0 0 var(--s2); }
+  a  { color: var(--accent); text-underline-offset: 3px; }
+  strong { font-weight: 650; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: .69rem; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 var(--s1);
+  }
+  .lede { font-size: 1.2rem; line-height: 1.55; color: var(--quiet); }
+
+  /* ---- the divider is the program's own output: a ramp at two levels ---- */
+  .strip {
+    height: 26px; margin: var(--s4) 0; border: 0;
+    background-image: var(--strip); background-size: auto 26px; background-repeat: repeat-x;
+    opacity: .5; mix-blend-mode: multiply;
+  }
+  @media (prefers-color-scheme: dark) { .strip { mix-blend-mode: screen; opacity: .34; } }
+  :root[data-theme="dark"] .strip { mix-blend-mode: screen; opacity: .34; }
+  :root[data-theme="light"] .strip { mix-blend-mode: multiply; opacity: .5; }
+
+  /* ---- hero ---- */
+  header { padding: var(--s5) 0 var(--s4); }
+  .hero-grid { display: grid; gap: var(--s4); grid-template-columns: 1fr; align-items: end; }
+  @media (min-width: 900px) { .hero-grid { grid-template-columns: 1fr 512px; } }
+
+  .wipe { position: relative; width: 100%; max-width: 512px; aspect-ratio: 1; margin-left: auto;
+          box-shadow: 0 2px 18px var(--shadow); background: var(--plate); }
+  .wipe img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .wipe .top { clip-path: inset(0 calc(100% - var(--x, 50%)) 0 0); image-rendering: pixelated; }
+  .wipe .seam { position: absolute; top: 0; bottom: 0; left: var(--x, 50%); width: 1px;
+                background: var(--accent); pointer-events: none; }
+  .wipe-ctl { width: 100%; max-width: 512px; margin: var(--s2) 0 0 auto; display: block;
+              accent-color: var(--accent); }
+  .wipe-cap { max-width: 512px; margin: var(--s1) 0 0 auto; display: flex;
+              justify-content: space-between; font-family: var(--mono);
+              font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; color: var(--silver); }
+
+  /* ---- plates ---- */
+  section { padding: var(--s4) 0 0; }
+  .plates {
+    display: grid; gap: var(--s3); margin: var(--s3) 0 0;
+    grid-template-columns: repeat(auto-fit, minmax(min(232px, 100%), 1fr));
+  }
+  .plates.two { grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
+  .plates.five { grid-template-columns: repeat(auto-fit, minmax(min(176px, 100%), 1fr)); }
+  figure { margin: 0; }
+  figure img {
+    display: block; width: 100%; height: auto; background: var(--plate);
+    image-rendering: pixelated; box-shadow: 0 1px 10px var(--shadow);
+  }
+  figure img.smooth { image-rendering: auto; }
+  figcaption {
+    font-family: var(--mono); font-size: .72rem; line-height: 1.5; color: var(--quiet);
+    margin-top: var(--s1); border-top: 1px solid var(--rule); padding-top: .45rem;
+  }
+  figcaption b { color: var(--ink); font-weight: 600; display: block; letter-spacing: .02em; }
+
+  code, .cmd { font-family: var(--mono); font-variant-ligatures: none; }
+  code { font-size: .88em; background: var(--plate); padding: .1em .35em; border-radius: 2px; }
+  .cmd {
+    display: block; overflow-x: auto; white-space: pre; font-size: .8rem; line-height: 1.7;
+    background: var(--plate); color: var(--ink); padding: var(--s2) var(--s3);
+    border-left: 2px solid var(--accent); margin: var(--s3) 0 0;
+  }
+  .cmd .c { color: var(--silver); }
+
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; margin-top: var(--s3);
+          font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+  th, td { text-align: right; padding: .45rem .7rem; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; font-family: var(--mono); font-size: .8rem; }
+  thead th { font-family: var(--mono); font-size: .68rem; letter-spacing: .1em;
+             text-transform: uppercase; color: var(--accent); border-bottom-color: var(--accent); }
+  td.win { font-weight: 700; }
+
+  .note { border-left: 2px solid var(--rule); padding-left: var(--s2); color: var(--quiet);
+          font-size: .95rem; margin: var(--s3) 0 0; }
+  .note b { color: var(--ink); }
+
+  footer { margin-top: var(--s5); padding-top: var(--s3); border-top: 1px solid var(--rule);
+           font-family: var(--mono); font-size: .74rem; color: var(--silver); }
+
+  input[type=range]:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="hero-grid">
+    <div>
+      <p class="eyebrow">A command-line renderer for black-and-white output</p>
+      <h1>Every tone you have, from two you can print.</h1>
+      <p class="lede col">A dithering engine that works in linear light from end to end, and
+      builds its threshold masks by learning the grain of a real film scan — so the texture
+      that carries the tone belongs to a photograph rather than to an algorithm.</p>
+    </div>
+    <div>
+      <div class="wipe" id="wipe">
+        <img class="smooth" src="{{hero-src.jpg}}" alt="The source photograph in continuous tone">
+        <img class="top" src="{{hero-dither.png}}" alt="The same photograph rendered to two levels">
+        <span class="seam"></span>
+      </div>
+      <input class="wipe-ctl" id="wipe-ctl" type="range" min="0" max="100" value="52"
+             aria-label="Wipe between the two-level rendering and the original">
+      <div class="wipe-cap"><span>2 levels</span><span>drag</span><span>256 levels</span></div>
+    </div>
+  </div>
+</header>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">Since dn-tools-v1</p>
+  <h2 class="col">What is new if you have used the first version</h2>
+  <p class="col">The first version dithered with round, random or blue-noise thresholds. This one
+  adds film grain, and the means to choose it well. New to <code>dither</code>? Skip this list;
+  the rest of the page starts from the beginning.</p>
+  <ul class="col" style="padding-left:1.1em; margin:var(--s2) 0 0">
+    <li><b>Film grain as the threshold.</b> Four generators learn a mask from a film scan —
+    <code>dft</code>, <code>markov</code>, <code>inpaint</code> and <code>direct</code> — chosen with
+    <code>--mask-method</code> and fed with <code>--mask-sample</code>. Blue noise is still the
+    default.</li>
+    <li><b>A film library.</b> <code>install_dither</code> installs scans of six films, cuts each a
+    grain-only crop and calibrates them, so <code>--mask-sample Kodak-TriX</code> works with no
+    further setup.</li>
+    <li><b><code>--supersample</code> and <code>--out-size</code></b>, to put the grain below the
+    picture's detail and choose the output size.</li>
+    <li><b><code>--mask-scale</code></b> for coarser or finer grain, and
+    <code>--level-spacing device</code> for a panel with its own levels.</li>
+    <li><b><code>--explain</code>, <code>--set</code>, <code>--budget</code> and
+    <code>--mask-calibrate</code></b>: every default says where it came from, and built masks are
+    cached.</li>
+    <li><b><code>maketexture</code></b>, a companion tool that synthesises grain from a patch.</li>
+    <li><b><code>--threshold blue</code> is now <code>--threshold mask</code></b>, since blue noise
+    is one mask among five. The old spelling still works.</li>
+  </ul>
+</section>
+
+<section>
+  <p class="eyebrow">The shape of a run</p>
+  <h2 class="col">Decode, dither, encode — and never guess in between</h2>
+  <div class="col">
+    <p>Every image is decoded to linear light before anything touches it, and re-encoded only
+    on the way out. The curve is applied exactly at those two boundaries and nowhere inside
+    the loop, which is what lets a half-lit pixel average to the light it should emit rather
+    than to the pixel value that looks like it.</p>
+    <p>Input may be 8- or 16-bit. The difference is not tidiness: an 8-bit target cannot
+    express anything below one output level, so error diffusion and the multi-frame budget
+    have nothing left to distribute. On a gradient spanning four 8-bit codes, more exposures
+    buy exactly nothing from an 8-bit source and a great deal from a 16-bit one.</p>
+  </div>
+  <div class="scroll"><table>
+    <thead><tr><th>frames</th><th>16-bit in</th><th>8-bit in</th><th>gain</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>61.9</td><td>793.0</td><td>12.8×</td></tr>
+      <tr><td>4</td><td>25.0</td><td>793.0</td><td>31.7×</td></tr>
+      <tr><td>16</td><td class="win">12.7</td><td>793.0</td><td>62.7×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note col">RMS error against the true picture, in units of 1e-6 linear. The 8-bit
+  column does not move, because the target was quantised before the budget ever saw it.</p>
+</section>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">--threshold</p>
+  <h2 class="col">Three ways to decide a pixel</h2>
+  <p class="col">The threshold rule and the error diffusion are independent axes: every rule
+  works at any diffusion strength. Shown here with diffusion off, so each rule stands alone.</p>
+  <div class="plates">
+    <figure><img class="smooth" src="{{00-source.jpg}}" alt="The source photograph">
+      <figcaption><b>the source</b>256 tones, for comparison.</figcaption></figure>
+    <figure><img src="{{01-round.png}}" alt="Rounding each pixel to the nearest level">
+      <figcaption><b>round</b>Nearest level. Deterministic, and with no diffusion it collapses
+      to a hard silhouette.</figcaption></figure>
+    <figure><img src="{{02-random.png}}" alt="A stochastic threshold">
+      <figcaption><b>random</b>A stochastic threshold. Correct on average, noisy everywhere.</figcaption></figure>
+    <figure><img src="{{03-mask.png}}" alt="Thresholded against a blue-noise mask">
+      <figcaption><b>mask</b>Compared against a mask. Correct on average <em>and</em>
+      arranged.</figcaption></figure>
+  </div>
+  <code class="cmd">dither dog.png --threshold mask --spatial 0 --out out.png</code>
+</section>
+
+<section>
+  <p class="eyebrow">--spatial</p>
+  <h2 class="col">How much of the error is handed onward</h2>
+  <p class="col">Error diffusion is serpentine Floyd–Steinberg — even rows left to right, odd
+  rows right to left, so the error is always pushed towards pixels not yet visited and the
+  directional worming of a raster scan never appears. <code>--spatial</code> scales how much
+  of the accumulated error the <em>threshold rule sees</em>, not how much is diffused; the
+  residual is always passed on in full, which is what keeps the output averaging to the
+  target at any setting. In a <code>--frames</code> run it applies to each pixel's total over
+  the frames as well as to each frame.</p>
+  <div class="plates">
+    <figure><img src="{{04-sp0.png}}" alt="No error diffusion">
+      <figcaption><b>--spatial 0</b>Nothing carried. Each pixel decides alone.</figcaption></figure>
+    <figure><img src="{{05-sp05.png}}" alt="Half strength error diffusion">
+      <figcaption><b>--spatial 0.5</b>Half. Texture from the mask, structure from the ledger.</figcaption></figure>
+    <figure><img src="{{06-sp1.png}}" alt="Full error diffusion">
+      <figcaption><b>--spatial 1</b>Full, and the default when no threshold is named.</figcaption></figure>
+  </div>
+  <p class="note col"><b>Why it is the fraction the rule sees.</b> Scaling what is passed on
+  instead would discard part of every residual. With a mask those residuals are not zero-mean —
+  the mask is a fixed function of position, so it correlates with the error field feeding back
+  into it — and at <code>--spatial 0.5</code> discarding them lifts the shadows by 27/1000 and
+  crushes the highlights by 19/1000.</p>
+</section>
+
+<section>
+  <p class="eyebrow">--levels &middot; --level-spacing</p>
+  <h2 class="col">More rungs on the ladder</h2>
+  <p class="col">Two levels is the default and the hardest case. Up to 256 are available, and
+  where the rungs sit is a separate question from how many there are.</p>
+  <div class="plates">
+    <figure><img src="{{07-lev2.png}}" alt="Two levels"><figcaption><b>--levels 2</b>Black and white, and sRGB-invariant.</figcaption></figure>
+    <figure><img src="{{08-lev4.png}}" alt="Four levels"><figcaption><b>--levels 4</b>Two intermediate rungs.</figcaption></figure>
+    <figure><img src="{{09-lev16.png}}" alt="Sixteen levels"><figcaption><b>--levels 16</b>Near-continuous at this size.</figcaption></figure>
+  </div>
+  <p class="note col"><b>Three ladders, because there are three displays.</b>
+  <code>srgb</code> puts the rungs at even 8-bit pixel values — right when the file <em>is</em>
+  the display signal. <code>linear</code> puts them at even steps of light.
+  <code>device</code> puts them where a panel with exactly <code>--levels</code> of its own
+  would put them, which is the right answer for a 3-bit mono screen and differs from
+  <code>srgb</code> by up to 2% of a rung whenever <code>levels-1</code> does not divide 255.</p>
+</section>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">--mask-method</p>
+  <h2 class="col">Five ways to build a threshold mask</h2>
+  <p class="col">A mask is a tile of thresholds, flat in histogram and tiled toroidally across
+  the image. What it looks like decides what the dithering looks like, and these five disagree
+  completely about how to make one. Four are periodic by construction; the fifth is a crop of
+  a photograph and has to earn its join. <code>markov</code> and <code>inpaint</code> grow
+  structure sweep by sweep, and after every sweep their power spectrum is matched to the film's
+  in 16 frequency bands, so it stays at the grain's scale.</p>
+  <div class="plates five">
+    <figure><img class="smooth" src="{{10-m-blue.jpg}}" alt="A void-and-cluster blue noise mask">
+      <figcaption><b>blue</b>Void-and-cluster. Takes no sample — the only one that invents from nothing.</figcaption></figure>
+    <figure><img class="smooth" src="{{1x-m-dft.jpg}}" alt="A mask matching the sample's spectrum">
+      <figcaption><b>dft</b>Alternating projections onto the sample's spectrum and a flat histogram.</figcaption></figure>
+    <figure><img class="smooth" src="{{1x-m-markov.jpg}}" alt="A mask from a pairwise Markov random field">
+      <figcaption><b>markov</b>A pairwise random field, fitted then Gibbs-sampled.</figcaption></figure>
+    <figure><img class="smooth" src="{{1x-m-inpaint.jpg}}" alt="A mask synthesised by Efros-Leung resynthesis">
+      <figcaption><b>inpaint</b>Efros–Leung: copy the middle of whichever neighbourhood matches best.</figcaption></figure>
+    <figure><img class="smooth" src="{{1x-m-direct.jpg}}" alt="A mask that is a crop of the film itself">
+      <figcaption><b>direct</b>The sample itself, cut and seamed. The upper bound the others are measured against.</figcaption></figure>
+  </div>
+  <div class="scroll"><table>
+    <thead><tr><th>generator</th><th>grain 4X</th><th>grain 2484</th><th>spectrum 4X</th></tr></thead>
+    <tbody>
+      <tr><td>direct</td><td class="win">0.67</td><td class="win">1.24</td><td>0.418</td></tr>
+      <tr><td>dft</td><td>5.83</td><td>2.63</td><td class="win">0.003</td></tr>
+      <tr><td>inpaint</td><td>5.73</td><td>3.66</td><td>0.497</td></tr>
+      <tr><td>markov</td><td>7.29</td><td>3.01</td><td>0.501</td></tr>
+      <tr><td>a real patch of the film</td><td>1</td><td>1</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note col">Lower is better everywhere. <em>grain</em> asks whether the shape of a
+  mask's grain, block by block, could have come from the film, scored against the scan as it is
+  and in units of how much one real patch differs from another — so 1 is indistinguishable.
+  <em>spectrum</em> is the RMS log ratio of radial power against the film high-passed at 32 px.
+  No generator wins every column: <code>dft</code> owns the spectrum by construction,
+  <code>direct</code> is the film itself, and <code>markov</code> and <code>inpaint</code>
+  trade the spectrum for local structure. Masks as installed and calibrated, 256².</p>
+</section>
+
+<section>
+  <p class="eyebrow">--mask-sample</p>
+  <h2 class="col">Learning the grain of an actual film</h2>
+  <p class="col">Point <code>--mask-sample</code> at a scan and the mask is built to resemble
+  it. Point it at a <em>directory</em> of scans, or name a film in the library at
+  <code>~/.config/dither/samples/</code>, and every scan becomes data — because a film is not
+  one frame, and a model fitted to a single exposure learns that frame's density as much as
+  the emulsion's character. Each film also has a crop at
+  <code>~/.config/dither/crops/</code>, a window chosen to hold grain and nothing else: it is
+  what <code>dft</code> and <code>direct</code> build from, and what the others are held to.
+  Name a sample-based method with no sample and you get Kodak 4X.</p>
+  <p class="col">A mask lights the sample's brightest grain first, so the dither shows the
+  grain as it is in the scan.</p>
+  <div class="plates two">
+    <figure><img class="smooth" src="{{20-film.jpg}}" alt="A 1:1 crop of a Kodak 4X film scan">
+      <figcaption><b>the sample</b>Kodak 4X: the film's crop, shown at 1:1. Its darkest grain
+      clumps several times harder than its lightest.</figcaption></figure>
+    <figure><img class="smooth" src="{{1x-m-inpaint.jpg}}" alt="The mask synthesised from that scan">
+      <figcaption><b>the mask it produced</b>Synthesised, not copied — no 5×5 tile of it appears
+      anywhere in the sample.</figcaption></figure>
+  </div>
+  <div class="plates two">
+    <figure><img src="{{2x-dog-blue.png}}" alt="The photograph dithered with a blue-noise mask">
+      <figcaption><b>blue noise</b>Even, featureless, engineered. Nothing wrong with it, and
+      nothing of a photograph in it.</figcaption></figure>
+    <figure><img src="{{2x-dog-inpaint.png}}" alt="The photograph dithered with a film-grain mask">
+      <figcaption><b>the film's own grain</b>The same picture, carried by texture learned from
+      the scan above.</figcaption></figure>
+  </div>
+  <code class="cmd">dither dog.png --mask-method inpaint --mask-sample Kodak-4X --supersample 4
+<span class="c"># a film name resolves in the library; a path you type always wins over it</span></code>
+</section>
+
+<section>
+  <p class="eyebrow">--mask-scale</p>
+  <h2 class="col">The same grain, coarser</h2>
+  <p class="col">Grain belongs to a format, not to a file. <code>--mask-scale</code> asks for
+  the sample's texture at a different size — for <code>dft</code> as a pure frequency remap,
+  which is why frequencies past the sample's Nyquist are set to zero rather than wrapped.
+  Wrapped, at scale 2 the main lobe would mirror back as a second lobe carrying 15.8% of peak
+  power — fine noise on grain that had been asked to be coarse.</p>
+  <div class="plates">
+    <figure><img class="smooth" src="{{3x-scale1.jpg}}" alt="Mask at scale 1"><figcaption><b>--mask-scale 1</b>The sample's own grain size.</figcaption></figure>
+    <figure><img class="smooth" src="{{3x-scale2.jpg}}" alt="Mask at scale 2"><figcaption><b>--mask-scale 2</b>Twice as coarse.</figcaption></figure>
+    <figure><img class="smooth" src="{{3x-scale4.jpg}}" alt="Mask at scale 4"><figcaption><b>--mask-scale 4</b>Four times, and visibly band-limited.</figcaption></figure>
+  </div>
+</section>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">--supersample &middot; --out-size</p>
+  <h2 class="col">Dither finer than the picture</h2>
+  <p class="col">Film's look needs grain below the detail, not a finer mask — scaling the mask
+  target finer just converges on white noise. <code>--supersample n</code> dithers on an
+  n-times grid and averages back down in linear light, giving n²+1 tones per output pixel and
+  letting the grain sit where it belongs.</p>
+  <div class="plates">
+    <figure><img src="{{4x-ss1.png}}" alt="No supersampling"><figcaption><b>--supersample 1</b>2 tones. The grain is the pixel grid.</figcaption></figure>
+    <figure><img src="{{4x-ss4.png}}" alt="Four times supersampling"><figcaption><b>--supersample 4</b>17 tones per output pixel.</figcaption></figure>
+    <figure><img class="smooth" src="{{4x-ss8.jpg}}" alt="Eight times supersampling"><figcaption><b>--supersample 8</b>65 tones, and the grain is well below the detail.</figcaption></figure>
+  </div>
+  <p class="note col"><b>One resample, not two.</b> With <code>--supersample</code> the dither
+  grid is the only place the sub-pixel information exists, so <code>--out-size</code> is reached
+  from there directly rather than via the input's size. Shrinking a 4096 grid to 512 measures
+  21.1/1000 linear against the truth in one step and 36.4 through 1024 — and the two-step path
+  comes back with <em>more</em> distinct tones, 206 against 64, which is interpolation inventing
+  values rather than detail surviving.</p>
+  <div class="plates two">
+    <figure><img src="{{6x-grid.png}}" alt="A 1:1 window of the raw dither grid">
+      <figcaption><b>the grid itself</b>Set <code>--out-size</code> to the input's longer edge
+      times <code>--supersample</code> and nothing is averaged at all — the raw dither comes out
+      whole. A 1:1 window of it.</figcaption></figure>
+    <figure><img class="smooth" src="{{6x-small.jpg}}" alt="The same run fitted to 128 pixels">
+      <figcaption><b>--out-size 128</b>The other end of the same option: the whole frame fitted
+      inside a square, in one resample from the grid.</figcaption></figure>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">--frames</p>
+  <h2 class="col">Spending the error over time</h2>
+  <p class="col">For a display that can show a sequence, the tone can be spread across frames
+  instead of across pixels. Each pixel is given a budget — <code>goal = target × frames</code> —
+  and every frame aims at what is left divided by the frames remaining, so the total converges
+  <em>exactly</em> on the final frame. No separate accumulator, and stochastic thresholds need
+  no special case.</p>
+  <div class="plates">
+    <figure><img src="{{5x-fr1.png}}" alt="A single frame"><figcaption><b>--frames 1</b>One exposure.</figcaption></figure>
+    <figure><img src="{{5x-fr4.png}}" alt="Four frames averaged"><figcaption><b>--frames 4</b>Four, averaged in linear light.</figcaption></figure>
+    <figure><img src="{{5x-fr16.png}}" alt="Sixteen frames averaged"><figcaption><b>--frames 16</b>Sixteen. A fresh mask offset each time.</figcaption></figure>
+  </div>
+  <p class="note col">These are previews: the average is re-encoded to 8 bits, so it understates
+  what a display showing the frames in sequence actually emits. <code>--save-frames</code> writes
+  each one separately — measure those, not the average, when the sequence is the product.</p>
+</section>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">maketexture</p>
+  <h2 class="col">The check no statistic can make</h2>
+  <p class="col">The companion tool synthesises a texture from a patch using the same generators,
+  and <code>--paste</code> writes the input back with that region replaced. If the synthesis
+  works, the region cannot be found. Below is a 256×256 patch of Kodak 4X replaced entirely by
+  synthesised grain — press the button to see where.</p>
+  <div class="plates two">
+    <figure>
+      <div style="position:relative">
+        <img class="smooth" id="paste-img" src="{{7x-paste.jpg}}" alt="A film scan with a synthesised region pasted into it">
+        <span id="paste-box" style="position:absolute; left:8.33%; top:8.33%; width:66.7%; height:66.7%;
+              border:2px solid var(--accent); opacity:0; transition:opacity .25s"></span>
+      </div>
+      <figcaption><b>find the join</b>
+        <button id="reveal" style="font:inherit; font-family:var(--mono); font-size:.72rem;
+          margin-top:.4rem; background:none; color:var(--accent); border:1px solid var(--rule);
+          padding:.3rem .7rem; cursor:pointer">show the region</button></figcaption>
+    </figure>
+    <figure><img class="smooth" src="{{7x-texture.jpg}}" alt="The synthesised texture on its own">
+      <figcaption><b>the synthesised patch</b>On its own. Every statistic of the grain, none of
+      the sample's actual pixels.</figcaption></figure>
+  </div>
+  <code class="cmd">maketexture ~/.config/dither/crops/Kodak-4X.png --sample 256x256+128+128 --paste pasted.png</code>
+</section>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">--explain &middot; --set &middot; --budget &middot; --mask-calibrate</p>
+  <h2 class="col">Defaults that say where they came from</h2>
+  <div class="col">
+    <p>Most parameters are not constants but rules, resolved once and recorded with what they
+    depended on. <code>--explain</code> prints the whole resolution, and the origin column is the
+    point of it: a value you gave is never recomputed, and a value the program chose says what
+    it chose from.</p>
+  </div>
+  <code class="cmd"><span class="c">$ dither dog.png --mask-method markov --mask-sample Kodak-4X \
+         --supersample 4 --explain</span>
+
+  parameter           value        origin    derived from
+  image.width         256          measured
+  supersample         4            user
+  mask.method         markov       user
+  mask.sample         Kodak-4X     user
+  threshold           mask         implied
+  mask.highpass       0            derived   mask.method
+  markov.temp         0.645359     measured
+  markov.weights      ml           measured
+  markov.radius       3            measured
+  mask.size.w         256          derived   supersample, image.height, image.width,
+                                             mask.method, markov.max_repeats, mask.highpass,
+                                             mask.scale, markov.max_size, budget</code>
+  <div class="col">
+    <p style="margin-top:var(--s3)">The <code>threshold</code> line is <code>reconcile</code> at work. Naming a
+    mask option is a request for a mask, so the threshold default moves to accommodate it rather
+    than leaving your option silently ignored. What cannot be rescued is refused outright, naming
+    both sides — because an option that had no effect alongside a zero exit status is the worst
+    of the available outcomes.</p>
+    <p><code>--budget 30s</code> picks the mask size and pair count to fit the time, using
+    per-generator work formulas divided by a throughput measured from real builds.
+    <code>--mask-calibrate</code> measures a generator's awkward parameters against your sample
+    instead of trusting a default fitted on someone else's film — and declines, rather than
+    inventing a number, when the search runs to the end of its bracket without turning over. The
+    answer is kept in the config and every later run on that sample uses it: the three
+    <code>measured</code> lines above came from the calibration made when Kodak 4X was
+    installed. <code>--no-config</code> goes back to the rules.</p>
+    <p>Masks are cached under a key walked out of the parameter registry, so a repeat is
+    byte-identical to a build and arrives in 0.06s instead of 4.70s. The key hashes the sample's
+    contents rather than its path, and the executable's identity too, so rebuilding a generator
+    invalidates every mask it ever made.</p>
+  </div>
+</section>
+
+<hr class="strip">
+
+<section>
+  <p class="eyebrow">Reference</p>
+  <h2 class="col">The whole surface</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>option</th><th style="text-align:left">what it does</th></tr></thead>
+    <tbody>
+      <tr><td>--threshold</td><td style="text-align:left">round, random or mask</td></tr>
+      <tr><td>--spatial</td><td style="text-align:left">error diffusion, 1 full to 0 none</td></tr>
+      <tr><td>--levels</td><td style="text-align:left">output tones, 2–256</td></tr>
+      <tr><td>--level-spacing</td><td style="text-align:left">srgb, linear or device — where the rungs sit</td></tr>
+      <tr><td>--mask-method</td><td style="text-align:left">blue, dft, markov, inpaint or direct</td></tr>
+      <tr><td>--mask-sample</td><td style="text-align:left">a scan, a directory of them, or a film in the library</td></tr>
+      <tr><td>--mask-size</td><td style="text-align:left">pin the tile instead of deriving it</td></tr>
+      <tr><td>--mask-scale</td><td style="text-align:left">the sample's grain, coarser or finer</td></tr>
+      <tr><td>--mask-highpass</td><td style="text-align:left">ignore sample structure coarser than this (32 px; 0 for markov and inpaint)</td></tr>
+      <tr><td>--markov-bands / --inpaint-bands</td><td style="text-align:left">spectrum matching after each sweep, in this many bands (16; 0 off)</td></tr>
+      <tr><td>--direct-equalise</td><td style="text-align:left">rank each pixel within a neighbourhood of this sigma, so the tile has no density drift</td></tr>
+      <tr><td>--mask-in / --mask-out</td><td style="text-align:left">load or save the mask itself</td></tr>
+      <tr><td>--mask-calibrate</td><td style="text-align:left">measure the awkward parameters against your sample, once, and keep them</td></tr>
+      <tr><td>--no-config</td><td style="text-align:left">neither read nor write calibrations, cached masks or rates</td></tr>
+      <tr><td>--supersample</td><td style="text-align:left">dither at n× and average back down</td></tr>
+      <tr><td>--out-size</td><td style="text-align:left">fit the output in a square, resampling once</td></tr>
+      <tr><td>--frames / --save-frames</td><td style="text-align:left">spend the tone over a sequence</td></tr>
+      <tr><td>--budget</td><td style="text-align:left">spend about this long building the mask</td></tr>
+      <tr><td>--linear</td><td style="text-align:left">treat input and output as raw linear</td></tr>
+      <tr><td>--seed</td><td style="text-align:left">everything stochastic derives from it</td></tr>
+      <tr><td>--explain / --set</td><td style="text-align:left">show every parameter; override any of them</td></tr>
+      <tr><td>--debug-pixel</td><td style="text-align:left">per-frame ideal/display/displayed for one pixel</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<footer>
+  Every figure on this page is output from the program, including the dithered rule between
+  sections — a ramp at two levels, blue noise, no diffusion. Images are shown at 1:1 where the
+  pattern is the point.
+</footer>
+
+</div>
+
+<script>
+  (function () {
+    var wipe = document.getElementById('wipe'), ctl = document.getElementById('wipe-ctl');
+    function set() { wipe.style.setProperty('--x', ctl.value + '%'); }
+    ctl.addEventListener('input', set); set();
+
+    var btn = document.getElementById('reveal'), box = document.getElementById('paste-box'), on = false;
+    btn.addEventListener('click', function () {
+      on = !on;
+      box.style.opacity = on ? '1' : '0';
+      btn.textContent = on ? 'hide the region' : 'show the region';
+    });
+  })();
+</script>

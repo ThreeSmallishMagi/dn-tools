@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""When dither refuses, does it say so, and does it leave nothing behind?
+
+Three things can go wrong when a run cannot proceed, and only the first is
+usually tested:
+
+  it succeeds anyway, and the option the user typed was quietly dropped --
+  which `Params::conflicts` exists to prevent and which --mask-out escaped
+  for as long as it lived outside the registry;
+
+  it fails with nothing to act on, so the user is left with a library's
+  warning about a decoder rather than a sentence about their command;
+
+  it fails *after* writing something, so a later step reads a file that looks
+  like a result and is not.
+
+So every case below asserts all three: a non-zero status, a line of the
+program's own prose naming the problem, and no output file. The last one is
+the easiest to regress and the hardest to notice, because a partial artifact
+is indistinguishable from a real one until something reads it.
+
+What is deliberately not asserted is the wording. These messages are tuned
+often and a test that pins them turns every improvement into a failure; what
+matters is that a message exists, is the program's own, and names the thing
+that was wrong -- so the check looks for the offending path or value in it
+rather than for a fixed sentence.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.join(ROOT, 'build', 'dither')
+IMG = os.path.join(ROOT, 'examples', 'ramp_256x256.png')
+SAMPLE = os.path.join(ROOT, 'examples', 'crops', 'Kodak-4X-1.png')
+
+failures = []
+
+
+def check(name, ok, detail=''):
+    print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if not ok else ""))
+    if not ok:
+        failures.append(name)
+
+
+def own_prose(text):
+    """The program's own lines: not a library's warning, not the banner it
+       prints before working, not the notes reconcile() leaves."""
+    out = []
+    for line in text.strip().split('\n'):
+        if not line.strip():
+            continue
+        if line.startswith('[ WARN') or line.startswith('[ERROR'):
+            continue
+        if re.match(r'^(threshold=|Note: |Synthesising |Reusing |Loaded )', line):
+            continue
+        out.append(line)
+    return out
+
+
+def main():
+    if not os.path.exists(DITHER):
+        print("  cannot find build/dither; build first")
+        return 2
+
+    work = tempfile.mkdtemp(prefix='errorcheck.')
+    env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(work, 'cfg'))
+    corrupt = os.path.join(work, 'corrupt.png')
+    open(corrupt, 'w').write('not an image')
+    missing = os.path.join(work, 'nope.png')
+
+    # Each case: a name, the arguments after the output path is appended, and a
+    # fragment the message must name. The fragment is the user's own word for
+    # the thing that was wrong -- a path they typed or a value they gave.
+    cases = [
+        ("a fractional --levels",      ['--levels', '2.9'],                      '2.9'),
+        ("an unknown threshold",       ['--threshold', 'nonsense'],              'threshold'),
+        ("markov with no sample",      ['--mask-method', 'markov'],              'sample'),
+        ("an unknown generator",       ['--mask-method', 'nonsense'],            'mask-method'),
+        ("a mask file that is absent", ['--mask-in', missing],                   missing),
+        ("a mask file that is junk",   ['--mask-in', corrupt],                   corrupt),
+        ("a mask size of zero",        ['--mask-size', '0x0'],                   'mask-size'),
+        ("a sample that is absent",    ['--mask-method', 'dft',
+                                        '--mask-sample', missing],               missing),
+    ]
+
+    for name, args, fragment in cases:
+        out = os.path.join(work, re.sub(r'\W+', '_', name) + '.png')
+        r = subprocess.run([DITHER, IMG, '--no-config', *args, '--out', out],
+                           capture_output=True, text=True, env=env, timeout=120)
+        prose = own_prose(r.stderr + r.stdout)
+        said = any(fragment in line for line in prose)
+        check(f"{name}: refused",      r.returncode != 0, f"exit {r.returncode}")
+        check(f"{name}: said why",     bool(prose) and said,
+              f"nothing of its own named {fragment!r}; got {prose[:1]}")
+        check(f"{name}: wrote nothing", not os.path.exists(out),
+              "an output file was left behind")
+
+    # An input the program cannot read, and an output it cannot write. Both
+    # arrive from outside and neither is the user mistyping an option.
+    r = subprocess.run([DITHER, missing, '--no-config',
+                        '--out', os.path.join(work, 'x.png')],
+                       capture_output=True, text=True, env=env, timeout=120)
+    check("an input image that is absent: refused and said why",
+          r.returncode != 0 and any(missing in l for l in own_prose(r.stderr + r.stdout)),
+          f"exit {r.returncode}")
+
+    nowhere = os.path.join(work, 'no-such-directory', 'x.png')
+    r = subprocess.run([DITHER, IMG, '--no-config', '--out', nowhere],
+                       capture_output=True, text=True, env=env, timeout=120)
+    check("an output path that cannot be written: refused and said why",
+          r.returncode != 0 and any(nowhere in l for l in own_prose(r.stderr + r.stdout)),
+          f"exit {r.returncode}")
+
+    # And refused before the work, not after it: a mask build can take a
+    # minute, and an output that was never going to be written makes all of it
+    # wasted. A build that started says so with its "Building" line.
+    for what, args in [
+            ("an output in a missing directory", ['--out', nowhere]),
+            ("an output with no encoder",        ['--out', os.path.join(work, 'x.xyz')]),
+            ("a mask output with no encoder",    ['--mask-out', os.path.join(work, 'm.xyz'),
+                                                  '--out', os.path.join(work, 'y.png')]),
+    ]:
+        r = subprocess.run([DITHER, IMG, '--no-config', '--threshold', 'mask', *args],
+                           capture_output=True, text=True, env=env, timeout=120)
+        check(f"{what}: refused before the mask is built",
+              r.returncode != 0 and 'Building' not in r.stderr + r.stdout
+              and not os.path.exists(os.path.join(work, 'y.png')),
+              f"exit {r.returncode}, {(r.stderr + r.stdout).strip()[-120:]}")
+
+    # A missing value is a parse error, which happens before any of the above.
+    r = subprocess.run([DITHER, IMG, '--no-config', '--levels'],
+                       capture_output=True, text=True, env=env, timeout=120)
+    check("an option with no value: refused and said which",
+          r.returncode != 0 and any('--levels' in l for l in own_prose(r.stderr + r.stdout)),
+          f"exit {r.returncode}")
+
+    # The other executables. temporaldither parsed its depths with atoi and
+    # shifted by them, so `32 2 128 0` shifted a 32-bit value by 32 -- undefined
+    # behaviour from four numbers a user can type. Stated generally, because the
+    # defect is the missing check rather than that one shift: every numeric
+    # argument of every tool here must be range-checked, and a value outside
+    # the range must be refused rather than used.
+    td = os.path.join(ROOT, 'build', 'temporaldither')
+    if os.path.exists(td):
+        for name, args in [
+                ("a depth as wide as the word",  ['32', '2', '128', '0']),
+                ("a depth of zero",              ['0', '2', '1', '0']),
+                ("a negative depth",             ['-1', '2', '1', '0']),
+                ("a depth that is not a number", ['abc', '2', '1', '0']),
+                ("a value past the source's range", ['8', '2', '300', '0']),
+                ("an unknown strategy",          ['8', '2', '128', '9']),
+        ]:
+            r = subprocess.run([td, *args], capture_output=True, text=True, timeout=60)
+            check(f"temporaldither: {name} is refused",
+                  r.returncode != 0 and bool(own_prose(r.stderr + r.stdout)),
+                  f"exit {r.returncode}, said {own_prose(r.stderr + r.stdout)[:1]}")
+        r = subprocess.run([td, '8', '2', '128', '0'], capture_output=True,
+                           text=True, timeout=60)
+        check("temporaldither: a sound command still runs", r.returncode == 0,
+              f"exit {r.returncode}")
+
+        # The edge of what it accepts. At 31 bits a level is past what a float
+        # holds exactly and an int holds at all, so the full-scale value came
+        # back as 2^31, one above the display's top level, and the random
+        # strategy cast it into an int. Every displayed level must be in range,
+        # and the 40-frame totals must not wrap, so the average must be exact.
+        for target in (1, 8, 16, 31):
+            top = (1 << target) - 1
+            for strategy in ('0', '1', '2'):
+                r = subprocess.run([td, '31', str(target), str((1 << 31) - 1), strategy, '7'],
+                                   capture_output=True, text=True, timeout=60)
+                rows = [l.split() for l in r.stdout.splitlines()
+                        if l.split() and l.split()[0].isdigit()]
+                shown = [int(c) for row in rows for c in (row[1], row[5])]
+                averages = [float(row[6]) for row in rows]
+                check(f"temporaldither: full scale into {target} bits, strategy {strategy}",
+                      r.returncode == 0 and len(rows) == 40
+                      and all(0 <= s <= top for s in shown)
+                      and all(a == top for a in averages),
+                      f"exit {r.returncode}, levels {sorted(set(shown))[-2:]}, top {top}")
+
+        # The other edge: a target under one level, where the accumulator goes
+        # below zero after every frame that shows a whole level. A strategy that
+        # mishandles that runs the display away to full brightness and stays in
+        # range doing it, so what is asserted is the ledger: the accumulator
+        # stays within a level of zero and the 40-frame average is on target.
+        for strategy in ('0', '1', '2'):
+            for seed in ('1', '2', '3'):
+                r = subprocess.run([td, '8', '2', '10', strategy, seed],
+                                   capture_output=True, text=True, timeout=60)
+                rows = [l.split() for l in r.stdout.splitlines()
+                        if l.split() and l.split()[0].isdigit()]
+                ok = r.returncode == 0 and len(rows) == 40 and all(
+                    -1 < float(row[2]) < 1 for row in rows) and abs(float(rows[-1][3])) < 0.03
+                check(f"temporaldither: a target under one level, strategy {strategy} seed {seed}",
+                      ok, f"exit {r.returncode}, last row {rows[-1] if rows else None}")
+
+    subprocess.run(['rm', '-rf', work])
+    print(f"  {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

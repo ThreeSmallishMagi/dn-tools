@@ -1,0 +1,70 @@
+Triage of code_improvement_suggestions3.txt. One line per suggestion, keyed by the
+line its heading sits on in that file. Status is Accepted / Rejected / Ask / Done.
+
+This round is markedly better evidenced than the first two: the reviewer built the
+tree, ran the unit tests, and wrote focused probes rather than reasoning from the
+source alone. Where a finding is marked Accepted below it has been reproduced
+here independently, and the reproduction is recorded with it -- a review that
+brings evidence still gets checked, but it gets checked quickly.
+
+Only one is rejected outright, which is unusual and is a fact about the report
+rather than about the standard applied.
+
+Five of the accepted findings are defects in work I did in this project's recent
+history -- the mask cache key, its tests, and a comment I wrote asserting a
+contract that markov does not honour. Those are listed no differently from the
+rest.
+
+Line 75:Done: Separate readable formatting from lossless serialization. **The worst finding in the report and the one to fix first.** format() is %.6g and value_of() feeds the mask cache key, so distinct parameters collide: reproduced here with blue.sigma=1.8000001 and 1.8000002, which produce one cached mask where there should be two. That is a silent wrong hit -- the second run is served the first sigma's mask -- and it is precisely the failure the cache was designed around. save_config has the same defect at rest: a measured rate writes as `3.6061e+06`, five figures. Keep %.6g for display; add a round-trip serializer (max_digits10, C locale) for identity and persistence, and version the encoding.
+Line 98:Done: Build calibration identity from the actual calibration request. Not independently reproduced -- accepted on the structural argument, which is the mask cache's own: a key assembled from a hand-picked list of inputs is a list to forget something from, and this one omits seed, shortlist and reuse while hashing pixels without dimensions. The remedy differs from the mask cache's deliberately, since the two have different legitimate exclusions; the shared part is that the request should be resolved once and then both keyed and executed.
+Line 125:Done: Replace the raw config-token search with an option-aware first pass. Reproduced: with a real config present, `dither --no-config --threshold mask --explain` reports blue.rate as measured -- the flag is ignored because the pre-scan starts at argv[2] -- where the same flag later correctly reports fallback. The pre-scan also cannot tell a flag from a value, so a filename of `--no-config` disables configuration. Fix by sharing arity, not by introducing the ArgCursor the first review rejected.
+Line 149:Done: Give numeric and paired arguments one strict parsing contract. Reproduced both divergences: `--supersample 2.9` resolves to 2 while `--set supersample=2.9` resolves to 2.9 and rounds to 3, and `--mask-size 32x32garbage` is accepted as 32. This changes what input is accepted, so it lands as a documented fix rather than as cleanup, and needs its own entry in the option reference.
+Line 172:Done: Validate threshold names once before either execution path. Reproduced: `--threshold not-a-rule --explain` exits 0, and a real run prints `threshold=not-a-rule` in its summary before anything refuses it. The parser already validates generator and spacing names; the threshold is the one that was missed.
+Line 186:Done: Separate cache writing from eviction and make failures truly optional. The split is worth having on its own, but the error-handling points are the substance: cv::imwrite and cv::imread can throw, so an optional cache must not be able to abort a valid main output; eviction subtracts a file's size even when its removal failed; hash_file cannot distinguish a short read from EOF; and build_identity overwrites file_size's error code with last_write_time's. The stale-.tmp comment promises a cleanup the code never performs -- that one is mine.
+Line 214:Done: Give the config loader/writer explicit failure boundaries. load_config claims corrupt lines are ignored, but a registered number outside its range throws from set() -- so a cache file that is merely stale, which is exactly what a range change makes it, is fatal rather than skipped. save_config truncating in place is the other half: an interrupted write leaves no config rather than the old one. Write-and-rename, and validate at the read boundary.
+Line 234:Done: Reuse to_logp in fit_expert; the old uncertainty is now checkable. Previously rejected for want of arithmetic identity, and the reviewer supplies exactly that -- 50 tables across Qc=2..32 including all-zero, matching exactly, with MI after to_logp also matching. That is new evidence and it reverses the earlier decision. Landing it still requires whole-mask byte-identity here, since table equivalence is not a program regression test.
+Line 258:Done: Remove redundant Markov parameters and forwarding layers. report_occupancy ignores radius, report_weights ignores weights, gibbs_field takes an N that is always H*W, and markov's prepare_sample forwards unchanged to maskutil's. Note the correct exclusion the reviewer drew: inpaint's same-named helper also rank-flattens and must stay.
+Line 281:Done: Compute the reference clumping profile once per calibration. 120 reference FFTs where 5 suffice, because clump_distance recomputes the reference's five level-set measurements on every draw. The constraint is that the selected temperature must not move: same distances, same order of reduction, serial and parallel alike.
+Line 296:Done: Keep a calibration score with its temperature and winning index. Rediscovering the winner by floating-point equality against `best` is fragile in a way that costs nothing to remove. The interpolation point is the sharper one: it assumes ts[1]-ts[0] spacing that failed draws can invalidate.
+Line 313:Done: Give the direct mask one owned working field. Three image-sized clones where one is needed, and the ownership boundary is currently invisible. Behaviour-preserving, and the reviewer correctly separates it from the two-sorts question, which is not a reason to touch random tie-breaking.
+Line 330:Done: Validate overlap against tile dimensions before quilt_axis. Reproduced: `--mask-size 16x16 --set direct.overlap=32` aborts on `keep > overlap` inside maskutil, with an OpenCV assertion in place of a diagnostic. Both values are inside their registered ranges, so the ranges cannot express the relationship and the geometry has to be resolved before the crop.
+Line 350:Done: Validate each inpaint level before allocating and querying it. Reproduced, though not as predicted: `--mask-size 16x16 --set inpaint.levels=5 --set inpaint.radius=3` aborts inside cvflann on `result.full()` rather than reading out of bounds. Same class and same fix -- validate the coarse dimensions at the top of the level loop -- and the reviewer was explicit that the path was found statically, which is why the observed failure differs.
+Line 372:Done: Do not construct a cache key when caching is disabled. Under --no-config the key is still built, which reads and hashes the whole sample file to produce something nothing consumes. Cheap to gate and it makes the disabled path honestly disabled.
+Line 388:Done: Construct one MaskRequest in build_with_method. Two request objects differing in one field, which is a second site to update whenever MaskRequest gains one.
+Line 402:Done: Reuse each registration block's applicability value. Cosmetic, and accepted only because inpaint already does it -- the inconsistency is the defect, not the repetition. Explicitly not the add_const_i/add_const_d family the first review rejected.
+Line 416:Done: Repair comments attached to obsolete code before adding more prose. The largest item by count and the one with the most user-visible part: the help text advertises `--mask-cache`, which the parser does not accept -- `Unknown option: --mask-cache`. That is mine, from the mask cache work, and test/flagcheck could not catch it because it reads the .md documents and not cli.cpp's usage string. Extending flagcheck to the help text is the durable half of this fix. The stale engine.cpp comments (254 not 255; spatial scaling the decision rather than the deposit) contradict findings this project made and wrote up elsewhere.
+Line 453:Done: Share test setup without sharing the expected answer. The substantive half is a coverage gap in a test I wrote: the sweep is titled "every parameter that applies" and pins method=markov, so blue, dft, inpaint and direct keys are never swept. Its integer-first mutation also rounds real values and skips silently. Fix the coverage before the fixture.
+Line 477:Done: Make test assertions match the claims they print. Three cases, all mine. The sample-content cache test can be satisfied by an unreadable alternate sample returning an empty name -- a pass for the wrong reason. The direct case concludes "with and without rounding" while testing the textured sample only with rounding on. The decomposition case prints "exact" without asserting a bound, and its s is manufactured by the test.
+Line 499:Done: Give the test runner a per-case exception boundary. R13 and R14 above both throw, so this is not hypothetical: one such case today aborts the runner with no named failure and no remaining results. A catch at the existing boundary, not a testing framework.
+Line 512:Done: Split the long compound test by invariant, not by implementation phase. Accept the split and the stale-commentary corrections -- the collision comment says "above 127 levels" beside an assertion of 122, which is my inconsistency. Accept also the reviewer's refusal to compress the BudgetCase table into loops, which would hide deliberate combinations.
+Line 531:Rejected: Simplify the scratch hello program only if it is retained. hello.cpp is untracked, is not a CMake target, and is Graham's. The report is right that it should not be deleted as part of a cleanup; the same reasoning says it should not be rewritten as part of one either. Nothing in the project depends on it.
+Line 547:Done: Bound reconciliation's trial count while multiplying it. Defensive only -- the current registry cannot reach the cap -- but the check expresses "does the search fit?" more directly than a product compared afterwards, and costs nothing.
+Line 561:Done: Make the generator log argument mean the same thing for every builder. This corrects a claim I made: fixing blue_build's null dereference, I wrote that every other row treats a null log as "say nothing". markov_build does not forward q.log at all and build_markov_mask hardcodes &std::cerr, so the contract I asserted did not exist. Either the contract holds everywhere or the comment should not claim it.
+
+All of the above are implemented as of 2026-09-27, in eight commits following
+the order below. Every behaviour-preserving change was checked against a 76-run
+hash matrix -- thresholds, diffusion, levels, frames, spacings, all five
+generators at two sizes each, alternate samples, scale, high-pass, seed,
+calibration, pair and bin counts, both weighting schemes, --mask-report,
+supersample and --budget -- which is unchanged throughout.
+
+Two things were found while implementing rather than by the review, and both
+came from testing a fix rather than from reading:
+
+- A *second* place cached a non-answer as a calibration. The review named the
+  one inside calibrate_markov_temp; the "sample too small" guard above it did
+  the same thing, and only showed up when the first was fixed and the symptom
+  did not go away.
+- The runner's missing exception boundary (R21) stopped being hypothetical
+  while writing R01's test, which set an out-of-range value and took the whole
+  suite down with it. That is why R21 was pulled ahead of the input-validation
+  work.
+
+The order used, which differs from the report's only in putting the help text early:
+  1. Line 75 (key collisions) and Line 416's --mask-cache half. One is a wrong
+     result, the other is a documented option that does not exist.
+  2. Lines 125, 149, 172 -- input the program accepts and should not.
+  3. Lines 330, 350, 499 together: two crashes and the runner boundary that
+     turns a crash into a named failure.
+  4. Lines 98, 186, 214 -- the remaining identity and durability work.
+  5. The refactors and test fixes as convenient.

@@ -1,0 +1,102 @@
+Triage of doc/UXImprovements.md, the UX review of 23 September 2026. One line
+per numbered finding. Status is Accepted / Rejected / Ask / Done.
+
+The review asks, first, for evidence about real users before any interface
+work, and most of its findings are framed as conditional on that evidence.
+That framing is right and is kept here: what was done is what the documents and
+the program could settle on their own -- contradictions, a refusal that came
+too late, messages in the program's own vocabulary rather than the user's.
+What depends on how the tool is actually used is marked Ask, because the
+author is the one who knows.
+
+Triaged on 7 November 2026, six weeks after the review. Several of the
+contradictions it lists had been fixed in that time; each is re-checked
+against the current text below rather than assumed.
+
+1:Done: one trustworthy account of current behaviour. Re-checked each:
+- MI ratio 0.65: DESIGN.md and GLOSSARY.md now both describe it as the first
+  design and say why it was dropped. Already fixed.
+- minimum error boundary cut "not shipped": the glossary's "not shipped" is the
+  histogram-preserving *blend*, and the cut's own entry describes it as what
+  direct uses. Not a contradiction in the current text.
+- --budget "Default 30s": DEFAULTS.md now opens that section with "As shipped,
+  --budget is unset by default". Already fixed.
+- calibration two-tier against "Open questions": the open question was wrong
+  -- a calibration is a pure function of the sample and settings, so a first
+  and second run cannot differ. Rewritten in DEFAULTS.md.
+- markov.iters 3 / 12 / 20: the table row said 3, the program says 2. Fixed in
+  DEFAULTS.md; the struck-through `mask.iters` row and the dated record are
+  history and are marked as such.
+- --mask-weights: every remaining mention is the record of its removal.
+- doc/README.md "four documents", UXPrinciples.txt missing: fixed in 255c9e5.
+- ARCHITECTURE.md four/five generators: the remaining "four" is "all four
+  generators then in the table -- direct came later", which is history.
+- glossary order: checked mechanically, every entry is in order.
+- the review check for option names: test/flagcheck holds help, README and
+  the registry to one list. Also found while checking: "Three rules are `?`"
+  in DEFAULTS.md's open questions, when all three have since been measured.
+
+2:Ask: task recipes for the four jobs. Accepted in part -- the review's "validate
+the introductory path from a clean checkout" is test/workflowcheck, which runs
+the install and the everyday commands against an empty config. The recipes
+themselves need what the documents do not hold: how the enlarger program and
+the multi-frame display consume the frames, and what the photogravure process
+needs from a mask. The author knows those; a recipe written without them would
+be a guess presented as a procedure.
+
+3:Done in part: a multi-frame run without --save-frames now says that its output
+is the average, a preview, and that --save-frames writes the frames to expose.
+That is the case the review singles out, and it costs one line. Ask: a job
+record, or documenting each receiving device's mapping, depends on the
+handoffs in 2.
+
+4:Done in part: conflict messages name the flags the user typed. They used
+registry keys -- "mask.scale applies to ..., which mask.in rules out" -- which
+the review rightly says needs translating back to the command; it now reads
+"--mask-scale applies to building a mask from a sample, which
+--mask-in rules out". The two halves of --mask-size are one flag and one
+message, and a parameter with no flag is named as `--set key`. The scope text
+"--mask-method dft or markov" for the sample parameters was itself stale, since
+inpaint and direct take a sample too.
+Rejected: labelling provisional values in --explain. Its origin column already
+says `fallback`, `derived` or `measured`, and the nominal image size is
+described as "nominal until an image is read"; a second label would restate
+the first.
+Ask: whether naming --threshold should go on turning diffusion off. It is
+documented, the run summary prints spatial= on every run, and changing the
+rule changes the output of every command that names a threshold.
+
+5:Ask: a "check your result" guide and a gallery. Agreed that no automated check
+is a guarantee of invisible seams, and CLAUDE.md says so. But the checks are
+developer tools that take a sample and a mask, not a picture and an intended
+print, and a gallery needs choosing which images at which viewing scale stand
+for "the intended medium" -- the same knowledge as 2.
+
+6:Done in part: an output in a missing directory, or with an extension no
+encoder handles, is now refused before any work, rather than after a mask
+build that can take a minute -- for --out and --mask-out both; errorcheck
+asserts the refusal comes before the "Building" line. A directory that exists
+but cannot be written to is still found at the write.
+Already true, and checked by errorcheck: a refusal leaves no output file.
+Rejected for now: atomic writes and a cancellation contract. A run writes at
+most a handful of files at the end, after all the work, so an interrupted run
+leaves nothing rather than a partial file; the case the review has in mind
+(a long multi-file write interrupted half way) is --save-frames with many
+frames, where a rename-into-place per file would add machinery to protect
+files the next run rewrites anyway.
+
+7:Done: the README's --config entry already says what the config holds, that
+deleting it only costs re-measuring, that it affects --budget runs only, and
+that --no-config neither reads nor writes it; the mask cache and the sample
+library each have their own paragraph. The run manifest the review floats is
+conditional on a demonstrated need to share results, which is 9's question.
+
+8:Done in part: blue noise's percentage redraw is now drawn only on a terminal;
+redirected, it was a hundred carriage returns on one line of the log. --help
+fits 80 columns (every line is at most 80 characters; a byte count says 82
+where an em dash is). The glossary's alphabetical order was already fixed.
+Ask: a screen-reader pass, which needs one.
+
+9:Ask: the user study. The review's own first priority, and not something a
+change to this repository can do. The author is the first participant it
+names.

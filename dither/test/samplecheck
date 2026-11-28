@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Does --mask-sample resolve the way it says it does, and does completion agree?
+
+`--mask-sample` names one of three things: a file, a directory of scans of one
+film, or a film in the library at $XDG_CONFIG_HOME/dither/samples. The three
+have to resolve the way the help describes, the mask cache has to notice when
+any of the files behind a name changes, and the bash completion has to offer
+exactly the films that exist.
+
+That last one is why this exists. The completion script is the only part of the
+program the rest of the suite cannot see, and a completion that offers a name
+the parser then rejects is worse than none — it reads as a promise. It is the
+same argument `flagcheck` makes about the documentation, so it gets the same
+kind of check: the script must not restate anything, and what it offers must
+come from the program.
+
+Everything runs under a temporary XDG_CONFIG_HOME, so the developer's own
+sample library is neither read nor written.
+"""
+import os, re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.join(ROOT, 'build', 'dither')
+IMG = os.path.join(ROOT, 'examples', 'm039crop.png')
+
+fails = []
+
+
+def check(name, ok, detail=''):
+    if ok:
+        print(f"  ok   {name}")
+    else:
+        fails.append(name)
+        print(f"  FAIL {name}" + (f": {detail}" if detail else ''))
+
+
+def run(args, env):
+    return subprocess.run([DITHER] + args, capture_output=True, text=True, env=env)
+
+
+def main():
+    if not os.path.exists(DITHER):
+        print("samplecheck: build/dither is missing; run `build` first")
+        return 1
+    import cv2, numpy as np
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, XDG_CONFIG_HOME=tmp)
+        # Three small scans of real grain, cut here rather than kept: what is
+        # under test is resolution, and 256 px keeps every build in it cheap.
+        src = os.path.join(tmp, 'src')
+        os.makedirs(src)
+        crops = []
+        for name in ('Kodak-2484-1.png', 'Kodak-4X-1.png', 'Kodak-4X-2.png'):
+            im = cv2.imread(os.path.join(ROOT, 'examples', name), cv2.IMREAD_GRAYSCALE)
+            if im is None:
+                print(f"samplecheck: cannot read examples/{name}")
+                return 1
+            crops.append(name)
+            cv2.imwrite(os.path.join(src, name), im[32:288, 32:288])
+        film = os.path.join(tmp, 'dither', 'samples', 'Test-Film')
+        other = os.path.join(tmp, 'dither', 'samples', 'Test-Other')
+        os.makedirs(film)
+        os.makedirs(other)
+        for c in crops[:2]:
+            shutil.copy(os.path.join(src, c), film)
+        shutil.copy(os.path.join(src, crops[2]), other)
+
+        # --- the library lists what is in it, and nothing else
+        names = run(['--list-samples'], env).stdout.split()
+        check("--list-samples offers exactly the films present",
+              names == ['Test-Film', 'Test-Other'], str(names))
+
+        # dft rather than inpaint throughout. What these assert is how
+        # --mask-sample *resolves* -- how many scans a name reaches and what
+        # the run says it did with them -- which samples.cpp decides and every
+        # combining generator reports alike. inpaint is twenty-one times the
+        # cost at this size (3.0s against 0.14s) and was answering a question
+        # nobody asked here; its own multi-scan behaviour is pinned by
+        # unittest's "a set-valued transformation keeps the scans' relative
+        # contrast", which is where that belongs.
+        #
+        # --- a bare name resolves to every scan under it
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', 'Test-Film', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("a film name takes all of its scans",
+              '2 scans,' in r.stderr and 'each used whole' in r.stderr,
+              r.stderr.strip()[-200:])
+
+        # --- scans of unequal width keep essentially all of their content.
+        # Cropping every scan to the narrowest threw away 52% of Kodak-4X and
+        # 80% of Kodak-2484 -- a portrait frame pulled the common width down and
+        # the landscape ones lost most of their columns. Each scan is now cut
+        # into round(W/C) bands instead, so the composite carries close to the
+        # whole set. Checked as area, which is the quantity that was being lost;
+        # the bound is deliberately loose because the exact figure depends on
+        # how the widths happen to divide.
+        wide = os.path.join(tmp, 'dither', 'samples', 'Test-Wide')
+        os.makedirs(wide)
+        rng = np.random.default_rng(7)
+        want = 0
+        for i, (w, h) in enumerate(((240, 400), (1000, 400))):
+            cv2.imwrite(os.path.join(wide, f's{i}.png'),
+                        rng.integers(0, 256, (h, w), dtype=np.uint8))
+            want += w * h
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', 'Test-Wide', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        m = re.search(r'each used whole \((\d+) px\)', r.stderr)
+        got = int(m.group(1)) if m else 0
+        check("unequal widths keep every pixel, not a crop of each",
+              got == want,
+              f"{got} px of {want}; a crop to the narrowest would give {240*800}")
+
+        # --- a single file inside it is still a single file
+        one = os.path.join(film, crops[0])
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', one, '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("a file path is used alone", 'samples combined' not in r.stderr)
+
+        # --- direct cannot combine and must say so rather than stacking
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'direct',
+                 '--mask-sample', 'Test-Film', '--mask-size', '256x256',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        # It must also *say* so: a run that quietly used one of four scans is
+        # the shape of a silently dropped option.
+        check("direct takes one scan, and says which",
+              'using the largest' in r.stderr, r.stderr.strip()[-200:])
+        check("a film with no crop says where one would go",
+              'no crop for Test-Film' in r.stderr, r.stderr.strip()[-200:])
+
+        # --- a film's crop is what direct and dft take, and the others do not
+        cropdir = os.path.join(tmp, 'dither', 'crops')
+        os.makedirs(cropdir)
+        shutil.copy(os.path.join(src, crops[2]), os.path.join(cropdir, 'Test-Film.png'))
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'direct',
+                 '--mask-sample', 'Test-Film', '--mask-size', '128x128',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("direct takes the film's crop rather than a scan",
+              "uses the film's crop" in r.stderr and 'using the largest' not in r.stderr,
+              r.stderr.strip()[-200:])
+        # dft imposes the sample's whole spectrum, so a scan's oriented edges
+        # come back as streaks; it takes the window chosen to hold only grain.
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', 'Test-Film', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("dft takes the film's crop rather than its scans",
+              "uses the film's crop" in r.stderr and '2 scans,' not in r.stderr,
+              r.stderr.strip()[-200:])
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'markov',
+                 '--mask-sample', 'Test-Film', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("markov and inpaint still pool the scans, not the crop",
+              '2 scans,' in r.stderr and "film's crop" not in r.stderr,
+              r.stderr.strip()[-200:])
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'direct',
+                 '--mask-sample', one, '--mask-size', '128x128',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("a path is used as given even when its film has a crop",
+              "film's crop" not in r.stderr, r.stderr.strip()[-200:])
+
+        # The key must hash the crop, since that is what the mask is made of:
+        # hashing the scans instead would serve the old crop's mask after the
+        # crop changed, which is a wrong hit rather than a miss.
+        def direct_of(tag):
+            out = os.path.join(tmp, f'd-{tag}.png')
+            run([IMG, '--threshold', 'mask', '--mask-method', 'direct',
+                 '--mask-sample', 'Test-Film', '--mask-size', '128x128',
+                 '--mask-out', out, '--out', os.path.join(tmp, 'o.png')], env)
+            return open(out, 'rb').read() if os.path.exists(out) else b''
+        first = direct_of('a')
+        check("a repeat of the same crop is served from the cache",
+              first != b'' and direct_of('b') == first)
+        shutil.copy(os.path.join(src, crops[1]), os.path.join(cropdir, 'Test-Film.png'))
+        check("changing the crop changes the mask, so the key saw it",
+              direct_of('c') not in (first, b''))
+        os.remove(os.path.join(cropdir, 'Test-Film.png'))
+
+        # --- the cache key covers every file behind the name, not just the first.
+        # A mask served from a stack of two when the name now means three is the
+        # cache's worst failure: a wrong hit rather than a miss.
+        # Cached, so these runs go through the key rather than round it.
+        def mask_of(tag):
+            out = os.path.join(tmp, f'm-{tag}.png')
+            run([IMG, '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', 'Test-Film', '--mask-size', '64x64',
+                 '--mask-out', out, '--out', os.path.join(tmp, 'o.png')], env)
+            return open(out, 'rb').read() if os.path.exists(out) else b''
+        two_a = mask_of('two-a')
+        two_b = mask_of('two-b')
+        check("a repeat of the same film is served from the cache",
+              two_a == two_b and two_a != b'')
+        shutil.copy(os.path.join(src, crops[2]), film)
+        three = mask_of('three')
+        check("adding a scan changes the mask, so the key saw it",
+              three != two_a and three != b'')
+        os.remove(os.path.join(film, crops[2]))
+        check("removing it again returns the first mask", mask_of('two-c') == two_a)
+        shutil.copy(os.path.join(src, crops[2]), film)
+
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', 'Test-Film', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("adding a scan changes what the name means",
+              '3 scans,' in r.stderr, r.stderr.strip()[-200:])
+
+        # --- an unknown name refuses and says what is available
+        r = run([IMG, '--no-config', '--threshold', 'mask', '--mask-method', 'dft',
+                 '--mask-sample', 'Test-Nope', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("an unknown film is refused, naming the ones that exist",
+              'Test-Film' in r.stderr and 'Could not read sample' in r.stderr,
+              r.stderr.strip()[-200:])
+
+        # --- a generator that imitates a sample, named without one, takes the
+        # default film when it is installed and refuses when it is not. The
+        # film is cut small, so what is tested is the choice and not the build.
+        r = run([IMG, '--no-config', '--mask-method', 'dft', '--mask-size', '64x64',
+                 '--out', os.path.join(tmp, 'o.png')], env)
+        check("with no default film installed, a missing sample is refused",
+              r.returncode != 0 and 'install_dither' in r.stderr,
+              r.stderr.strip()[-200:])
+        with tempfile.TemporaryDirectory() as dtmp:
+            denv = dict(os.environ, XDG_CONFIG_HOME=dtmp)
+            dfilm = os.path.join(dtmp, 'dither', 'samples', 'Kodak-4X')
+            os.makedirs(dfilm)
+            os.makedirs(os.path.join(dtmp, 'dither', 'crops'))
+            for c in crops[1:]:
+                shutil.copy(os.path.join(src, c), dfilm)
+            shutil.copy(os.path.join(src, crops[1]),
+                        os.path.join(dtmp, 'dither', 'crops', 'Kodak-4X.png'))
+
+            def out_of(tag, args):
+                out = os.path.join(dtmp, f'{tag}.png')
+                r = run([IMG, '--no-config', '--out', out] + args, denv)
+                return r, open(out, 'rb').read() if os.path.exists(out) else b''
+            # direct takes the film's crop and clamps its size to it, and dft
+            # pools the scans: the two paths that read the sample's files.
+            for m, size in (('direct', '128x128'), ('dft', '64x64')):
+                r, implied = out_of(f'i-{m}', ['--mask-method', m, '--mask-size', size])
+                _, named = out_of(f'n-{m}', ['--mask-method', m, '--mask-size', size,
+                                             '--mask-sample', 'Kodak-4X'])
+                check(f"{m} with no sample takes the default film, and says so",
+                      'mask.sample=Kodak-4X' in r.stderr, r.stderr.strip()[-200:])
+                check(f"{m}'s implied film is byte-identical to naming it",
+                      implied != b'' and implied == named)
+            r, _ = out_of('i-temp', ['--set', 'markov.temp=0.3', '--mask-size', '64x64'])
+            check("a markov parameter alone implies markov and then the film",
+                  'mask.method=markov' in r.stderr and 'mask.sample=Kodak-4X' in r.stderr,
+                  r.stderr.strip()[-200:])
+            # Calibration reads the sample as the build does and scores against
+            # the film's crop: dft's once calibrated on every scan and built
+            # from the crop, and a scan's middle is a photograph.
+            for m, extra in (('dft', []),
+                             ('markov', ['--markov-weights', 'flat', '--markov-radius', '3'])):
+                r, _ = out_of(f'cal-{m}', ['--mask-method', m, '--mask-sample', 'Kodak-4X',
+                                           '--mask-calibrate', '--mask-size', '64x64'] + extra)
+                check(f"{m}'s calibration is scored against the film's crop",
+                      "calibrating against the film's crop" in r.stderr,
+                      r.stderr.strip()[-200:])
+            # mask.method's own rule must never see the film: a sample there
+            # turns blue into dft.
+            r, _ = out_of('i-blue', ['--threshold', 'mask', '--mask-size', '64x64'])
+            check("a bare --threshold mask still builds blue noise",
+                  'mask-method=blue' in r.stdout + r.stderr and 'Kodak-4X' not in r.stderr,
+                  r.stderr.strip()[-200:])
+
+        # --- the completion offers exactly that list, by asking the program
+        script = os.path.join(ROOT, 'completion', 'dither')
+        drive = (f'source {script}\n'
+                 f'COMP_WORDS=(dither --mask-sample ""); COMP_CWORD=2\n'
+                 f'COMPREPLY=(); _dither\n'
+                 f'printf "%s\\n" "${{COMPREPLY[@]}}"\n')
+        got = subprocess.run(['bash', '-c', drive], capture_output=True, text=True,
+                             env=dict(env, PATH=os.path.join(ROOT, 'build') + os.pathsep
+                                      + env.get('PATH', ''))).stdout.split()
+        offered = [g for g in got if g.startswith('Test-')]
+        have = run(['--list-samples'], env).stdout.split()
+        check("completion offers exactly what --list-samples does",
+              offered == have, f"offered {offered} against {have}")
+
+        # --- and the script states no option list of its own
+        text = open(script).read()
+        check("completion restates no option list",
+              '--list-options' in text and '--list-samples' in text
+              and '--mask-highpass' not in text)
+
+        # **Every offered flag must be one the parser takes.** Checking the
+        # spelling is not enough -- the previous version of this passed while
+        # maketexture offered flags it then refused. So each is actually run,
+        # and the only thing asserted is that the parser does not disown it.
+        def offers(prog):
+            exe = os.path.join(ROOT, 'build', prog)
+            if not os.path.exists(exe):
+                return exe, []
+            return exe, subprocess.run([exe, '--list-options'], capture_output=True,
+                                       text=True, env=env).stdout.split()
+
+        exe, offered = offers('dither')
+        check("dither --list-options offers only flags",
+              all(f.startswith('--') for f in offered))
+        check("dither offers the generator ceilings, which --help cannot show",
+              any(f.endswith('-max-size') for f in offered))
+
+        exe, offered = offers('maketexture')
+        check("maketexture --list-options offers only flags",
+              all(f.startswith('--') for f in offered))
+        # The ceilings drive dither's automatic sizing; this tool is told its
+        # size and never reads them, so offering them would be a false promise.
+        check("maketexture does not offer dither's sizing policy",
+              not any(f.endswith(('-max-size', '-max-repeats')) for f in offered))
+        check("maketexture offers no blue or direct parameters",
+              not any(f.startswith(('--blue-', '--direct-')) for f in offered))
+
+        if offered:
+            disowned = []
+            for f in offered:
+                if f in ('--help', '--list-options'):
+                    continue
+                r = subprocess.run([exe, os.path.join(src, crops[0]), '--size', '8x8',
+                                    f, '1', '--out', os.path.join(tmp, 'o.png')],
+                                   capture_output=True, text=True, env=env)
+                if 'Unknown option' in r.stderr or 'is a dither option' in r.stderr:
+                    disowned.append(f)
+            check("every flag maketexture offers, maketexture accepts",
+                  not disowned, str(disowned[:5]))
+
+    print(f"  {'FAIL' if fails else 'ok'}  {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

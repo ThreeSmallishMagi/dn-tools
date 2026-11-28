@@ -1,0 +1,25 @@
+# The shipped film samples, for `install_samples` in ../aliases and for
+# test/findcrops. Tab separated, one row per scan:
+#
+#   film  scan  [x  y  side  search]
+#
+# Every scan is copied whole into ~/.config/dither/samples/<film>/, where
+# --mask-sample <film> pools them for dft, markov and inpaint. The window
+# columns are filled on exactly one row per film: that scan's window is cut
+# into ~/.config/dither/crops/<film>.png, the tile --mask-method direct takes.
+# `search` says which of findcrops' searches chose it, and `#N` that it is
+# that search's Nth window, picked by eye from its --top list; the README says why.
+Ilford-Delta3200	EOS3-Delta3200-088b.jpg	3968	832	768	equalise
+Kodak-2484	Kodak-2484-1.png
+Kodak-2484	Mamiya-2484-154.jpg	1600	992	2048	equalise#5
+Kodak-4X	AutoRex-4X-449c.jpg	32	32	1024	equalise
+Kodak-4X	DemiEE17-4X-316a.jpg
+Kodak-4X	DemiEE17-4X-319d.jpg
+Kodak-4X	Kodak-4X-1.png
+Kodak-4X	Kodak-4X-2.png
+Kodak-OldTriX	X570-TriX80-273a.jpg
+Kodak-OldTriX	X570-TriX80-274a.jpg	4928	1888	1024	equalise
+Kodak-OldTriX	X570-TriX80-278a.jpg
+Kodak-PanatomicX	EOS3-PanatomicX-134a.jpg	1504	1856	1024	drift
+Kodak-TriX	X570-Tri-X-017.jpg
+Kodak-TriX	X570-Tri-X-032a.jpg	4384	32	1024	equalise

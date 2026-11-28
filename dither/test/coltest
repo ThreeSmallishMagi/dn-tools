@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Run dither with a matrix of options and check density preservation of each.
+
+  coltest [reference] [dither_binary]
+
+Defaults: reference=../examples/ramp_256x256.png, binary=../build/dither.
+A "PASS" means every column's linear-light mean matches the reference column's
+linear-light mean within 3σ of counting noise.
+
+Each configuration is checked at every group size in GROUPS. Grouping pools
+adjacent columns, so the standard error falls by √group and a small bias applied
+everywhere stops hiding in per-column noise — see colstats --group. A row is
+identified by its configuration *and* its group, because the two ask genuinely
+different questions and a configuration can legitimately pass one and fail the
+other.
+"""
+import concurrent.futures, os, sys, subprocess, tempfile
+
+add_full=False
+if '--full' in sys.argv:
+    add_full=True
+    sys.argv.remove('--full')
+
+HERE     = os.path.dirname(os.path.abspath(__file__))
+ROOT     = os.path.dirname(HERE)          # the repo, one level up from test/
+COLSTATS = os.path.join(HERE, 'colstats')
+REF      = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
+                           else os.path.join(ROOT, 'examples', 'ramp_256x256.png'))
+DITHER   = os.path.abspath(sys.argv[2] if len(sys.argv) > 2
+                           else os.path.join(ROOT, 'build', 'dither'))
+
+
+if not os.path.isfile(REF):    sys.exit(f"reference not found: {REF}")
+if not os.path.isfile(DITHER): sys.exit(f"dither binary not found: {DITHER}")
+
+# Each test: (label, dither args). The first entry is an identity sanity check
+# that bypasses dither (uses the reference itself as "output") to verify the
+# test harness reports PASS on a known-good comparison.
+tests = [
+    ('identity sanity check',              None),
+    ('round   defaults (spatial=1)',       []),
+
+    ('random  spatial=0',                  ['--threshold', 'random', '--spatial', '0']),
+    ('random  spatial=0 lin',              ['--threshold', 'random', '--spatial', '0', '--linear']),
+    ('random  levels=8 spatial=0',         ['--threshold', 'random', '--levels', '8', '--spatial', '0']),
+    ('random  levels=8 spatial=0 lin',     ['--threshold', 'random', '--levels', '8', '--spatial', '0', '--linear']),
+    ('random  levels=4 frames=8 spatial=0.5', ['--threshold', 'random', '--frames', '8', '--levels', '4', '--spatial', '0.5']),
+    ('random  frames=16 spatial=0',        ['--threshold', 'random', '--frames', '16', '--spatial', '0']),
+    ('random  frames=64 spatial=0',        ['--threshold', 'random', '--frames', '64', '--spatial', '0']),
+    ('random  frames=128 spatial=0',       ['--threshold', 'random', '--frames', '128', '--spatial', '0']),
+    ('random  spatial=1',                  ['--threshold', 'random', '--spatial', '1']),
+    ('random  frames=16 spatial=1',        ['--threshold', 'random', '--frames', '16', '--spatial', '1']),
+    ('random  frames=16 spatial=0.5',      ['--threshold', 'random', '--frames', '16', '--spatial', '0.5']),
+    ('random  frames=128 spatial=0.1',     ['--threshold', 'random', '--frames', '128', '--spatial', '0.1']),
+
+    ('round   spatial=0',                  ['--threshold', 'round', '--spatial', '0']),
+    ('round   levels=16 spatial=0',        ['--threshold', 'round', '--levels', '16', '--spatial', '0']),
+    ('round   levels=16 spatial=0 lin',    ['--threshold', 'round', '--levels', '16', '--spatial', '0', '--linear']),
+    ('round   frames=64 spatial=0',        ['--threshold', 'round', '--frames', '64', '--spatial', '0']),
+    ('round   spatial=1 lin',              ['--threshold', 'round', '--spatial', '1', '--linear']),
+    ('round   frames=16 spatial=1',        ['--threshold', 'round', '--frames', '16', '--spatial', '1']),
+    ('round   frames=16 spatial=0.5',      ['--threshold', 'round', '--frames', '16', '--spatial', '0.5']),
+    ('round   levels=4 spatial=1',         ['--threshold', 'round', '--levels', '4', '--spatial', '1']),
+    ('round   levels=8 frames=4 spatial=1',['--threshold', 'round', '--levels', '8', '--frames', '4', '--spatial', '1']),
+
+    ('mask    spatial=0',                  ['--threshold', 'mask', '--spatial', '0']),
+    ('mask    levels=4 frames=8 spatial=0.5',['--threshold', 'mask', '--frames', '8', '--levels', '4', '--spatial', '0.5']),
+    ('mask    frames=16 spatial=0',        ['--threshold', 'mask', '--frames', '16', '--spatial', '0']),
+    ('mask    frames=128 spatial=0',       ['--threshold', 'mask', '--frames', '128', '--spatial', '0']),
+    ('mask    mask=32x32 spatial=0',       ['--threshold', 'mask', '--mask-size', '32x32', '--spatial', '0']),
+    ('mask    mask=128x128 spatial=0',     ['--threshold', 'mask', '--mask-size', '128x128', '--spatial', '0']),
+    ('mask    seed=7 sigma=2.5 spatial=0', ['--threshold', 'mask', '--seed', '7', '--blue-sigma', '2.5', '--spatial', '0']),
+
+    # Partial diffusion was entirely absent from this matrix, which is how a
+    # tone shift at --spatial 0.5 reached a release: the mask threshold is a
+    # fixed function of position, so it correlates with the error field feeding
+    # back into it, and only intermediate strengths expose that. 0 and 1 are
+    # both clean and neither would have shown it.
+    ('mask    spatial=0.5',                ['--threshold', 'mask', '--spatial', '0.5']),
+    ('mask    spatial=0.9',                ['--threshold', 'mask', '--spatial', '0.9']),
+    ('mask    spatial=1',                  ['--threshold', 'mask', '--spatial', '1']),
+    ('mask    frames=8 spatial=0.5',       ['--threshold', 'mask', '--frames', '8', '--spatial', '0.5']),
+    ('random  spatial=0.5',                ['--threshold', 'random', '--spatial', '0.5']),
+    ('round   spatial=0.5',                ['--threshold', 'round', '--spatial', '0.5']),
+    # `blue` is the old name for `mask`, still accepted; this pins that promise.
+    ('blue    alias spatial=0',            ['--threshold', 'blue', '--spatial', '0']),
+    #('dft     supersample=2',              ['--mask-method', 'dft', '--mask-sample', '../examples/Kodak-4X-1.png', '--supersample', '2']),
+    #('markov  supersample=2',              ['--mask-method', 'markov', '--mask-sample', '~/agent/claude1/cpp/opencv/examples/Kodak-4X-1.png', '--supersample', '2']),
+    #('inpaint supersample=2',              ['--mask-method', 'inpaint', '--mask-sample', 'examples/Kodak-4X-1.png', '--supersample', '2']),
+]
+
+thresholds = ['random', 'round', 'mask']
+frame_counts = ['1', '16', '128']
+levels =   ['2', '8' ]
+spatials = ['0', '0.1', '0.5', '1']
+linears =  [True, False]
+
+def add_full_tests():
+    for threshold in thresholds:
+        for frames in frame_counts:
+            for level in levels:
+                for spatial in spatials:
+                    for linear in linears:
+                        args=['--threshold', threshold, '--frames', frames, '--levels', level, '--spatial', spatial ]
+                        if linear: args.append('--linear')
+                        tests.append((f"{threshold} frames={frames} lvl={level} spatial={spatial} lin={linear}",args))
+
+if add_full:
+    add_full_tests()
+
+def label_key(label):
+    return ' '.join(label.split())
+
+# Column groups each configuration is checked at. 1 is the per-column test; a
+# larger group pools columns and so tests for systematic bias instead.
+GROUPS = (1, 16, 32)
+
+# (configuration, group) -> most failing groups tolerated. An allowance is a
+# statement that the configuration cannot preserve density for a known reason,
+# not a way to quieten a result that has not been explained.
+expected_failure = {
+    # round with no diffusion is not density-preserving at all: it is a hard
+    # threshold, so a flat area either rounds entirely up or entirely down.
+    (label_key('round   spatial=0'), 1):           200,
+    (label_key('round   spatial=0'), 16):           16,
+    (label_key('round   spatial=0'), 32):            8,
+    # Same cause at 16 levels: srgb-spaced rungs are widest in linear light near
+    # white (lin(255)-lin(238) is ~2x a uniform step), so the undiffused rounding
+    # residual there is bigger. Passes cleanly once --spatial is on.
+    (label_key('round   levels=16 spatial=0'), 1):   7,
+    (label_key('round   levels=16 spatial=0'), 16):  1,
+    # A 32x32 mask holds 1024 pixels for 255 threshold values, so its histogram
+    # is coarse and its level sets are lumpy.
+    (label_key('mask    mask=32x32 spatial=0'), 1): 19,
+    (label_key('mask    mask=128x128 spatial=0'), 1): 4,
+    # An unlucky draw at the default seed rather than a bias: around 33% density
+    # the fixed seed happens to put z at 3.1-3.2. Checked at seeds 1-5, where the
+    # same test reads 1.0 to 2.5 and passes at every group.
+    (label_key('random  spatial=0 lin'), 1):         1,
+    (label_key('random  spatial=0 lin'), 16):        1,
+    (label_key('random  frames=16 spatial=1'), 1):   1,
+    # The darkest 16 columns come out empty: 2.31/1000 linear short, while the
+    # image as a whole reads +0.13/1000 because the rest rounds up by +0.29.
+    #
+    # This used to be explained as the goal pass diffusing and exporting the
+    # dark band's debt inward. It does not diffuse. The goal pass takes the same
+    # spatial_fn as the per-frame passes and only pins its *scale* at 1, so with
+    # --spatial 0 that function is spatial_none and nothing diffuses anywhere.
+    # The goal is then round(target*frames) per pixel independently -- it
+    # reproduces the output on 100% of pixels -- and every pixel below
+    # 1/(2*frames) of a level shows black. At 64 frames that boundary falls at
+    # column 21, which is the whole of this band and 6 columns of the next, and
+    # that is exactly what the level counts show. It is the hard-threshold
+    # cause of the `round spatial=0` entry above, at budget granularity.
+    # --spatial 1 removes it (worst z 0.45). Grouping is
+    # what made it visible; per column it hides under counting noise.
+    (label_key('round   frames=64 spatial=0'), 16):  1,
+    # `round` is a deterministic threshold, so with partial diffusion it worms
+    # rather than dithers: neighbouring columns swing tens of parts per thousand
+    # against each other and cancel. At group 1 only column 228 exceeds 3 sigma
+    # (z = 3.3, -96/1000 linear against +76 next door at 229), and the image as
+    # a whole is -0.65/1000. --spatial 1 worms too -- columns 230/231 read
+    # -65/+52 -- but no single column reaches the threshold there.
+    (label_key('round   spatial=0.5'), 1):           1,
+}
+
+# The --full matrix reaches the same not-density-preserving corners as the
+# named tests above, under its own labels, and nothing marked them. All 19 are
+# `round` with no or little diffusion, or `random` tripping the 3-sigma line by
+# chance; none is a defect. Merged only under --full so a plain run still
+# validates its keys strictly.
+expected_failure_full = {
+    # `round` with --spatial 0 is a hard threshold, so a flat area rounds
+    # entirely one way: the same cause as the named `round spatial=0` entry,
+    # which allows 200/16/8 -- and lin=False here *is* that configuration and
+    # reads exactly those numbers. --linear is worse at group 1 (238) because
+    # the ramp is uniform in light, so more of it sits in the half-step that
+    # rounds to black.
+    ('round frames=1 lvl=2 spatial=0 lin=True',   1): 238,
+    ('round frames=1 lvl=2 spatial=0 lin=True',  16):  16,
+    ('round frames=1 lvl=2 spatial=0 lin=True',  32):   8,
+    ('round frames=1 lvl=2 spatial=0 lin=False',  1): 200,
+    ('round frames=1 lvl=2 spatial=0 lin=False', 16):  16,
+    ('round frames=1 lvl=2 spatial=0 lin=False', 32):   8,
+    # Same threshold, 8 levels: the step is smaller so the residual is, and the
+    # count falls with the level count -- 200 at 2 levels, 31 here, 7 at 16 in
+    # the named entry above. Whole-image tone is -1.66/1000 (lin +1.10), so the
+    # light is displaced rather than lost.
+    ('round frames=1 lvl=8 spatial=0 lin=True',   1):  28,
+    ('round frames=1 lvl=8 spatial=0 lin=True',  16):   6,
+    ('round frames=1 lvl=8 spatial=0 lin=False',  1):  31,
+    ('round frames=1 lvl=8 spatial=0 lin=False', 16):   8,
+    # Multi-frame is the same hard threshold at budget granularity. With
+    # --spatial 0 main() passes spatial_none, so *nothing* diffuses -- not the
+    # per-frame passes and not the goal pass either, since it takes the same
+    # spatial_fn and only the scale is pinned at 1. The goal is therefore
+    # round(target*frames) per pixel independently, which matches the output on
+    # 100% of pixels, and every pixel under 1/(2*frames) of a level shows black:
+    # columns 0-49 at 16 frames and 0-21 at 64, both exactly where that formula
+    # puts the boundary. lin=True does not fail because a linear ramp puts only
+    # 8 columns under that line where sRGB puts 49.
+    ('round frames=16 lvl=2 spatial=0 lin=False', 16):  4,
+    ('round frames=16 lvl=2 spatial=0 lin=False', 32):  1,
+    # Partial diffusion: `round` worms rather than dithers, neighbouring columns
+    # swinging against each other and cancelling. Grouping sees the swing before
+    # it cancels. The named `round spatial=0.5` entry is the same effect one
+    # step further on, and the whole image holds to -3.66/1000 (lin -0.12).
+    ('round frames=1 lvl=2 spatial=0.1 lin=True',  16): 2,
+    ('round frames=1 lvl=2 spatial=0.1 lin=True',  32): 2,
+    ('round frames=1 lvl=2 spatial=0.1 lin=False', 16): 4,
+    ('round frames=1 lvl=2 spatial=0.1 lin=False', 32): 3,
+    ('round frames=1 lvl=2 spatial=0.5 lin=False',  1): 1,
+    # `random` is stochastic and these are false positives, not bias: 256
+    # columns tested at 3 sigma expect about 0.7 of them per run. Across seeds
+    # 42 and 1-5 the group-1 row fails 3 times of 6 with worst z 2.74 to 3.49,
+    # and the group-16 row only at seed 42 (3.07, against 1.03 to 2.53
+    # elsewhere) -- hovering on the line rather than sitting past it.
+    ('random frames=1 lvl=2 spatial=0 lin=True',   16): 1,
+    ('random frames=1 lvl=2 spatial=0.1 lin=True',  1): 1,
+}
+if add_full:
+    expected_failure.update({(label_key(k), g): v
+                             for (k, g), v in expected_failure_full.items()})
+
+known = {label_key(label) for label, _ in tests}
+unknown = sorted(f"{lbl!r} g{g}" for lbl, g in expected_failure
+                 if lbl not in known or g not in GROUPS)
+if unknown:
+    sys.exit("expected_failure references unknown test/group: " + ', '.join(unknown))
+
+def colstats(target, linear, group):
+    """Run colstats on `target` and return its RESULT trailer as a dict, or {}."""
+    cmd = [COLSTATS, target, REF]
+    if linear:      cmd += ['--linear']       # match the decode dither emitted
+    if group > 1:   cmd += ['--group', str(group)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    for line in reversed(r.stdout.splitlines()):
+        if line.startswith('RESULT '):
+            return dict(kv.split('=', 1) for kv in line[len('RESULT '):].split())
+    return {}
+
+
+def dither(args, out_path, work):
+    """Run dither; return True on success. Side files are opt-in, and the cwd is
+    a temp dir, so nothing it writes can pollute the repo."""
+    r = subprocess.run([DITHER, REF, *args, '--out', out_path],
+                       cwd=work, capture_output=True, text=True)
+    return r.returncode == 0
+
+print(f"ref={REF}\ndither={DITHER}\ncolstats={COLSTATS}\n")
+print(f"{'test':<44} {'group':>5} {'worst |z|':>10} {'avg |z|':>10} {'fails':>6}  result")
+print('-' * 87)
+
+overall_ok = True
+totals = {g: [0.0, 0.0, 0] for g in GROUPS}      # per group: worst z, avg z, fails
+
+def measure(job):
+    """One row: dither once, then colstats at every group size. Returns the
+       printed lines and whether the row was clean, so the matrix prints in its
+       own order however the rows finish.
+
+    Each row gets its own output path, which is what kept this serial. The rows
+    are otherwise independent -- they share only the reference, which nothing
+    writes."""
+    slot, label, args, work = job
+    out_path = os.path.join(work, f'out{slot}.png')
+    # args is None for the identity sanity check, which compares the reference
+    # against itself to prove the harness passes a known-good case.
+    target = REF
+    if args is not None:
+        if not dither(args, out_path, work):
+            return [(f"{label:<44} {'-':>5} {'-':>10} {'-':>10} {'-':>6}  DITHER ERROR",
+                     False, None)]
+        target = out_path
+
+    rows = []
+    for group in GROUPS:
+        info = colstats(target, args and '--linear' in args, group)
+        if not info:
+            rows.append((f"{label:<44} {group:>5} {'?':>10} {'?':>10} {'?':>6}  "
+                         f"COLSTATS PARSE FAIL", False, None))
+            continue
+
+        fails = int(info['fails'])
+        worst, avg = float(info['worst_z']), float(info['average_abs_z'])
+        allowed = expected_failure.get((label_key(label), group))
+        if info['verdict'] == 'PASS':
+            result = 'PASS'
+        elif allowed is not None and fails <= allowed:
+            result = f"EXPECTED <= {allowed}"
+        else:
+            result = info['verdict']
+        rows.append((f"{label:<44} {group:>5} {worst:>10.3f} {avg:>10.3f} {fails:>6}  {result}",
+                     result != info['verdict'] or info['verdict'] == 'PASS',
+                     # Totals cover only the configurations expected to be
+                     # clean, so a documented allowance cannot flatter or
+                     # spoil them.
+                     None if allowed is not None else (group, worst, avg, fails)))
+    return rows
+
+
+with tempfile.TemporaryDirectory(prefix='coltest.') as work:
+    jobs = [(i, label, args, work) for i, (label, args) in enumerate(tests)]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, os.cpu_count() or 4)) as pool:
+        done = dict(zip(range(len(jobs)), pool.map(measure, jobs)))
+    for i in range(len(jobs)):
+        for line, ok, total in done[i]:
+            print(line)
+            if not ok:
+                overall_ok = False
+            if total:
+                group, worst, avg, fails = total
+                t = totals[group]
+                t[0] += worst; t[1] += avg; t[2] += fails
+
+print('-' * 87)
+for group in GROUPS:
+    worst, avg, fails = totals[group]
+    print(f"{'Totals over clean tests':<44} {group:>5} {worst:>10.2f} {avg:>10.2f} {fails:>6}")
+print(f"OVERALL {'PASS' if overall_ok else 'FAIL'}")
+sys.exit(0 if overall_ok else 1)

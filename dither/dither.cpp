@@ -1,463 +1,284 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
+// The pipeline, and nothing else: decode the input onto the level ladder, hand
+// it to the engine, encode what comes back. Everything it calls lives in
+// engine.cpp (the dither), cli.cpp (the command line), mask.cpp (mask policy)
+// or generators.cpp (the generators themselves).
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <string>
 #include <vector>
 #include <opencv2/opencv.hpp>
-#include "bluenoise.h"
+#include "app.h"
+#include "cli.h"
+#include "engine.h"
+#include "generators.h"
+#include "mask.h"
+#include "samples.h"
+#include "maskparams.h"
+#include "generators.h"
+#include "options.h"
 #include "srgb.h"
 
-std::mt19937 rng;
-
-// ===========================================================================
-// The dither functions pick a level from a value in "display units", [0, levels-1]
-// on the ladder. The residual is carried forward (across pixels by diffusion,
-// across frames by the budget) in linear light; see Space.
-// ===========================================================================
-
-// `dir` is +1 for left-to-right scans, -1 for right-to-left (serpentine).
-using SpatialFn = void (*)(int row, int col, int dir, cv::Mat& spatial_err, float value);
-
-// Pick a display level given the accumulated display value at (row, col).
-// `new_frame()` is called at the top of each output frame; thresholds with
-// per-frame state (blue noise) override it, others ignore.
-class DitherFn {
-public:
-    virtual ~DitherFn() = default;
-    virtual int operator()(double v, int row, int col) = 0;
-    virtual void new_frame() {}
-};
-
-class RoundDither : public DitherFn {
-public:
-    int operator()(double v, int /*row*/, int /*col*/) override {
-        return (int)std::lround(v);
-    }
-};
-
-class RandomDither : public DitherFn {
-public:
-    int operator()(double v, int /*row*/, int /*col*/) override {
-        int lo = (int)std::floor(v);
-        float frac = v - lo;
-        return lo + (frac > dist(rng) ? 1 : 0);
-    }
-private:
-    std::uniform_real_distribution<float> dist{0.0f, 1.0f};
-};
-
-// Blue-noise dither: threshold frac(v) against a precomputed mask value with
-// per-frame toroidal (sx, sy) offsets drawn in new_frame(). A cell holding t is
-// the rank at quantile t/254, so frac*254 > t fires with probability frac.
-class BlueDither : public DitherFn {
-public:
-    explicit BlueDither(cv::Mat m) : mask(std::move(m)) {}
-    int operator()(double v, int row, int col) override {
-        int lo = (int)std::floor(v);
-        float frac = v - lo;
-        uint8_t thr = mask.at<uint8_t>((row + sy) % mask.rows, (col + sx) % mask.cols);
-        return frac * 254.0f > thr ? lo + 1 : lo;
-    }
-    void new_frame() override {
-        sx = std::uniform_int_distribution<int>(0, mask.cols - 1)(rng);
-        sy = std::uniform_int_distribution<int>(0, mask.rows - 1)(rng);
-    }
-private:
-    cv::Mat mask;
-    int sx = 0, sy = 0;
-};
-
-static void spatial_none(int /*row*/, int /*col*/, int /*dir*/,
-                         cv::Mat& /*spatial_err*/, float /*value*/) { }
-
-// Floyd-Steinberg diffusion, serpentine-aware. On the current row the "next"
-// pixel we haven't visited yet is (row, col+dir); the "previous" is col-dir.
-// Weights are renormalised over the columns inside the image, so no error is
-// lost at a row end.
-static void spatial_floydsteinberg(int row, int col, int dir,
-                                   cv::Mat& spatial_err, float value)
+// The input in display units: [0, levels-1] on the chosen level ladder, and
+// enlarged first if --supersample asked for it.
+static cv::Mat prepare_target(const cv::Mat& image, const vision::LevelSet& ladder,
+                              const Options& opt)
 {
-    const int W = spatial_err.cols, H = spatial_err.rows;
-    struct Tap { int r, c; float w; };
-    const Tap taps[4] = {{row, col + dir, 7.0f / 16}, {row + 1, col - dir, 3.0f / 16},
-                         {row + 1, col, 5.0f / 16},   {row + 1, col + dir, 1.0f / 16}};
-    float total = 0;
-    for (const Tap& t : taps)
-        if (0 <= t.c && t.c < W) total += t.w;
-    for (const Tap& t : taps)
-        if (t.r < H && 0 <= t.c && t.c < W)
-            spatial_err.at<float>(t.r, t.c) += value * t.w / total;
+    cv::Mat target = vision::decode_display(image, ladder, opt.useSrgb);
+    if (opt.supersample > 1)
+        // Enlarged in display units rather than in pixels: interpolating decoded
+        // values keeps the tone correct, and the dither then runs on the fine
+        // grid where the mask's grain can sit below the picture detail.
+        cv::resize(target, target, cv::Size(target.cols * opt.supersample,
+                                            target.rows * opt.supersample),
+                   0, 0, cv::INTER_CUBIC);
+    return target;
 }
 
-// Serpentine iteration over a `size` grid: even rows go left→right, odd rows
-// right→left. `body` receives (row, col, dir) where `dir` is ±1.
-template <typename Body>
-static void for_serpentine(cv::Size size, Body&& body)
+// False if --debug-pixel names a pixel the run does not have. Checked against
+// the *target*, which --supersample has already enlarged.
+static bool report_debug_pixel(const cv::Mat& target, const Options& opt)
 {
-    for (int row = 0; row < size.height; row++) {
-        int dir = (row & 1) ? -1 : +1;
-        int col = (dir > 0) ? 0 : size.width - 1;
-        for (int i = 0; i < size.width; i++, col += dir)
-            body(row, col, dir);
+    if (opt.debug_row < 0 || opt.debug_col < 0) return true;
+    if (opt.debug_row >= target.rows || opt.debug_col >= target.cols) {
+        fprintf(stderr, "--debug-pixel %d,%d is outside the %dx%d image\n",
+                opt.debug_row, opt.debug_col, target.cols, target.rows);
+        return false;
     }
-}
-
-// What the ledgers conserve: linear light, since srgb-spaced rungs are uneven in
-// light and conserving display units raises the mean. Identity on a uniform ladder.
-struct Space {
-    const vision::LevelSet* ladder = nullptr;
-    explicit Space(const vision::LevelSet* l = nullptr) : ladder(l && !l->uniform ? l : nullptr) {}
-
-    double to_conserved(double display) const {
-        if (!ladder) return display;
-        const auto& L = ladder->lin;
-        const int k = std::clamp((int)std::floor(display), 0, (int)L.size() - 2);
-        return L[k] + (display - k) * (L[k + 1] - (double)L[k]);
-    }
-    // Snaps to a rung within 1e-5, so a budget paid down to whole rungs reads back whole.
-    double to_display(double conserved) const {
-        if (!ladder) return conserved;
-        const auto& L = ladder->lin;
-        const int top = (int)L.size() - 1;
-        const int k = conserved < L.front() ? 0 : conserved >= L.back() ? top - 1
-                    : (int)(std::upper_bound(L.begin(), L.end(), conserved) - L.begin()) - 1;
-        const double span = L[k + 1] - (double)L[k];
-        double t = span > 0 ? (conserved - L[k]) / span : 0.0;
-        if (std::abs(t) < 1e-5) t = 0; else if (std::abs(t - 1) < 1e-5) t = 1;
-        return k + t;
-    }
-    double of_level(int level) const { return ladder ? ladder->lin[level] : level; }
-};
-
-// One serpentine quantizing scan over a `size` grid, with its own private
-// spatial-error channel, in `space`. dither_fn quantizes `target + spatial * err`
-// to a level in [0, max_level] and the whole residual against `target + err` is
-// diffused, so the ledger stays exact at any --spatial. `sink(row, col, level,
-// display)` records the result. Used for the goal pass and each output frame.
-template <typename ValueFn, typename Sink>
-static void quantize_scan(cv::Size size, DitherFn& dither_fn, SpatialFn spatial_fn,
-                          float spatial, int max_level, const Space& space,
-                          ValueFn value_fn, Sink sink)
-{
-    cv::Mat spatial_err = cv::Mat::zeros(size, CV_32F);
-    for_serpentine(size, [&](int row, int col, int dir) {
-        const double target = value_fn(row, col);
-        const float err = spatial_err.at<float>(row, col);
-        const double shown = space.to_display(target + spatial * err);
-        const int level = std::clamp(dither_fn(shown, row, col), 0, max_level);
-        spatial_fn(row, col, dir, spatial_err, (float)(target + err - space.of_level(level)));
-        sink(row, col, level, shown);
-    });
-}
-
-// Produce all output frames. Returns CV_8U raw display levels (0..levels-1);
-// the caller applies vision::encode_levels() to encode to pixel values.
-//
-// Each pixel is given a per-frame-total budget `goal = target * frames`. For
-// multi-frame runs the goal is dithered in display units to an integer in
-// [0, frames*(levels-1)], then converted to linear light, so the running total
-// converges exactly to it. Every frame aims at
-//
-//     ideal = (goal - displayed) / (frames - f) + spatial_err
-//
-// which for a single frame is the classical `ideal = target + spatial_err`.
-// The goal pass always diffuses in full; only the per-frame passes are scaled.
-// goals and displayed are double: a float error in a sum of `frames` rungs
-// exceeds the smallest rung step at high frame counts.
-static std::vector<cv::Mat> ditherPass(const cv::Mat& target, const vision::LevelSet& ladder,
-                          DitherFn& dither_fn, SpatialFn spatial_fn,
-                          float spatial, int levels,
-                          int frames, int debug_row, int debug_col)
-{
-    const Space space(&ladder);
-    cv::Mat goals;
-    target.convertTo(goals, CV_64F, frames);
-    if (frames > 1)
-        quantize_scan(goals.size(), dither_fn, spatial_fn, spatial, frames * (levels - 1), Space(),
-                      [&](int row, int col) { return goals.at<double>(row, col); },
-                      [&](int row, int col, int goal, float) {
-                          goals.at<double>(row, col) = goal;
-                      });
-    goals.forEach<double>([&](double& g, const int*) { g = frames * space.to_conserved(g / frames); });
-
-    cv::Mat displayed = cv::Mat::zeros(target.size(), CV_64F);
-    std::vector<cv::Mat> outputs;
-    outputs.reserve(frames);
-    for (int f = 0; f < frames; f++) {
-        dither_fn.new_frame();
-        cv::Mat output(target.size(), CV_8U);
-        quantize_scan(target.size(), dither_fn, spatial_fn, spatial, levels - 1, space,
-            [&](int row, int col) {
-                return (goals.at<double>(row, col) - displayed.at<double>(row, col))
-                       / (frames - f);
-            },
-            [&](int row, int col, int display, float ideal) {
-                double d = displayed.at<double>(row, col) + space.of_level(display);
-                displayed.at<double>(row, col) = d;
-                output.at<uint8_t>(row, col) = (uint8_t)display;
-                if (row == debug_row && col == debug_col)
-                    fprintf(stderr, "  frame=%d ideal=%+.4f display=%d displayed=%+.4f\n",
-                            f, ideal, display, d);
-            });
-        outputs.push_back(output);
-    }
-    return outputs;
-}
-
-struct Options {
-    std::string inPath;
-    std::string threshold = "round";
-    std::string outPath = "dither.png";
-    bool useSrgb = true;
-    int levels = 2;
-    int frames = 1;
-    bool saveFrames = false;
-    double spatial = 1.0;   // share of diffused error the threshold sees (1 = full FS, 0 = none);
-                            // resolved in parseOptions, which defaults it to 0 when
-                            // --threshold names a threshold explicitly
-    uint64_t seed = 42;
-    double mask_sigma = 1.8;
-    int maskW = 0;
-    int maskH = 0;
-    std::string levelSpacing = "srgb";    // where the display levels sit: srgb | linear
-    std::string maskIn;     // empty = build the mask instead of loading one
-    std::string maskOut;    // empty = don't write the mask
-    double mask_eps = 1e-4;
-    double mask_radius = 6.0;
-    int debug_row = -1;
-    int debug_col = -1;
-};
-
-// cv::imwrite reports an unwritable path by returning false and an unknown
-// extension by throwing; neither should reach the user as a core dump.
-static bool write_image(const std::string& path, const cv::Mat& img)
-{
-    try {
-        if (cv::imwrite(path, img)) return true;
-    } catch (const cv::Exception&) { }
-    fprintf(stderr, "Could not write %s\n", path.c_str());
-    return false;
-}
-
-static void usage();
-
-static bool parseOptions(int argc, char** argv, Options& opt)
-{
-    opt.inPath = argv[1];
-    bool threshold_set = false, spatial_set = false, mask_build_set = false, bad = false;
-
-    for (int index = 2; index < argc && !bad; ) {
-        std::string k = argv[index++];
-        auto need = [&]() -> std::string {
-            if (index >= argc) {
-                fprintf(stderr, "Missing value for %s\n", k.c_str());
-                bad = true; return "";
-            }
-            return argv[index++];
-        };
-        // Numeric arguments are parsed and range-checked here, so a typo names
-        // the offending option instead of throwing std::stod out of main. The
-        // level ceiling is real: level indices travel in a CV_8U mat.
-        auto need_num = [&](double lo, double hi) -> double {
-            std::string v = need();
-            if (!bad) {
-                try {
-                    size_t used = 0;
-                    double d = std::stod(v, &used);
-                    if (used == v.size() && lo <= d && d <= hi) return d;
-                } catch (const std::exception&) { }
-                fprintf(stderr, "Bad value for %s: '%s' (expected a number in [%g, %g])\n",
-                        k.c_str(), v.c_str(), lo, hi);
-                bad = true;
-            }
-            return lo;
-        };
-        if      (k == "--help" || k == "-h") { usage(); exit(0); }
-        else if (k == "--threshold")  { opt.threshold   = need(); threshold_set = true; }
-        else if (k == "--spatial")    { opt.spatial     = need_num(0.0, 1.0); spatial_set = true; }
-        else if (k == "--linear")      opt.useSrgb     = false;
-        else if (k == "--out")         opt.outPath     = need();
-        else if (k == "--seed")        opt.seed        = (uint64_t)need_num(0, 9e15);
-        else if (k == "--levels")      opt.levels      = (int)need_num(2, 256);
-        else if (k == "--level-spacing") opt.levelSpacing = need();
-        else if (k == "--frames")      opt.frames      = (int)need_num(1, 100000);
-        else if (k == "--save-frames") opt.saveFrames  = true;
-        else if (k == "--mask-in")     opt.maskIn      = need();
-        else if (k == "--mask-out")    opt.maskOut     = need();
-        else if (k == "--mask-sigma")  { opt.mask_sigma  = need_num(0.01, 1000); mask_build_set = true; }
-        else if (k == "--mask-eps")    { opt.mask_eps    = need_num(1e-12, 1);   mask_build_set = true; }
-        else if (k == "--mask-radius") { opt.mask_radius = need_num(0.1, 100);   mask_build_set = true; }
-        else if (k == "--mask-size") {
-            std::string v = need();
-            if (std::sscanf(v.c_str(), "%dx%d", &opt.maskW, &opt.maskH) != 2 ||
-                opt.maskW <= 0 || opt.maskH <= 0) {
-                fprintf(stderr, "Bad --mask-size value, use WxH format\n"); return false;
-            }
-            mask_build_set = true;
-        }
-        else if (k == "--debug-pixel") {
-            std::string v = need();
-            if (std::sscanf(v.c_str(), "%d,%d", &opt.debug_row, &opt.debug_col) != 2 ||
-                opt.debug_row < 0 || opt.debug_col < 0) {
-                fprintf(stderr, "Bad --debug-pixel value, use ROW,COL format\n"); return false;
-            }
-        }
-        else { fprintf(stderr, "Unknown option: %s\n", k.c_str()); return false; }
-    }
-    if (bad) return false;
-
-    // Naming a threshold opts out of error diffusion; an explicit --spatial wins
-    // either way, whichever order the two appear in.
-    if (!spatial_set) opt.spatial = threshold_set ? 0.0 : 1.0;
-
-    if (opt.levelSpacing != "linear" && opt.levelSpacing != "srgb") {
-        fprintf(stderr, "--level-spacing must be linear or srgb\n"); return false;
-    }
-
-    // Mask options are only consulted by the blue threshold, and a supplied mask
-    // makes the build knobs moot — say so rather than ignoring them in silence.
-    if (opt.threshold != "blue" &&
-        (mask_build_set || !opt.maskIn.empty() || !opt.maskOut.empty()))
-        fprintf(stderr, "Note: mask options apply only to --threshold blue\n");
-    else if (!opt.maskIn.empty() && mask_build_set)
-        fprintf(stderr, "Note: --mask-in supplies the mask; mask-building options are ignored\n");
-
+    fprintf(stderr, "debug pixel=%d,%d target=%.6f frames=%d spatial=%.2f\n",
+            opt.debug_row, opt.debug_col,
+            target.at<float>(opt.debug_row, opt.debug_col),
+            opt.frames, opt.spatial);
     return true;
 }
 
-static void usage() {
-    fputs(R"(usage: dither <image> [options]
-
-Treats input as sRGB by default and dithers in linear light. A dither is a
-threshold rule (--threshold) plus error diffusion (--spatial); the defaults
-give round-to-nearest with full Floyd-Steinberg at 2 levels.
-
-Thresholds (--threshold):
-  round      deterministic round to nearest level (default)
-  random     stochastic threshold — fast, grainy
-  blue       void-and-cluster blue-noise mask; best perceptual quality
-
-Options:
-  --threshold <name>  threshold rule to use (default: round)
-  --spatial <frac>    how much Floyd-Steinberg error each pixel's threshold
-                      sees (1 = full FS, 0 = none); the error is always passed
-                      on in full. Defaults to 1, or 0 when --threshold is given
-  --out <path>        output file path (default: dither.png)
-  --linear            treat pixel values as raw linear light (skip the sRGB
-                      ↔ linear conversion that normally wraps the dither)
-  --levels <n>        number of output tones, 2-256 (default 2)
-  --level-spacing <s> where those tones sit: srgb (equal steps in pixel value,
-                      default — 3 levels are 0/128/255) or linear (equal steps
-                      in linear light — 3 levels are 0/188/255)
-  --frames <n>        dither n independent frames and average them (default 1)
-  --save-frames       also write each frame as <stem>-N.png
-  --seed <n>          random seed (default 42)
-  --debug-pixel <r,c> print per-frame ideal/display/displayed for pixel (r, c)
-  --help, -h          show this message
-
-blue-only options:
-  --mask-sigma <val>  blue-noise kernel radius in pixels (default 1.8)
-  --mask-size <WxH>   generate a WxH tile and repeat it over the image
-                      (default: the image size, capped at 256 per side)
-  --mask-in <path>    use this image as the mask instead of building one;
-                      the other mask-building options are then ignored
-  --mask-out <path>   write the mask in use to this path
-  --mask-eps <val>    Gaussian kernel weight cutoff (default 1e-4)
-  --mask-radius <mul> kernel half-width in sigma units (default 6.0). Only
-                      bites below ~4.3, where --mask-eps stops binding first
-)", stdout);
+// Level indices to pixel values, then to the output's size, in linear light.
+//
+// **One resample, not two.** With --supersample the dither grid is the only
+// place the sub-pixel information exists, so --out-size is reached from there
+// directly rather than via the input's size. Resolving to the input first
+// quantises to 8 bits in between, and the second resample cannot recover what
+// that threw away: shrinking a 4096 grid to 512 reads 21.1/1000 linear against
+// the truth in one step and 36.4 through 1024. (It comes back with *more*
+// distinct tones that way, 206 against 64, which is interpolation inventing
+// values rather than detail surviving.)
+//
+// At exactly input x supersample the target *is* the dither grid, so nothing is
+// averaged and the raw dither comes out whole -- supersample without reducing,
+// which is the main thing --out-size is for. Past that the resample resumes, and
+// enlarging further costs tone: the resolution here is how many dithered pixels
+// each output pixel averages, so a bigger target averages fewer of them.
+static void encode_and_resize(std::vector<cv::Mat>& frames,
+                              const vision::LevelSet& ladder, const Options& opt)
+{
+    for (cv::Mat& f : frames) {
+        f = vision::encode_levels(f, ladder);
+        if (opt.outSize <= 0) {
+            f = vision::downsample_gray(f, opt.supersample, opt.useSrgb);
+            continue;
+        }
+        const int ss = std::max(opt.supersample, 1);
+        const int w = f.cols / ss, h = f.rows / ss;       // the input's size
+        const double k = (double)opt.outSize / std::max(w, h);
+        f = vision::resize_gray(f, cv::Size(std::max(1, (int)std::lround(w * k)),
+                                            std::max(1, (int)std::lround(h * k))),
+                                opt.useSrgb);
+    }
 }
 
-int main(int argc, char** argv)
+// The linear-light average, and the individual frames if --save-frames asked.
+static bool write_outputs(const std::vector<cv::Mat>& frames, const Options& opt)
 {
-    if (argc < 2) { usage(); return -1; }
+    if (!write_image(opt.outPath, vision::average_gray(frames, opt.useSrgb))) return false;
+    if (!opt.saveFrames) {
+        // The average is a preview, re-encoded to 8 bits, and it is easy to
+        // hand on as though it were the frames.
+        if (frames.size() > 1)
+            std::cerr << "Note: " << opt.outPath << " is the average of " << frames.size()
+                      << " frames, a preview; --save-frames also writes each frame, which"
+                         " is what to display or expose\n";
+        return true;
+    }
+    const auto path = std::filesystem::path(opt.outPath);
+    const std::string stem = path.stem().string();
+    for (size_t k = 0; k < frames.size(); k++)
+        if (!write_image((path.parent_path() /
+                          (stem + "-" + std::to_string(k) + ".png")).string(), frames[k]))
+            return false;
+    return true;
+}
+
+int dither_main(int argc, char** argv)
+{
+    if (argc < 2) { usage_brief(); return -1; }
     if (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") { usage(); return 0; }
 
     Options opt;
-    if (!parseOptions(argc, argv, opt)) return -1;
+    params::Params P;
+    for (const Generator& g : generators()) g.register_params(P);
+    register_mask_params(P);            // and the mask geometry that spans them
 
-    std::cout << "threshold=" << opt.threshold << " colorspace=" << (opt.useSrgb ? "sRGB" : "linear")
+    // Loaded first so anything on the command line still outranks it: cached
+    // values arrive as Origin::Measured, a command-line one as Origin::User.
+    // Parsing --no-config/--config needs a peek, since loading precedes parsing.
+    //
+    // It walks the command line the way the parser will -- same starting index,
+    // same idea of which tokens consume the next one -- because a pre-scan that
+    // disagrees with the parser is a pre-scan that acts on tokens the parser
+    // reads as something else. It did: it began at argv[2], so `dither
+    // --no-config …` loaded the config anyway, and it matched any argument
+    // equal to the string, so `--out --no-config` turned configuration off and
+    // then wrote to a file of that name. Last one wins, as in the parser.
+    std::string cfg = config_path();
+    for (int i = first_option_index(argc, argv); i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--no-config") cfg.clear();
+        else if (a == "--config") { if (i + 1 < argc) cfg = argv[i + 1]; i++; }
+        else if (option_takes_value(P, a)) i++;      // its value is not an option
+    }
+    if (!cfg.empty()) P.load_config(cfg);
+
+    if (!parseOptions(argc, argv, opt, P)) return -1;
+
+    // Where the results go is checked before any of the work that makes them:
+    // a mask build can take a minute, and finding afterwards that the
+    // directory is missing or the extension has no encoder throws that away.
+    // write_image still reports what goes wrong at the write itself.
+    if (!opt.explain) {
+        for (const std::string& out : {opt.outPath, opt.maskOut}) {
+            if (out.empty()) continue;
+            const auto dir = std::filesystem::path(out).parent_path();
+            std::error_code ec;
+            if (!dir.empty() && !std::filesystem::is_directory(dir, ec)) {
+                fprintf(stderr, "Could not write %s: %s is not a directory\n",
+                        out.c_str(), dir.string().c_str());
+                return -1;
+            }
+            if (!cv::haveImageWriter(out)) {
+                fprintf(stderr, "Could not write %s: no image format has that extension"
+                                " (use .png)\n", out.c_str());
+                return -1;
+            }
+        }
+    }
+
+
+    if (!opt.explain) {
+      std::cout << "threshold=" << opt.threshold;
+      // Which mask, and where it came from. Only under --threshold mask, where
+      // they are the settings that decide what the output looks like; under the
+      // others they are resolved but unused, and printing them would suggest
+      // otherwise. The generator prints its own line, but only when it builds:
+      // --mask-in says nothing at all without this.
+      if (opt.threshold == "mask") {
+          if (!opt.maskIn.empty()) std::cout << " mask=" << opt.maskIn;
+          else {
+              std::cout << " mask-method=" << opt.maskMethod;
+              if (!opt.maskSample.empty()) std::cout << " mask-sample=" << opt.maskSample;
+          }
+      }
+      std::cout << " colorspace=" << (opt.useSrgb ? "sRGB" : "linear")
               << " levels=" << opt.levels << "/" << opt.levelSpacing
               << " frames=" << opt.frames
               << " spatial=" << opt.spatial << " out=" << opt.outPath << "\n";
+    }
 
     rng = std::mt19937(opt.seed);
     std::unique_ptr<DitherFn> dither_fn;
     // With --spatial 0 the residual would be scaled to zero anyway; skip the
     // deposit entirely so no-diffusion runs don't pay for it.
     SpatialFn spatial_fn = (opt.spatial > 0.0) ? spatial_floydsteinberg : spatial_none;
-    cv::Mat image = cv::imread(opt.inPath, cv::IMREAD_GRAYSCALE | cv::IMREAD_ANYDEPTH);
-    if (image.empty()) { fprintf(stderr, "Could not read %s\n", opt.inPath.c_str()); return -1; }
+    cv::Mat image;
+    if (!opt.inPath.empty()) {
+        // ANYDEPTH is what lets a 16-bit file through; without it imread silently
+        // hands back 8 bits and the extra precision is gone before anything sees
+        // it. Verified to give single-channel native depth for 16-bit gray *and*
+        // 16-bit colour, so to_gray only has channels to reduce for odd inputs.
+        image = cv::imread(opt.inPath, cv::IMREAD_GRAYSCALE | cv::IMREAD_ANYDEPTH);
+        if (image.empty()) { fprintf(stderr, "Could not read %s\n", opt.inPath.c_str()); return -1; }
+        // Facts read off the input rather than chosen; the mask size needs them.
+        P.set(mask::keys::ImageW, (long long)image.cols, params::Origin::Measured);
+        P.set(mask::keys::ImageH, (long long)image.rows, params::Origin::Measured);
+    } else if (!opt.explain) {
+        fprintf(stderr, "No input image given\n"); usage_brief(); return -1;
+    }
+
+    // The sample, read here for the same reason the image is: the mask size is
+    // derived from both. A generator whose tile is a piece of its sample cannot
+    // be asked for one bigger than the sample has, so the size rule needs the
+    // sample's dimensions before it can answer -- and reading it now rather
+    // than at build time is also what keeps --explain honest about the size it
+    // reports. Decoded once and handed on.
+    samples::Set set;
+    if (!opt.maskSample.empty() && opt.maskIn.empty()) {
+        // One resolution for the whole run. --mask-sample may name a file, a
+        // directory of scans of one film, or a film in the library; reading
+        // happens here so that `mask.sample_w`/`sample_h` -- which the size
+        // rule reads, and which direct's limit is computed from -- are known
+        // before the size is resolved.
+        const bool crop_first = uses_crop(opt.maskMethod);
+        const std::vector<std::string> paths = samples::resolve(opt.maskSample, crop_first);
+        if (crop_first && !paths.empty() && !samples::is_path(opt.maskSample)) {
+            // Said either way, since which file a film name reached is not
+            // otherwise visible: the crop, or scans that were never chosen for
+            // a tile.
+            if (const std::string crop = samples::crop_for(opt.maskSample); !crop.empty())
+                std::cerr << "  " << opt.maskMethod << " uses the film's crop, " << crop << "\n";
+            else {
+                const Generator* g = find_generator(opt.maskMethod);
+                std::cerr << "Note: no crop for " << opt.maskSample << " in "
+                          << samples::crops_root() << ", so " << opt.maskMethod
+                          << (g && g->combines ? " takes the film's whole scans, picture and all. "
+                                               : " cuts its tile from the middle of a whole scan. ")
+                          << "Save a square crop of clean grain there as "
+                          << opt.maskSample << ".png to choose it.\n";
+            }
+        }
+        set = samples::Set::read(paths, &std::cerr);
+        if (!set.empty()) {
+            // The primary scan's size, not the set's total: the only thing that
+            // reads these is `direct`'s sample_limit, and `direct` builds its
+            // tile out of that one scan.
+            const cv::Mat& one = set.primary();
+            P.set(mask::keys::SampleW, (long long)one.cols, params::Origin::Measured);
+            P.set(mask::keys::SampleH, (long long)one.rows, params::Origin::Measured);
+        }
+        // An unreadable sample is not reported here. --explain should still
+        // answer, and the build says so properly a moment later with the path
+        // in the message.
+    }
+    if (P.num(mask::keys::Budget) > 0 && !P.measured(P.str(mask::keys::Method) + ".rate"))
+        fprintf(stderr, "Note: no measured speed for this machine yet, so --budget is working "
+                        "from a compiled-in guess and this run may overshoot. It is recorded "
+                        "afterwards, so the next one will be closer.\n");
+    // A calibration for this sample: taken from the config when there is one,
+    // and measured as well under --mask-calibrate. Before --explain, so it
+    // reports what the build will use. A command-line value still outranks it.
+    if (!maybe_calibrate(opt, P, cfg, &set)) return -1;
+    if (opt.explain) { P.explain(std::cout); return 0; }
+
     if      (opt.threshold == "round")  { dither_fn = std::make_unique<RoundDither>(); }
     else if (opt.threshold == "random") { dither_fn = std::make_unique<RandomDither>(); }
-    else if (opt.threshold == "blue")   {
-        cv::Mat mask;
-        if (!opt.maskIn.empty()) {
-            mask = cv::imread(opt.maskIn, cv::IMREAD_GRAYSCALE);
-            if (mask.empty()) {
-                fprintf(stderr, "Could not read mask %s\n", opt.maskIn.c_str()); return -1;
-            }
-            std::cerr << "Loaded mask " << mask.cols << "x" << mask.rows
-                      << " from " << opt.maskIn << "\n";
-        } else {
-            constexpr int max_default_mask = 256;
-            cv::Size maskSz = (opt.maskW > 0 && opt.maskH > 0)
-                            ? cv::Size(opt.maskW, opt.maskH)
-                            : cv::Size(std::min(image.cols, max_default_mask),
-                                       std::min(image.rows, max_default_mask));
-            std::cerr << "Building progressive mask " << maskSz.width << "x" << maskSz.height
-                      << " sigma=" << opt.mask_sigma << " eps=" << opt.mask_eps
-                      << " radius=" << opt.mask_radius
-                      << " srgb=" << opt.useSrgb << " levels=" << opt.levels << " …\n";
-            mask = build_blue_noise_mask(maskSz, opt.mask_sigma, opt.mask_eps,
-                                         opt.mask_radius, opt.seed);
-        }
+    else if (opt.threshold == "mask")   {
+        cv::Mat mask = obtain_mask(opt, set, P, cfg);
+        if (mask.empty()) return -1;
         if (!opt.maskOut.empty() && !write_image(opt.maskOut, mask)) return -1;
-        dither_fn = std::make_unique<BlueDither>(std::move(mask));
+        dither_fn = std::make_unique<MaskDither>(std::move(mask));
     }
     else { fprintf(stderr, "Unknown threshold: %s\n", opt.threshold.c_str()); return -1; }
 
-    // Build target in display units: [0, levels-1] on the chosen level ladder.
-    vision::LevelSet ladder = vision::make_levels(opt.levels, opt.useSrgb,
-                                                  opt.levelSpacing == "srgb");
-    cv::Mat target = vision::decode_display(image, ladder, opt.useSrgb);
-
-    if (opt.debug_row >= 0 && opt.debug_col >= 0) {
-        if (opt.debug_row >= target.rows || opt.debug_col >= target.cols) {
-            fprintf(stderr, "--debug-pixel %d,%d is outside the %dx%d image\n",
-                    opt.debug_row, opt.debug_col, target.cols, target.rows);
-            return -1;
-        }
-        fprintf(stderr, "debug pixel=%d,%d target=%.6f frames=%d spatial=%.2f\n",
-                opt.debug_row, opt.debug_col,
-                target.at<float>(opt.debug_row, opt.debug_col),
-                opt.frames, opt.spatial);
-    }
+    const vision::Spacing spacing = opt.levelSpacing == "linear" ? vision::Spacing::Linear
+                                 : opt.levelSpacing == "device" ? vision::Spacing::Device
+                                                                : vision::Spacing::Srgb;
+    const vision::LevelSet ladder = vision::make_levels(opt.levels, opt.useSrgb, spacing);
+    const cv::Mat target = prepare_target(image, ladder, opt);
+    if (!report_debug_pixel(target, opt)) return -1;
 
     std::vector<cv::Mat> frames = ditherPass(target, ladder, *dither_fn, spatial_fn,
                                              opt.spatial, opt.levels, opt.frames,
                                              opt.debug_row, opt.debug_col);
-    for (cv::Mat& f : frames)
-        f = vision::encode_levels(f, ladder);
-
-    cv::Mat result = vision::average_gray(frames, opt.useSrgb);
-    if (!write_image(opt.outPath, result)) return -1;
-
-    if (opt.saveFrames) {
-        auto p = std::filesystem::path(opt.outPath);
-        std::string stem = p.stem().string();
-        for (size_t k = 0; k < frames.size(); k++)
-            if (!write_image((p.parent_path() / (stem + "-" + std::to_string(k) + ".png")).string(),
-                             frames[k]))
-                return -1;
-    }
-
-    return 0;
+    encode_and_resize(frames, ladder, opt);
+    return write_outputs(frames, opt) ? 0 : -1;
 }

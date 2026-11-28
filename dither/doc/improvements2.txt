@@ -1,0 +1,83 @@
+Triage of code_improvement_suggestions2.txt. One line per suggestion, keyed by the
+line its heading sits on in that file. Status is Accepted / Rejected / Ask / Done.
+
+Fewer accepted than the first pass, which is what a second pass over the same
+code should look like. Most of what is left is either a taste call the first pass
+already made, or a pattern applied where it does not pay. Several of the good
+ones are artefacts the first pass introduced -- a comment that now describes code
+that is not there, blank lines left by a scripted conversion, an optional
+argument added without checking what depends on it.
+
+Line 35:Rejected: spatial_floydsteinberg dropping residual on the last row is the design, not a bug. Out-of-column taps are excluded from the denominator so nothing leaks sideways; below-row taps stay in it and are not deposited, so the share aimed past the last row falls off the bottom. Renormalising there, as suggested, would concentrate the whole residual into the last row's next pixel. Adding a comment so this is not filed a third time.
+Line 57:Done: assert CV_32F and continuity in rank_order. It is a shared utility now and the contract is only implied by its body.
+Line 78:Rejected: one toroidal blur helper. Rejected in the first pass and the reason stands: smooth_power blurs a spectrum with a reflected border, highpass_field blurs a field toroidally. Same shape, different operation.
+Line 87:Done: share bin_freq between spectralmask and markov's level_set_low, which computes it inline.
+Line 96:Rejected: add_const_i/_d/_s plus a range builder. The (long long) casts are load-bearing: Value is a variant and an integer parameter that silently became a double would not be caught. A deducing template would remove the casts and reintroduce exactly that trap for a literal 0 meant as 0.0.
+Line 110:Done: one complete-number parser for the CLI, --set and the config file.
+Line 119:Done: consistent internal linkage for private helpers.
+Line 132:Done: same as line 57.
+Line 139:Rejected: factor the two rank projection bodies. Each is four lines and the formula is the whole of what differs; a helper taking a callable is longer than what it replaces.
+Line 150:Done: assert order.size() == sz.area() in threshold_mask, at the boundary where a generator bug becomes a corrupt image.
+Line 159:Done: name the 0.1874 half-power sigma constant.
+Line 167:Rejected: move rank_bins to maskutil. The suggestion itself says it is correctly local.
+Line 179:Done: anonymous namespace in bluenoise. Part of line 119.
+Line 187:Done: push the chosen index into an order vector rather than filling a rank Mat and scanning it afterwards. Removes a Mat, a nested loop, and uses the shared threshold_mask.
+Line 196:Rejected: extract heap seeding and neighbour re-push. With line 187 applied the loop is already short, and both blocks are four lines under a comment that says what they do.
+Line 208:Rejected: restyle makeSparseGaussian. Whitespace churn on code the first pass just touched.
+Line 217:Done: blank-line artefacts in the registration blocks, left by the first pass's scripted conversion.
+Line 228:Rejected: format() visitor. Rejected in the first pass; a visitor for a three-alternative variant needs an overload helper, which is more machinery than the get_if chain.
+Line 236:Done: part of line 110.
+Line 245:Rejected: move the reconciliation search behind a friend. Private members in a header are ordinary C++; a friend helper class to hide three of them is worse than what it hides.
+Line 255:Rejected: split explain(). Rejected in the first pass.
+Line 264:Rejected: a generic origin_is(key, Origin). measured() and user_set() read better at the call sites than origin_is(key, Origin::User) would, which is the point of having them.
+Line 271:Done: explain()'s comment says three generators; there are four.
+Line 278:Done: delete StackFrame's copy and move, since it is only ever an automatic guard.
+Line 289:Rejected: same as line 35.
+Line 295:Done: mask_work falling through to markov_work for an unknown method. Callers validate first, but this is the central work function and should not encode "unknown means markov".
+Line 305:Rejected: an ArgCursor. The lambdas close over exactly what they need and are three lines each; a class to hold them is machinery for its own sake.
+Line 314:Done: extract the --mask-size, --set and --debug-pixel parsers, matching parse_budget_seconds from the first pass.
+Line 323:Rejected: group Options into nested structs. Rejected in the first pass.
+Line 332:Done: extract the tail of run() -- target preparation, frame encoding, output writing.
+Line 345:Rejected: avoid reading the markov sample twice. Rejected in the first pass.
+Line 355:Done: print_run_summary. Part of line 332.
+Line 363:Done: the sample-options heading omits inpaint, and --mask-pairs opens a parenthesis it never closes. Both real.
+Line 371:Done: the Space block is tab-indented in a spaces file.
+Line 378:Done: report_conflicts prints "this run rule out" when nothing user-set is to blame.
+Line 389:Done: it claims the code uses INTER_AREA when it does not. The swap itself was rejected on measurement in the first pass -- 99.6% of the mask changed -- and the comment should say that rather than describe code that is not there.
+Line 399:Done: PatchDatabase recovers the radius from -ring.front().y, a hidden contract with ring_offsets.
+Line 407:Rejected: avoid materialising the group vector. It is cleared and refilled, so it allocates once; the strided alternative is harder to read for nothing.
+Line 416:Done: one anonymous namespace in inpaint. Part of line 119.
+Line 425:Done: extract the field initialise-or-upscale step out of the level loop.
+Line 435:Done: part of line 217.
+Line 442:Done: inpaint.rate is the only generator rate registered without its generator's applicability, so --explain lists it on runs that cannot use it.
+Line 454:Done: markov's calibration helpers have external linkage and are in no header. Part of line 119.
+Line 465:Rejected: to_logp in fit_markov_model. Rejected in the first pass -- only safe if the two are arithmetically identical, and if they are not it changes every mask.
+Line 474:Rejected: one expert-logit accumulator. Rejected in the first pass; the three sites want different things and a shared one grows flags.
+Line 487:Done: report_weights labels its baseline "flat 1/K" but passes whatever weights the run is using, so under --mask-weights mi or ml the label is wrong.
+Line 497:Done: report_occupancy takes an unused experts argument, and sample_markov_mask has a (void) line for variables it now uses.
+Line 505:Rejected: optional<MarkovModel> instead of unique_ptr. One allocation in a function that runs for seconds, and unique_ptr already says what the ownership is.
+Line 514:Done: fit_markov_model still does radius clamping, quantisation, selection, occupancy and assembly in one block.
+Line 526:Done: assert rank_bins' input the way the other rank helpers now do.
+Line 535:Rejected: PairSelection carrying candidate ids. Conditional on diagnostics nobody has asked for.
+Line 544:Done, half of it: select_pairs' summary did sit on the PairSelection struct and has moved down to the function. The Expert comment is not duplicated -- it appears once -- so that half of the suggestion was stale.
+Line 553:Done: a comment in report_holdout that belonged to the monolithic report_fit.
+Line 560:Done: the calibration line says "over N probes" where N counts temperatures, each averaged over three draws.
+Line 567:Done: part of line 217.
+Line 579:Done: same as line 87.
+Line 585:Rejected: share the Gaussian high-pass with spectralmask. The first pass deliberately kept that function separate and said why in maskutil.h; sharing five of its lines re-opens it for very little.
+Line 594:Rejected: the suggestion is to do nothing unless another caller appears.
+Line 601:Rejected: inline wrapped() into sample_amplitude_at. It names the toroidal read, and inlining it makes four call sites longer.
+Line 609:Done: two summaries sit back-to-back above one function, which is first-pass residue.
+Line 618:Done: part of line 217.
+Line 628:Done: decode_gray8 rebuilds its 256-entry table on every call, and it is called per frame and per supersample block.
+Line 637:Rejected: row-loop decode_display. forEach parallelises, and to_display does a binary search per pixel on a non-uniform ladder — a serial row loop would be slower, not tidier.
+Line 645:Rejected: pointer-loop the three-channel converters. Diagnostic-only, and the speed is not the point there.
+Line 653:Rejected: decide where the three-channel converters live. Adjacent to a first-pass rejection; they are asserted and documented as srgbtest's.
+Line 662:Rejected: the suggestion says no change is needed.
+Line 674:Done: the first pass added an optional image path to srgbtest without checking the helpers, which index column 255 and row 127 unconditionally. A smaller image reads out of bounds.
+Line 683:Rejected: make srgbtest a test or move it. Rejected in the first pass.
+Line 691:Rejected: named sample points in srgbtest. It is a fixed ramp probe; the indices are the content.
+Line 702:Rejected: modernize temporaldither. Rejected in the first pass.
+Line 715:Rejected: split temporaldither's two demonstrations. Rejected in the first pass.
+Line 723:Rejected: frame count as a CLI argument. Same demo, same answer as lines 702 and 715.
+Line 731:Rejected: reformat temporaldither. Same.

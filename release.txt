@@ -1,4 +1,44 @@
-DN-Tools v21Nov2026 21 Nov 2026 
+DN-Tools v2.0  v27Nov2026    (v2.0: 27 Nov 2026)
+
+Add masks that simulate film grain.
+
+  Film-grain masks (the main addition)
+  - --mask-method blue | dft | markov | inpaint | direct: four new generators that learn a threshold mask from a film scan. Blue noise is still the default.
+  - --mask-sample: a scan, a directory of scans, or a film name from the library. Naming a sample-based method without one uses Kodak-4X.
+  - --mask-scale: the film's grain coarser or finer.
+  - --mask-highpass: ignore sample structure coarser than this. The default is 32 px for dft and direct, and 0 for markov and inpaint.
+  - Spectrum matching: markov and inpaint hold every sweep to the film's power at each scale (--markov-bands, --inpaint-bands).
+  - Per-generator tuning:
+    - dft: --dft-iters, --dft-smooth-cells
+    - markov: --markov-bins, --markov-iters, --markov-pairs, --markov-radius, --markov-temp, --markov-weights, --markov-reuse, --markov-shortlist, --markov-report
+    - inpaint: --inpaint-iters, --inpaint-radius, --inpaint-db, --inpaint-dims, --inpaint-checks, --inpaint-groups, --inpaint-scales, --inpaint-cap
+    - direct: --direct-equalise, --direct-overlap, --direct-quantise
+
+  The film library
+  - install_dither installs bash completion and six films' scans. It also cuts each film a grain-only crop and calibrates it.
+  - The library's parts can also be run separately: install_samples, calibrate_samples, install_completion.
+  - dft and direct build from a film's crop; markov and inpaint pool all its scans.
+
+  Resolution and output
+  - --supersample: dither at n times the resolution and average back down in linear light.
+  - --out-size: fit the output in a square, resampling once from the dither grid. At input × supersample it writes the raw dither.
+  - --level-spacing device: a third ladder, for a panel with its own number of levels. v1 has srgb and linear.
+
+  Defaults, caching and calibration
+  - --explain: every parameter, its value, where that value came from, and what it was derived from.
+  - --set key=value: override any internal parameter.
+  - --mask-calibrate: measure a generator's parameters against your sample. The result is kept in the config, and every later run on that sample uses it.
+  - --budget <time>: choose the mask size and markov pair count to fit a time.
+  - Mask cache: built masks are kept in ~/.config/dither/masks and reused, byte-identical to a fresh build.
+  - --config and --no-config: use another config file, or ignore the config entirely.
+  - Options adjust each other: naming a mask option switches the threshold to mask and prints a Note: saying so. Options that conflict are refused, and the error names both.
+
+  Renamed (old option in brackets)
+  - --threshold mask (blue, still accepted).
+  - --blue-sigma (--mask-sigma, which now prints the new name).
+  - --blue-eps (--mask-eps) and --blue-radius (--mask-radius), which are rejected without a hint.
+
+DN-Tools v21Nov2026 21 Nov 2026
 
 Accuracy fixes. The next version adds masks that simulate film grain
 and is considerably larger. This change includes only a few small accuracy

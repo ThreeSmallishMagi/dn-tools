@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Choose, check and cut the crop each film's `direct` tile and `dft` spectrum come from.
+
+  findcrops [--write] [--stride N] [--objective drift|equalise] [--side N]
+            [--top K] [--pick N] [scan ...]
+  findcrops --install DIR
+
+`examples/films.tsv` lists every shipped scan, and on one row per film records
+a window: the square `install_samples` cuts into ~/.config/dither/crops/<film>.png
+for `--mask-method direct`. The other generators take the whole scans, so this
+is the one place a window is chosen.
+
+With no arguments this re-runs the recorded search for every recorded window
+and says whether it lands in the same place. Naming scans searches those
+instead -- any row, windowed or not, which is how a film's candidates are
+compared -- and `--objective` and `--side` override the record. `--write` makes
+each named scan's result its film's window, clearing the window from the film's
+other rows. `--top K` lists equalise's K best windows rather than only its
+best, and `--pick N` takes the Nth, recorded as `equalise#N` so a bare run still
+re-derives it: the residual ranks windows well and separates near-ties badly,
+so the last step of choosing can be the eye's. `--install DIR` searches nothing: it cuts the recorded windows into
+DIR, replacing a crop that differs and keeping the old one as `<film>.png~`.
+
+**drift**, the search that made the first twelve crops. It lived only in a
+session transcript and the README described it as "the window with the least
+drift", which is the last and weakest of its four parts: eight of those twelve
+are *not* their frame's drift minimum. In priority order:
+
+  tone gate      mean strictly inside (35, 215), and the load-bearing part.
+                 Drift and defects are both *minimised*, so a blown or crushed
+                 corner scores perfectly on both: without this, five of the
+                 twelve run straight to one, at tone 246, 235, 231, 16 and 6.
+
+  texture gate   grain -- the standard deviation of a sigma-3 high-pass -- at
+                 least 0.70 of the frame's own median, the bar being relative
+                 because how much grain a scan has is a property of the film.
+                 The same hazard caught a second way, for a mid-tone region with
+                 no texture in it. It never binds on any of the twelve, and is
+                 kept because this file documents the search that ran rather
+                 than a tidier one.
+
+  defects        the share of the window where the sigma-12 gradient is in the
+                 frame's top 3%: scratches, frame edges, the border of a cloned
+                 region. Weighted 1000x, so this is a sort key and not a term --
+                 one per cent of a window carrying an edge outranks any drift
+                 difference, because an edge in a threshold mask is a line
+                 across every picture it is used on. It moves four of the twelve
+                 (DemiEE17-319d, Kodak-2484-1, and both Kodak-4X scans).
+
+  drift          the standard deviation of the frame blurred at sigma 12: what
+                 is left when the grain is gone, i.e. how much of the window is
+                 *not* texture. The tiebreak among windows that passed, and what
+                 decides the other eight.
+
+Side is 1024 where the frame allows it, else the largest multiple of 64 that
+fits. Stride 32 -- the objective varies slowly, and every statistic is read from
+an integral image, so the cost is in the transforms and not in the sweep.
+
+**equalise, the search for what `direct` now does to a crop.** `direct` ranks
+each pixel within a sigma-24 neighbourhood of the raw sample
+(`--direct-equalise` at the defaults; EQ_SIGMA below must follow it), which
+removes smooth tone outright, so drift is
+optimising something that no longer reaches the mask -- and the defect key, a
+gradient of the sigma-12 blur, fires on exactly the soft ramps equalising
+handles. What survives equalising is structure sharper than its neighbourhood:
+door frames, the outline of a cloned-out subject. So that is what this
+measures, on the frame put through the same transform:
+
+  blown gate     at most 5% of the window may be pixels whose own value holds
+                 over half their neighbourhood. Equalising cannot order a tie,
+                 so such a region comes out as a coin flip -- white noise, not
+                 grain -- and white noise scores *well* on residual: the dark
+                 end of Kodak-2484-1's frame, half its pixels at code 0, reads
+                 4.44 against its crop's 9.01, and its shadow level sets are
+                 visibly shuffle rather than clumps. Local, so scattered
+                 clipping is no hazard: Kodak-4X-1 holds 22% of its crop at code
+                 0 and none of it counts. 5% rather than less because Kodak-2484-1's
+                 crop holds 4.6%, shows no shuffle, and the one window below 1%
+                 measured worse through the binary. A region with nothing in it
+                 at all is the texture gate's, which keeps the search out of a
+                 pasted block of 255 by itself.
+
+                 It replaces the tone gate, which excluded clean windows at tone
+                 230 (X570-Tri-X-017) for no reason equalising cares about.
+
+  texture gate   as above.
+
+  residual       how far the equalised window's level sets, at g = 0.1 ... 0.9
+                 and blurred at sigma 6, stray from g -- in units of g(1-g),
+                 averaged, x1000 in the table. Grain gives every frame a floor of
+                 its own, so compare windows of one frame and not figures across
+                 films.
+
+**How each film's window was chosen.** Equalise was re-run at sigma 24 on every
+scan, and each film's candidates judged through the binary rather than this
+proxy: `test/grainfit`'s `raw` at block 48 for a 256 mask against its own crop,
+and the tiled `--supersample 16` mask's level sets at g = 0.15, 0.5 and 0.85,
+blurred, by eye. The figures and the reasons are in examples/README.md.
+
+  Ilford-Delta3200   768 at +3968+832. The 832 windows at sigma 12 and 24 both
+                     carry door-frame arcs or a horizontal line; this is nearly
+                     clean, at grainfit 2.56 against their 2.25 and 2.08
+  Kodak-2484         Mamiya-2484-154 at 2048, so `direct` can cut a tile up to
+                     2036 for a large output; equalise#5, the plain wall. The
+                     five best 2048s read residual 16.2 to 18.1 and grainfit 0.95
+                     to 1.54, and every one but this carries a diagonal line, an
+                     arc or a blotch from the furniture below the wall. 1.24,
+                     against the best window's 1.19 with its line
+  Kodak-4X           AutoRex, grainfit 0.67, against Kodak-4X-1's 1.29
+  Kodak-OldTriX      274a, 0.89 and clean, where 278a carries curved marks
+  Kodak-PanatomicX   the drift window, 2.85 with dust specks, against equalise's
+                     3.73 at tone 17 with a vertical line
+  Kodak-TriX         032a at +4384+32, 1.76 with a faint diagonal; its sigma-12
+                     window grows vertical bands at 24, and 017 a grid of lines
+
+It does not touch examples/README.md. The table there is pasted from this
+output, but the prose around it is written by hand and regenerating it is how
+that prose was lost the first time.
+"""
+import argparse
+import os
+import sys
+
+import cv2
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+MANIFEST = os.path.join(ROOT, 'examples', 'films.tsv')
+
+TONE_LO, TONE_HI = 35, 215     # usable mean
+TEXTURE_SHARE = 0.70           # of the frame's median grain
+DEFECT_PCT = 97.0              # gradient percentile that counts as a defect
+DEFECT_WEIGHT = 1000.0         # defects outrank drift outright
+
+EQ_SIGMA = 24.0                # dither's --direct-equalise at the defaults
+RESID_SIGMA = 6.0              # the scale a residual is read at
+RESID_LEVELS = (0.1, 0.3, 0.5, 0.7, 0.9)
+BLOWN_TIE = 0.5                # a pixel whose value holds this much of its neighbourhood
+BLOWN_SHARE = 0.05             # ... may be at most this much of a window
+
+
+
+def manifest():
+    """films.tsv as a list of rows: [film, scan, x, y, side, search], the last
+    four None on a row with no window, plus the comment lines to write back."""
+    rows, header = [], []
+    with open(MANIFEST) as fh:
+        for line in fh:
+            line = line.rstrip('\n')
+            if line.startswith('#') or not line.strip():
+                header.append(line)
+                continue
+            f = line.split('\t')
+            if len(f) == 2:
+                rows.append(f + [None] * 4)
+            elif len(f) == 6:
+                rows.append(f[:2] + [int(f[2]), int(f[3]), int(f[4]), f[5]])
+            else:
+                raise SystemExit(f"films.tsv: neither 2 nor 6 fields: {line!r}")
+    for film in {r[0] for r in rows}:
+        n = sum(1 for r in rows if r[0] == film and r[2] is not None)
+        if n > 1:
+            raise SystemExit(f"films.tsv: {film} has {n} windows; a film has one crop")
+        if n == 0:
+            print(f"  films.tsv: {film} has no window, so no crop", file=sys.stderr)
+    return rows, header
+
+
+def save_manifest(rows, header):
+    with open(MANIFEST, 'w') as fh:
+        for line in header:
+            fh.write(line + '\n')
+        for r in rows:
+            fh.write('\t'.join(str(v) for v in (r if r[2] is not None else r[:2])) + '\n')
+
+
+def frame_of(scan):
+    return os.path.join(ROOT, 'examples', scan)
+
+
+def install(rows, dest):
+    """Cut every recorded window into dest/<film>.png, with the same read and
+    slice the check below compares, so an installed crop is the verified one."""
+    os.makedirs(dest, exist_ok=True)
+    added = replaced = same = 0
+    for film, scan, x, y, T, _ in rows:
+        if x is None:
+            continue
+        im = cv2.imread(frame_of(scan), cv2.IMREAD_GRAYSCALE)
+        if im is None:
+            raise SystemExit(f"cannot read {frame_of(scan)}")
+        crop = im[y:y + T, x:x + T]
+        out = os.path.join(dest, film + '.png')
+        have = cv2.imread(out, cv2.IMREAD_GRAYSCALE) if os.path.exists(out) else None
+        if have is not None and have.shape == crop.shape and (have == crop).all():
+            same += 1
+            continue
+        if os.path.exists(out):
+            os.replace(out, out + '~')
+            print(f"  replaced {out}; the old one is {film}.png~")
+            replaced += 1
+        else:
+            added += 1
+        cv2.imwrite(out, crop)
+    print(f"crops {dest}: {added} added, {replaced} replaced, {same} already there")
+    return 0
+
+
+def describe(crop):
+    """The crop's own tone, grain and drift, which is what the table reports.
+
+    Not the figures the search ranked on, though they are the same quantities:
+    those come from the frame's transforms restricted to the window, so near the
+    window's edge they see pixels outside it. The difference is under 0.1 and it
+    never changes which window wins -- but the table describes the file, so it
+    should be measured on the file, and a table that drifts in the last digit
+    every time it is regenerated is noise in the diff."""
+    g = crop.astype(np.float32)
+    return (float(g.mean()),
+            float((g - cv2.GaussianBlur(g, (0, 0), 3)).std()),
+            float(cv2.GaussianBlur(g, (0, 0), 12).std()))
+
+
+def equalise(f, sigma=EQ_SIGMA, seed=0, levels=256):
+    """maskutil::local_quantile, on its coarse grid, plus each pixel's tie share.
+
+    Returns (u, tie): u is the pixel's quantile within its Gaussian
+    neighbourhood, ties shuffled; tie is how much of that neighbourhood holds
+    the pixel's own value. The grid is the C++'s -- counts on cells of sigma/3,
+    read back bilinearly -- because the exact form is a full-resolution blur per
+    grey level, which on a 24-megapixel frame is minutes rather than seconds."""
+    f = np.asarray(f, np.float32)
+    h, w = f.shape
+    n = f.size
+    order = np.lexsort((np.random.default_rng(seed).random(n), f.ravel()))
+    v = f.ravel()[order]
+    start = np.flatnonzero(np.r_[True, v[1:] != v[:-1]])
+    if start.size > levels:
+        start = (np.arange(levels) * n) // levels
+    start = np.r_[start, n]
+
+    F = max(1, int(sigma // 3))
+    ch, cw = -(-h // F), -(-w // F)
+    yy, xx = np.indices(f.shape)
+    cell = ((yy // F) * cw + xx // F).ravel()
+    sc = sigma / F
+
+    def weigh(idx):
+        m = np.bincount(cell[idx], minlength=ch * cw).reshape(ch, cw).astype(np.float32)
+        return cv2.GaussianBlur(m, (0, 0), sc, sc, borderType=cv2.BORDER_CONSTANT)
+
+    inv = 1.0 / np.maximum(weigh(np.arange(n)), 1e-12)
+    cy = np.clip((yy.ravel() + 0.5) / F - 0.5, 0, ch - 1)
+    cx = np.clip((xx.ravel() + 0.5) / F - 0.5, 0, cw - 1)
+    y0 = cy.astype(np.int32); x0 = cx.astype(np.int32)
+    y1 = np.minimum(y0 + 1, ch - 1); x1 = np.minimum(x0 + 1, cw - 1)
+    ty = (cy - y0).astype(np.float32); tx = (cx - x0).astype(np.float32)
+
+    def at(m, i):
+        top = m[y0[i], x0[i]] * (1 - tx[i]) + m[y0[i], x1[i]] * tx[i]
+        bot = m[y1[i], x0[i]] * (1 - tx[i]) + m[y1[i], x1[i]] * tx[i]
+        return top * (1 - ty[i]) + bot * ty[i]
+
+    below = np.zeros((ch, cw), np.float32)
+    u = np.empty(n, np.float32)
+    tie = np.empty(n, np.float32)
+    for lo, hi in zip(start[:-1], start[1:]):
+        i = order[lo:hi]
+        level = weigh(i) * inv
+        share = at(level, i)
+        u[i] = at(below, i) + (np.arange(hi - lo) + 0.5) / (hi - lo) * share
+        tie[i] = share
+        below += level
+    return u.reshape(f.shape), tie.reshape(f.shape)
+
+
+def residual(u):
+    """Per pixel, how far the equalised field's level sets stray from their
+    share once blurred: zero for a field equalising has made uniform at every
+    scale, and raised wherever an edge left a band of one side's values."""
+    r = np.zeros(u.shape, np.float64)
+    for q in RESID_LEVELS:
+        d = cv2.GaussianBlur((u < q).astype(np.float32), (0, 0), RESID_SIGMA) - q
+        r += d.astype(np.float64) ** 2 / (q * (1 - q))
+    return r / len(RESID_LEVELS)
+
+
+def describe_equalised(crop):
+    """The crop's own tone, grain, residual and blown share, measured on the
+    file for the reason `describe` gives. Residual is x1000."""
+    g = crop.astype(np.float32)
+    u, tie = equalise(g)
+    return (float(g.mean()),
+            float((g - cv2.GaussianBlur(g, (0, 0), 3)).std()),
+            float(residual(u).mean() * 1000),
+            float((tie > BLOWN_TIE).mean()))
+
+
+def side_for(H, W, side):
+    if side:
+        if side > min(H, W):
+            raise SystemExit(f"--side {side} is larger than the frame ({W}x{H})")
+        return side
+    return 1024 if (H >= 1024 and W >= 1024) else (min(H, W) // 64) * 64
+
+
+def search_equalise(frame, stride, side, n=1):
+    """The n best windows under --objective equalise, as [(x, y, side)], each
+    at least half a side from every better one so that they are alternatives
+    rather than the same window shifted."""
+    im = cv2.imread(frame, cv2.IMREAD_GRAYSCALE)
+    if im is None:
+        raise SystemExit(f"cannot read {frame}")
+    H, W = im.shape
+    T = side_for(H, W, side)
+
+    g = im.astype(np.float32)
+    u, tie = equalise(g)
+    fine = g - cv2.GaussianBlur(g, (0, 0), 3)
+    Ir = cv2.integral(residual(u))
+    Ib = cv2.integral((tie > BLOWN_TIE).astype(np.float64))
+    If = cv2.integral((fine * fine).astype(np.float64))
+
+    def box(I, y, x):
+        return (I[y + T, x + T] - I[y, x + T] - I[y + T, x] + I[y, x]) / (T * T)
+
+    cand = []
+    for y in range(0, H - T + 1, stride):
+        for x in range(0, W - T + 1, stride):
+            if box(Ib, y, x) > BLOWN_SHARE:
+                continue
+            cand.append((np.sqrt(box(If, y, x)), box(Ir, y, x), y, x))
+    if not cand:
+        raise SystemExit(f"{frame}: every window is more than "
+                         f"{BLOWN_SHARE:.0%} blown")
+    med = np.median([c[0] for c in cand])
+    ok = [c for c in cand if c[0] >= TEXTURE_SHARE * med] or cand
+    picked = []
+    for _, _, y, x in sorted(ok, key=lambda c: c[1]):
+        if all(abs(y - py) >= T // 2 or abs(x - px) >= T // 2 for px, py, _ in picked):
+            picked.append((x, y, T))
+            if len(picked) == n:
+                break
+    return picked
+
+
+def search(frame, stride, side=0):
+    """The chosen window, as (x, y, side)."""
+    im = cv2.imread(frame, cv2.IMREAD_GRAYSCALE)
+    if im is None:
+        raise SystemExit(f"cannot read {frame}")
+    H, W = im.shape
+    T = side_for(H, W, side)
+
+    g = im.astype(np.float32)
+    fine = g - cv2.GaussianBlur(g, (0, 0), 3)      # the grain
+    sm = cv2.GaussianBlur(g, (0, 0), 12)           # everything that is not
+    grad = np.hypot(cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=5),
+                    cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=5))
+    defect = (grad > np.percentile(grad, DEFECT_PCT)).astype(np.float64)
+
+    # Four integral images, so each candidate costs four lookups rather than a
+    # pass over a megapixel.
+    Id = cv2.integral(defect)
+    If = cv2.integral((fine * fine).astype(np.float64))
+    I2 = cv2.integral((sm * sm).astype(np.float64))
+    I1 = cv2.integral(sm.astype(np.float64))
+
+    def box(I, y, x):
+        return (I[y + T, x + T] - I[y, x + T] - I[y + T, x] + I[y, x]) / (T * T)
+
+    cand = []
+    for y in range(0, H - T + 1, stride):
+        for x in range(0, W - T + 1, stride):
+            s1 = box(I1, y, x)
+            if not (TONE_LO < s1 < TONE_HI):
+                continue
+            s2 = box(I2, y, x)
+            cand.append((np.sqrt(box(If, y, x)),              # grain
+                         box(Id, y, x),                       # defect share
+                         np.sqrt(max(s2 - s1 * s1, 0.0)),     # drift
+                         y, x, s1))
+    if not cand:
+        raise SystemExit(f"{frame}: no window passes the tone gate")
+
+    # Falling back to the ungated set rather than refusing: a frame with no
+    # window above the bar still has to yield its best, and the drift column is
+    # what says how little that is worth.
+    med = np.median([c[0] for c in cand])
+    ok = [c for c in cand if c[0] >= TEXTURE_SHARE * med] or cand
+    ok.sort(key=lambda c: c[1] * DEFECT_WEIGHT + c[2])
+
+    _, _, _, y, x, _ = ok[0]
+    return x, y, T
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('scans', nargs='*', metavar='SCAN',
+                    help="scans to search, by file name or stem (default: every "
+                         "recorded window)")
+    ap.add_argument('--write', action='store_true',
+                    help="record each named scan's result as its film's window")
+    ap.add_argument('--install', metavar='DIR',
+                    help="cut the recorded windows into DIR/<film>.png and stop")
+    ap.add_argument('--stride', type=int, default=32, metavar='N',
+                    help="candidate spacing in pixels (default: 32)")
+    ap.add_argument('--objective', choices=('drift', 'equalise'),
+                    help="search every scan named this way (default: the "
+                         "recorded search, else equalise)")
+    ap.add_argument('--top', type=int, default=0, metavar='K',
+                    help="list equalise's K best windows for each scan named")
+    ap.add_argument('--pick', type=int, default=0, metavar='N',
+                    help="take equalise's Nth best window rather than its best, "
+                         "recorded as equalise#N")
+    ap.add_argument('--side', type=int, default=0, metavar='N',
+                    help="window side for every scan named (default: the "
+                         "recorded side, else 1024 or the largest multiple of 64 "
+                         "the frame allows)")
+    args = ap.parse_args()
+
+    rows, header = manifest()
+    if args.install:
+        return install(rows, args.install)
+
+    if args.scans:
+        stem = lambda r: os.path.splitext(r[1])[0]
+        want = {os.path.splitext(os.path.basename(a))[0] for a in args.scans}
+        todo = [r for r in rows if stem(r) in want]
+        missing = want - {stem(r) for r in todo}
+        if missing:
+            raise SystemExit("not in films.tsv: " + ' '.join(sorted(missing)))
+    else:
+        todo = [r for r in rows if r[2] is not None]
+
+    # Both searches' figures for every window, whichever chose it, so one table
+    # compares them all.
+    print("| film | scan | search | at | side | tone | grain | drift | residual | blown |")
+    print("|---|---|---|---|---:|---:|---:|---:|---:|---:|")
+    same = diff = 0
+    for r in todo:
+        film, scan, rx, ry, rside, rsearch = r
+        recorded, _, rrank = (rsearch or 'equalise').partition('#')
+        objective = args.objective or recorded
+        rank = args.pick or (int(rrank) if rrank and not args.objective else 1)
+        side = args.side or rside or 0
+        src = frame_of(scan)
+        if objective == 'equalise':
+            found = search_equalise(src, args.stride, side, max(rank, args.top))
+        elif rank > 1 or args.top:
+            raise SystemExit("--top and --pick rank equalise's windows only")
+        else:
+            found = [search(src, args.stride, side)]
+        if len(found) < rank:
+            raise SystemExit(f"{scan}: equalise found only {len(found)} windows")
+        label = lambda i: objective if i == 1 else f"{objective}#{i}"
+        im = cv2.imread(src, cv2.IMREAD_GRAYSCALE)
+        for i in (range(1, len(found) + 1) if args.top else [rank]):
+            x, y, T = found[i - 1]
+            crop = im[y:y + T, x:x + T]
+            tone, grain, drift = describe(crop)
+            _, _, resid, blown = describe_equalised(crop)
+            print(f"| {film} | `{scan}` | {label(i)} | +{x}+{y} "
+                  f"| {T} | {tone:.0f} | {grain:.1f} | {drift:.1f} | {resid:.2f} "
+                  f"| {blown:.1%} |", flush=True)
+
+        x, y, T = found[rank - 1]
+        if args.write:
+            for o in rows:
+                if o[0] == film:
+                    o[2:] = [None] * 4
+            r[2:] = [x, y, T, label(rank)]
+        elif rx is not None:
+            if (rx, ry, rside, rsearch) == (x, y, T, label(rank)):
+                same += 1
+            else:
+                diff += 1
+                print(f"  ^ films.tsv records {rsearch} +{rx}+{ry} at {rside}",
+                      file=sys.stderr)
+
+    if args.write:
+        save_manifest(rows, header)
+        print(f"\nrecorded {len(todo)} window(s) in films.tsv. Paste the table into "
+              f"examples/README.md; the prose there is hand-written.")
+        return 0
+    print(f"\n{same} window(s) reproduce, {diff} differ. --write to record them.")
+    return 1 if diff else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

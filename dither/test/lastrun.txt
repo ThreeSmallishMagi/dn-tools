@@ -1,0 +1,714 @@
+=== coltest ===
+ref=/home/agent/dev/cpp/opencv/examples/ramp_256x256.png
+dither=/home/agent/dev/cpp/opencv/build/dither
+colstats=/home/agent/dev/cpp/opencv/test/colstats
+
+test                                         group  worst |z|    avg |z|  fails  result
+---------------------------------------------------------------------------------------
+identity sanity check                            1      0.000      0.000      0  PASS
+identity sanity check                           16      0.000      0.000      0  PASS
+identity sanity check                           32      0.000      0.000      0  PASS
+round   defaults (spatial=1)                     1      2.343      0.602      0  PASS
+round   defaults (spatial=1)                    16      1.123      0.274      0  PASS
+round   defaults (spatial=1)                    32      0.971      0.283      0  PASS
+random  spatial=0                                1      2.747      0.722      0  PASS
+random  spatial=0                               16      1.366      0.574      0  PASS
+random  spatial=0                               32      0.965      0.475      0  PASS
+random  spatial=0 lin                            1      2.977      0.784      0  PASS
+random  spatial=0 lin                           16      3.065      0.883      1  EXPECTED <= 1
+random  spatial=0 lin                           32      1.831      0.923      0  PASS
+random  levels=8 spatial=0                       1      1.534      0.132      0  PASS
+random  levels=8 spatial=0                      16      0.395      0.122      0  PASS
+random  levels=8 spatial=0                      32      0.472      0.157      0  PASS
+random  levels=8 spatial=0 lin                   1      1.040      0.135      0  PASS
+random  levels=8 spatial=0 lin                  16      0.271      0.103      0  PASS
+random  levels=8 spatial=0 lin                  32      0.241      0.105      0  PASS
+random  levels=4 frames=8 spatial=0.5            1      1.406      0.065      0  PASS
+random  levels=4 frames=8 spatial=0.5           16      0.680      0.124      0  PASS
+random  levels=4 frames=8 spatial=0.5           32      0.534      0.155      0  PASS
+random  frames=16 spatial=0                      1      0.435      0.089      0  PASS
+random  frames=16 spatial=0                     16      0.319      0.121      0  PASS
+random  frames=16 spatial=0                     32      0.305      0.121      0  PASS
+random  frames=64 spatial=0                      1      0.360      0.050      0  PASS
+random  frames=64 spatial=0                     16      0.422      0.093      0  PASS
+random  frames=64 spatial=0                     32      0.195      0.084      0  PASS
+random  frames=128 spatial=0                     1      0.375      0.043      0  PASS
+random  frames=128 spatial=0                    16      0.388      0.079      0  PASS
+random  frames=128 spatial=0                    32      0.185      0.070      0  PASS
+random  spatial=1                                1      2.076      0.630      0  PASS
+random  spatial=1                               16      0.603      0.212      0  PASS
+random  spatial=1                               32      0.343      0.160      0  PASS
+random  frames=16 spatial=1                      1      1.832      0.104      0  PASS
+random  frames=16 spatial=1                     16      0.336      0.120      0  PASS
+random  frames=16 spatial=1                     32      0.375      0.156      0  PASS
+random  frames=16 spatial=0.5                    1      2.565      0.099      0  PASS
+random  frames=16 spatial=0.5                   16      0.333      0.144      0  PASS
+random  frames=16 spatial=0.5                   32      0.380      0.184      0  PASS
+random  frames=128 spatial=0.1                   1      1.418      0.050      0  PASS
+random  frames=128 spatial=0.1                  16      0.401      0.107      0  PASS
+random  frames=128 spatial=0.1                  32      0.361      0.098      0  PASS
+round   spatial=0                                1     15.908      7.219    200  EXPECTED <= 200
+round   spatial=0                               16     55.045     27.015     16  EXPECTED <= 16
+round   spatial=0                               32     69.484     38.306      8  EXPECTED <= 8
+round   levels=16 spatial=0                      1      4.386      0.775      7  EXPECTED <= 7
+round   levels=16 spatial=0                     16      0.595      0.311      0  PASS
+round   levels=16 spatial=0                     32      0.572      0.425      0  PASS
+round   levels=16 spatial=0 lin                  1      2.879      0.769      0  PASS
+round   levels=16 spatial=0 lin                 16      0.251      0.166      0  PASS
+round   levels=16 spatial=0 lin                 32      0.335      0.234      0  PASS
+round   frames=64 spatial=0                      1      1.508      0.276      0  PASS
+round   frames=64 spatial=0                     16      3.077      0.389      1  EXPECTED <= 1
+round   frames=64 spatial=0                     32      0.831      0.215      0  PASS
+round   spatial=1 lin                            1      2.819      0.638      0  PASS
+round   spatial=1 lin                           16      0.579      0.198      0  PASS
+round   spatial=1 lin                           32      0.379      0.173      0  PASS
+round   frames=16 spatial=1                      1      0.770      0.160      0  PASS
+round   frames=16 spatial=1                     16      0.266      0.128      0  PASS
+round   frames=16 spatial=1                     32      0.333      0.143      0  PASS
+round   frames=16 spatial=0.5                    1      0.770      0.160      0  PASS
+round   frames=16 spatial=0.5                   16      0.266      0.128      0  PASS
+round   frames=16 spatial=0.5                   32      0.333      0.143      0  PASS
+round   levels=4 spatial=1                       1      2.014      0.282      0  PASS
+round   levels=4 spatial=1                      16      0.186      0.077      0  PASS
+round   levels=4 spatial=1                      32      0.127      0.042      0  PASS
+round   levels=8 frames=4 spatial=1              1      0.616      0.102      0  PASS
+round   levels=8 frames=4 spatial=1             16      0.500      0.105      0  PASS
+round   levels=8 frames=4 spatial=1             32      0.411      0.117      0  PASS
+mask    spatial=0                                1      2.322      0.627      0  PASS
+mask    spatial=0                               16      0.426      0.175      0  PASS
+mask    spatial=0                               32      0.321      0.084      0  PASS
+mask    levels=4 frames=8 spatial=0.5            1      2.656      0.071      0  PASS
+mask    levels=4 frames=8 spatial=0.5           16      0.683      0.130      0  PASS
+mask    levels=4 frames=8 spatial=0.5           32      0.543      0.159      0  PASS
+mask    frames=16 spatial=0                      1      0.425      0.082      0  PASS
+mask    frames=16 spatial=0                     16      0.318      0.105      0  PASS
+mask    frames=16 spatial=0                     32      0.357      0.131      0  PASS
+mask    frames=128 spatial=0                     1      0.361      0.043      0  PASS
+mask    frames=128 spatial=0                    16      0.403      0.079      0  PASS
+mask    frames=128 spatial=0                    32      0.208      0.072      0  PASS
+mask    mask=32x32 spatial=0                     1      4.782      1.562     19  EXPECTED <= 19
+mask    mask=32x32 spatial=0                    16      2.169      0.742      0  PASS
+mask    mask=32x32 spatial=0                    32      1.578      0.584      0  PASS
+mask    mask=128x128 spatial=0                   1      4.310      0.952      4  EXPECTED <= 4
+mask    mask=128x128 spatial=0                  16      1.028      0.279      0  PASS
+mask    mask=128x128 spatial=0                  32      0.626      0.230      0  PASS
+mask    seed=7 sigma=2.5 spatial=0               1      2.304      0.628      0  PASS
+mask    seed=7 sigma=2.5 spatial=0              16      0.625      0.262      0  PASS
+mask    seed=7 sigma=2.5 spatial=0              32      0.508      0.208      0  PASS
+mask    spatial=0.5                              1      2.004      0.583      0  PASS
+mask    spatial=0.5                             16      0.388      0.134      0  PASS
+mask    spatial=0.5                             32      0.292      0.106      0  PASS
+mask    spatial=0.9                              1      2.220      0.629      0  PASS
+mask    spatial=0.9                             16      0.472      0.170      0  PASS
+mask    spatial=0.9                             32      0.229      0.127      0  PASS
+mask    spatial=1                                1      2.255      0.617      0  PASS
+mask    spatial=1                               16      0.316      0.123      0  PASS
+mask    spatial=1                               32      0.186      0.100      0  PASS
+mask    frames=8 spatial=0.5                     1      2.050      0.160      0  PASS
+mask    frames=8 spatial=0.5                    16      0.487      0.146      0  PASS
+mask    frames=8 spatial=0.5                    32      0.411      0.187      0  PASS
+random  spatial=0.5                              1      2.348      0.701      0  PASS
+random  spatial=0.5                             16      0.472      0.197      0  PASS
+random  spatial=0.5                             32      0.249      0.120      0  PASS
+round   spatial=0.5                              1      3.297      0.727      1  EXPECTED <= 1
+round   spatial=0.5                             16      2.426      0.524      0  PASS
+round   spatial=0.5                             32      2.587      0.597      0  PASS
+blue    alias spatial=0                          1      2.322      0.627      0  PASS
+blue    alias spatial=0                         16      0.426      0.175      0  PASS
+blue    alias spatial=0                         32      0.321      0.084      0  PASS
+---------------------------------------------------------------------------------------
+Totals over clean tests                          1      48.94       9.77      0
+Totals over clean tests                         16      19.32       6.12      0
+Totals over clean tests                         32      18.89       7.25      0
+OVERALL PASS
+
+=== unittest ===
+ref=/home/agent/dev/cpp/opencv/examples/ramp_256x256.png
+
+case                                                           result detail
+--------------------------------------------------------------------------------------------------------------
+make_levels: rungs ascend and span the range, every spacing and count PASS   3 spacings x 8 counts x 2 curves
+make_levels: `uniform` is never set on a ladder that is not even PASS   1530 ladders, none wrongly flagged (10 even ones conservatively unflagged)
+make_levels: rungs share an 8-bit code only where 8 bits cannot separate them PASS   srgb and device never collide; linear+sRGB first at 122 levels
+make_levels: device and srgb differ exactly when levels-1 does not divide 255 PASS   levels 2..64, agree iff levels-1 divides 255
+to_gray: keeps the bit depth, and never rescales by content    PASS   depth preserved, content-independent
+decode_gray: 16-bit is exact, and agrees with 8-bit where the codes coincide PASS   both curves: exact, and 8/16 agree on shared codes
+16-bit input is exploited, not merely accepted                 PASS   RMS 70.5 vs 793.0 (x1e-6), 11.3x finer
+a parameter struct's defaults are the registry's               PASS   11 integer defaults and inpaint.cap agree; markov.temp is derived
+threshold_byte: spans 0..254 and a cell is the rank at its own quantile PASS   6 sizes, endpoints, monotone, quantile
+threshold_mask: a field's brightest pixel lights first         PASS   brightest gets 0, and direct's plain tile reads -1 against its sample
+rank_order: a permutation, and stable on ties                  PASS   permutation, ascending, stable
+wrap_near and wrap_any agree wherever wrap_near is defined     PASS   5 periods, one period either side and five for wrap_any
+periodic_component: removes the DFT cross artifact, and only that PASS   cross 224 -> 1.18, against 0.99 for a field with no jump
+periodic_component: s is harmonic inside, which is what makes it smooth PASS   max |laplacian| 3e-07 of s's range 230.1
+periodic_component: the mean is untouched, and p + (u - p) rounds back PASS   mean 18.9044 held; reconstruction within 9.5e-07 of float rounding
+bin_freq: the upper half of a row holds the negative frequencies PASS   DC, conjugate symmetry and the Nyquist bound, even and odd n
+rank_uniform_unit and _signed: order-preserving onto their stated range PASS   monotone, ties resolved by the shared order, ranges exact
+threshold_mask: a threshold fires with exactly the probability asked of it PASS   fire probability tracks frac; interior flat, end bins half by design
+prepare_texture_sample: reflecting keeps a gradient's edge error small PASS   interior clean; edge tilt 8.612020 reflecting against 89.613228 wrapping; off is exact; scale resizes
+highpass_toroidal: matches an exactly toroidal filter at the border PASS   border 0.000019, interior 0.000018 against an exact circular filter
+mincut_path: connected, closed, and it finds the cheapest route PASS   planted optimum recovered; closed, connected, deterministic
+quilt_axis: joins the wrap without averaging a single pixel    PASS   wrap/interior 4.349355 -> 1.141716; no pixel averaged; both axes agree
+MaskDither: a negative value thresholds, and a rectangular mask is not transposed PASS   reads [row][col] on a 8x5 mask, and negative values threshold
+samples: a scan keeps what its file holds, at any depth, on one scale PASS   16 values kept from 16 bits against 1 from 8, both on the 0..255 scale
+samples: a set-valued transformation keeps the scans' relative contrast PASS   ten-to-one contrast survives every step, pooled 2.328103x
+srgb: the Mat helpers agree with the scalar ones on every code PASS   all 256 codes round-trip on all three channels
+budget: it closes exactly at the edge of the domain, not only in the middle PASS   20 budgets past 2^24 close exactly, at 100000 frames
+budget: the size chosen is a size that was priced as affordable PASS   320 rate/budget/grid combinations, 111 where nothing affordable existed
+a mask is a pure function of its inputs, not of what the process did first PASS   5 generators reproduce across an unrelated build
+flags: every option the registry offers decodes back to its own key PASS   47 flags round-trip, none colliding
+flags: a text parameter is typed as text, whatever the value looks like PASS   6 text and 54 numeric parameters typed from the registry
+mask size: a derived size never exceeds what the sample can supply PASS   derived sizes stay inside the sample on both axes, and 0 means unread
+integer parameters: a fractional value is refused, a derived hair is not PASS   fractional refused, derived rounding kept, wide seed exact
+mask cache key: values that differ, however slightly, key differently PASS   close doubles key apart, value_of stays short, doubles round-trip
+mask cache key: every parameter that applies moves it, for every generator PASS   63 parameters over 5 generators
+mask cache key: an intermediate left out of it cannot change the mask PASS   7 intermediates: each moves the key or leaves the mask alone
+mask cache key: a rate does not move it, and the sample's contents do PASS   1 rates ignored; sample contents counted
+quantise: a high-pass manufactures detail, and rounding removes it PASS   15713 values made from 2, all rounded onto the grid
+local_quantile: every neighbourhood comes out uniform, whatever went in PASS   block mean within 0.012 of 1/2 and spread within 0.014 of 1/sqrt(12), over a ramped, unevenly grainy, clipped field, counted exactly and pooled
+tie_share: 1 for a constant field, 1/n for n distinct values   PASS   endpoints exact; a two-level sample reads 0.270530
+rank_order_random: a permutation, sorted by value, shuffled within ties PASS   group correlation 0.999737 stable -> 0.000087 shuffled
+rank_order_random: seeded from its argument, never the global rng PASS   same seed reproduces, different seeds diverge
+bands: markov and inpaint end at the sample's power in every band PASS   worst band, log10 from the sample's, held against unheld: markov 0.05 against 0.56, inpaint 0.13 against 0.56
+band_reference: every scan counts, every part of a scan counts, order does not PASS   a second scan moves the target 1.51 log10, its order 0.000, a tall scan's lower half 1.44
+calibration holds its probes to the reference the build uses   PASS   both scans in the reference, probe and build byte-identical
+direct: refuses a sample whose mask would be mostly coin flips PASS   featureless and gradient refused, textured accepted, each with and without rounding, high-passed and equalised, and at scales either side of 1
+budget closes: round  frames=4   levels=2   srgb               PASS   65536 pixels, worst 0.000
+budget closes: round  frames=16  levels=2   srgb               PASS   65536 pixels, worst 0.000
+budget closes: round  frames=64  levels=2   srgb               PASS   65536 pixels, worst 0.000
+budget closes: round  frames=128 levels=2   srgb               PASS   65536 pixels, worst 0.000
+budget closes: round  frames=16  levels=2   srgb (--linear)    PASS   65536 pixels, worst 0.000
+budget closes: round  frames=64  levels=2   srgb (--linear)    PASS   65536 pixels, worst 0.000
+budget closes: round  frames=16  levels=8   srgb (--linear)    PASS   65536 pixels, worst 0.000
+budget closes: round  frames=16  levels=8   srgb               PASS   65536 pixels, worst 0.000
+budget closes: random frames=2   levels=2   srgb               PASS   65536 pixels, worst 0.999
+budget closes: random frames=4   levels=2   srgb               PASS   65536 pixels, worst 0.998
+budget closes: random frames=16  levels=2   srgb               PASS   65536 pixels, worst 0.996
+budget closes: random frames=16  levels=8   srgb               PASS   65536 pixels, worst 0.997
+budget closes: random frames=64  levels=8   srgb               PASS   65536 pixels, worst 0.990
+budget closes: mask   frames=4   levels=2   srgb               PASS   65536 pixels, worst 0.999
+budget closes: mask   frames=16  levels=2   srgb               PASS   65536 pixels, worst 0.997
+budget closes: mask   frames=16  levels=8   srgb               PASS   65536 pixels, worst 0.985
+budget closes: round  frames=16  levels=3   linear             PASS   65536 pixels, worst 0.000
+budget closes: round  frames=16  levels=8   linear             PASS   65536 pixels, worst 0.000
+budget closes: random frames=16  levels=5   linear             PASS   65536 pixels, worst 0.996
+budget closes: mask   frames=16  levels=8   linear             PASS   65536 pixels, worst 0.994
+budget closes: round  frames=16  levels=3   device             PASS   65536 pixels, worst 0.000
+budget closes: random frames=16  levels=8   device             PASS   65536 pixels, worst 0.999
+budget closes: round  frames=4   levels=2   srgb [16-bit in]   PASS   65536 pixels, worst 0.000
+budget closes: round  frames=16  levels=256 srgb [16-bit in]   PASS   65536 pixels, worst 0.000
+budget closes: round  frames=64  levels=256 srgb [16-bit in]   PASS   65536 pixels, worst 0.000
+budget closes: random frames=16  levels=256 srgb [16-bit in]   PASS   65536 pixels, worst 1.000
+budget closes: mask   frames=16  levels=256 srgb [16-bit in]   PASS   65536 pixels, worst 0.989
+budget closes: round  frames=16  levels=8   linear [16-bit in] PASS   65536 pixels, worst 0.000
+--------------------------------------------------------------------------------------------------------------
+OVERALL PASS (74 of 74)
+
+=== tonetest ===
+dither=/home/agent/dev/cpp/opencv/build/dither
+ref=/home/agent/dev/cpp/opencv/examples/ramp_256x256.png
+
+levels spacing   lin threshold  spatial  frames     mean  worst band  result
+     2 srgb        - round          0.0       1   -45.39      370.82  EXEMPT
+     2 srgb        - round          0.0       8    -2.42       30.08  EXEMPT
+     2 srgb        - round          0.1       1    -3.66       11.29  EXEMPT
+     2 srgb        - round          0.1       8    -0.02        0.29  EXEMPT
+     2 srgb        - round          0.5       1    -0.65        2.15  PASS
+     2 srgb        - round          0.5       8    -0.02        0.29  PASS
+     2 srgb        - round          0.9       1    -0.36        1.17  PASS
+     2 srgb        - round          0.9       8    -0.02        0.29  PASS
+     2 srgb        - round          1.0       1    -0.24        1.30  PASS
+     2 srgb        - round          1.0       8    -0.02        0.29  PASS
+     2 srgb        - random         0.0       1     0.37        5.28  PASS
+     2 srgb        - random         0.0       8     0.05        1.01  PASS
+     2 srgb        - random         0.1       1    -0.01        1.01  PASS
+     2 srgb        - random         0.1       8     0.21        0.71  PASS
+     2 srgb        - random         0.5       1     0.01        1.03  PASS
+     2 srgb        - random         0.5       8     0.11        0.40  PASS
+     2 srgb        - random         0.9       1    -0.02        1.16  PASS
+     2 srgb        - random         0.9       8     0.08        0.23  PASS
+     2 srgb        - random         1.0       1    -0.01        1.28  PASS
+     2 srgb        - random         1.0       8     0.08        0.28  PASS
+     2 srgb        - mask           0.0       1    -0.02        1.30  PASS
+     2 srgb        - mask           0.0       8    -0.03        0.36  PASS
+     2 srgb        - mask           0.1       1     0.08        0.67  PASS
+     2 srgb        - mask           0.1       8     0.20        0.75  PASS
+     2 srgb        - mask           0.5       1     0.08        0.76  PASS
+     2 srgb        - mask           0.5       8     0.13        0.39  PASS
+     2 srgb        - mask           0.9       1     0.07        0.80  PASS
+     2 srgb        - mask           0.9       8     0.09        0.28  PASS
+     2 srgb        - mask           1.0       1     0.10        0.58  PASS
+     2 srgb        - mask           1.0       8     0.08        0.25  PASS
+     3 srgb        - round          0.0       1   -17.36      217.28  EXEMPT
+     3 srgb        - round          0.0       8    -0.53        4.85  EXEMPT
+     3 srgb        - round          0.1       1    -1.04       10.45  EXEMPT
+     3 srgb        - round          0.1       8    -0.03        0.30  EXEMPT
+     3 srgb        - round          0.5       1    -0.19        2.50  PASS
+     3 srgb        - round          0.5       8    -0.05        0.38  PASS
+     3 srgb        - round          0.9       1    -0.05        1.83  PASS
+     3 srgb        - round          0.9       8    -0.05        0.38  PASS
+     3 srgb        - round          1.0       1    -0.04        1.03  PASS
+     3 srgb        - round          1.0       8    -0.05        0.36  PASS
+     3 srgb        - random         0.0       1    -0.95        3.08  PASS
+     3 srgb        - random         0.0       8     0.08        0.71  PASS
+     3 srgb        - random         0.1       1    -0.05        0.58  PASS
+     3 srgb        - random         0.1       8     0.14        0.81  PASS
+     3 srgb        - random         0.5       1    -0.03        0.52  PASS
+     3 srgb        - random         0.5       8     0.13        0.81  PASS
+     3 srgb        - random         0.9       1     0.01        0.71  PASS
+     3 srgb        - random         0.9       8     0.13        0.90  PASS
+     3 srgb        - random         1.0       1    -0.01        0.33  PASS
+     3 srgb        - random         1.0       8     0.13        0.84  PASS
+     3 srgb        - mask           0.0       1    -0.02        2.86  PASS
+     3 srgb        - mask           0.0       8     0.05        0.24  PASS
+     3 srgb        - mask           0.1       1     0.01        0.38  PASS
+     3 srgb        - mask           0.1       8     0.17        1.21  PASS
+     3 srgb        - mask           0.5       1    -0.01        0.67  PASS
+     3 srgb        - mask           0.5       8     0.18        1.24  PASS
+     3 srgb        - mask           0.9       1     0.01        0.42  PASS
+     3 srgb        - mask           0.9       8     0.17        1.15  PASS
+     3 srgb        - mask           1.0       1     0.02        0.27  PASS
+     3 srgb        - mask           1.0       8     0.18        1.19  PASS
+     4 srgb        - round          0.0       1    -8.42      130.81  EXEMPT
+     4 srgb        - round          0.0       8     0.44        4.67  EXEMPT
+     4 srgb        - round          0.1       1    -0.52        4.15  EXEMPT
+     4 srgb        - round          0.1       8    -0.03        0.27  EXEMPT
+     4 srgb        - round          0.5       1    -0.09        0.96  PASS
+     4 srgb        - round          0.5       8    -0.03        0.27  PASS
+     4 srgb        - round          0.9       1    -0.05        0.94  PASS
+     4 srgb        - round          0.9       8    -0.03        0.29  PASS
+     4 srgb        - round          1.0       1    -0.03        0.69  PASS
+     4 srgb        - round          1.0       8    -0.03        0.24  PASS
+     4 srgb        - random         0.0       1    -0.31        2.63  PASS
+     4 srgb        - random         0.0       8    -0.05        0.75  PASS
+     4 srgb        - random         0.1       1     0.10        0.60  PASS
+     4 srgb        - random         0.1       8     0.07        0.36  PASS
+     4 srgb        - random         0.5       1     0.02        0.47  PASS
+     4 srgb        - random         0.5       8     0.07        0.39  PASS
+     4 srgb        - random         0.9       1    -0.01        0.36  PASS
+     4 srgb        - random         0.9       8     0.07        0.33  PASS
+     4 srgb        - random         1.0       1     0.01        0.46  PASS
+     4 srgb        - random         1.0       8     0.07        0.35  PASS
+     4 srgb        - mask           0.0       1     0.06        0.33  PASS
+     4 srgb        - mask           0.0       8    -0.03        0.14  PASS
+     4 srgb        - mask           0.1       1    -0.00        0.29  PASS
+     4 srgb        - mask           0.1       8     0.10        0.57  PASS
+     4 srgb        - mask           0.5       1     0.01        0.26  PASS
+     4 srgb        - mask           0.5       8     0.10        0.54  PASS
+     4 srgb        - mask           0.9       1    -0.01        0.31  PASS
+     4 srgb        - mask           0.9       8     0.10        0.52  PASS
+     4 srgb        - mask           1.0       1    -0.01        0.23  PASS
+     4 srgb        - mask           1.0       8     0.10        0.54  PASS
+     3 linear      - round          0.0       1   -18.04      161.95  EXEMPT
+     3 linear      - round          0.0       8    -1.20        5.69  EXEMPT
+     3 linear      - round          0.1       1    -1.53        7.36  EXEMPT
+     3 linear      - round          0.1       8    -0.01        0.27  EXEMPT
+     3 linear      - round          0.5       1    -0.28        0.93  PASS
+     3 linear      - round          0.5       8    -0.01        0.27  PASS
+     3 linear      - round          0.9       1    -0.11        0.44  PASS
+     3 linear      - round          0.9       8    -0.01        0.27  PASS
+     3 linear      - round          1.0       1    -0.11        0.70  PASS
+     3 linear      - round          1.0       8    -0.01        0.27  PASS
+     3 linear      - random         0.0       1     0.41        2.44  PASS
+     3 linear      - random         0.0       8    -0.03        0.45  PASS
+     3 linear      - random         0.1       1     0.11        0.71  PASS
+     3 linear      - random         0.1       8     0.10        0.38  PASS
+     3 linear      - random         0.5       1     0.04        0.59  PASS
+     3 linear      - random         0.5       8     0.05        0.20  PASS
+     3 linear      - random         0.9       1     0.05        0.67  PASS
+     3 linear      - random         0.9       8     0.04        0.16  PASS
+     3 linear      - random         1.0       1     0.02        0.79  PASS
+     3 linear      - random         1.0       8     0.04        0.22  PASS
+     3 linear      - mask           0.0       1     0.12        0.82  PASS
+     3 linear      - mask           0.0       8    -0.01        0.18  PASS
+     3 linear      - mask           0.1       1     0.04        0.42  PASS
+     3 linear      - mask           0.1       8     0.07        0.31  PASS
+     3 linear      - mask           0.5       1     0.04        0.58  PASS
+     3 linear      - mask           0.5       8     0.05        0.19  PASS
+     3 linear      - mask           0.9       1     0.06        0.42  PASS
+     3 linear      - mask           0.9       8     0.03        0.15  PASS
+     3 linear      - mask           1.0       1     0.02        0.42  PASS
+     3 linear      - mask           1.0       8     0.03        0.11  PASS
+     8 linear      - round          0.0       1    -3.54       30.08  EXEMPT
+     8 linear      - round          0.0       8     0.02        1.35  EXEMPT
+     8 linear      - round          0.1       1    -0.28        1.52  EXEMPT
+     8 linear      - round          0.1       8    -0.00        0.09  EXEMPT
+     8 linear      - round          0.5       1    -0.06        0.35  PASS
+     8 linear      - round          0.5       8    -0.00        0.09  PASS
+     8 linear      - round          0.9       1    -0.02        0.28  PASS
+     8 linear      - round          0.9       8    -0.00        0.09  PASS
+     8 linear      - round          1.0       1    -0.02        0.13  PASS
+     8 linear      - round          1.0       8    -0.00        0.09  PASS
+     8 linear      - random         0.0       1    -0.34        1.08  PASS
+     8 linear      - random         0.0       8     0.00        0.11  PASS
+     8 linear      - random         0.1       1     0.02        0.10  PASS
+     8 linear      - random         0.1       8     0.02        0.09  PASS
+     8 linear      - random         0.5       1     0.00        0.11  PASS
+     8 linear      - random         0.5       8     0.01        0.05  PASS
+     8 linear      - random         0.9       1     0.01        0.11  PASS
+     8 linear      - random         0.9       8     0.01        0.03  PASS
+     8 linear      - random         1.0       1     0.00        0.14  PASS
+     8 linear      - random         1.0       8     0.01        0.02  PASS
+     8 linear      - mask           0.0       1     0.02        0.22  PASS
+     8 linear      - mask           0.0       8     0.01        0.06  PASS
+     8 linear      - mask           0.1       1    -0.02        0.16  PASS
+     8 linear      - mask           0.1       8     0.02        0.11  PASS
+     8 linear      - mask           0.5       1    -0.01        0.18  PASS
+     8 linear      - mask           0.5       8     0.01        0.05  PASS
+     8 linear      - mask           0.9       1     0.01        0.14  PASS
+     8 linear      - mask           0.9       8     0.01        0.02  PASS
+     8 linear      - mask           1.0       1     0.01        0.19  PASS
+     8 linear      - mask           1.0       8     0.01        0.03  PASS
+     4 device      - round          0.0       1    -8.42      130.81  EXEMPT
+     4 device      - round          0.0       8     0.44        4.67  EXEMPT
+     4 device      - round          0.1       1    -0.52        4.15  EXEMPT
+     4 device      - round          0.1       8    -0.03        0.27  EXEMPT
+     4 device      - round          0.5       1    -0.09        0.96  PASS
+     4 device      - round          0.5       8    -0.03        0.27  PASS
+     4 device      - round          0.9       1    -0.05        0.94  PASS
+     4 device      - round          0.9       8    -0.03        0.29  PASS
+     4 device      - round          1.0       1    -0.03        0.69  PASS
+     4 device      - round          1.0       8    -0.03        0.24  PASS
+     4 device      - random         0.0       1    -0.31        2.63  PASS
+     4 device      - random         0.0       8    -0.05        0.75  PASS
+     4 device      - random         0.1       1     0.10        0.60  PASS
+     4 device      - random         0.1       8     0.07        0.36  PASS
+     4 device      - random         0.5       1     0.02        0.47  PASS
+     4 device      - random         0.5       8     0.07        0.39  PASS
+     4 device      - random         0.9       1    -0.01        0.36  PASS
+     4 device      - random         0.9       8     0.07        0.33  PASS
+     4 device      - random         1.0       1     0.01        0.46  PASS
+     4 device      - random         1.0       8     0.07        0.35  PASS
+     4 device      - mask           0.0       1     0.06        0.33  PASS
+     4 device      - mask           0.0       8    -0.03        0.14  PASS
+     4 device      - mask           0.1       1    -0.00        0.29  PASS
+     4 device      - mask           0.1       8     0.10        0.57  PASS
+     4 device      - mask           0.5       1     0.01        0.26  PASS
+     4 device      - mask           0.5       8     0.10        0.54  PASS
+     4 device      - mask           0.9       1    -0.01        0.31  PASS
+     4 device      - mask           0.9       8     0.10        0.52  PASS
+     4 device      - mask           1.0       1    -0.01        0.23  PASS
+     4 device      - mask           1.0       8     0.10        0.54  PASS
+     3 srgb      yes round          0.0       1     0.98      190.20  EXEMPT
+     3 srgb      yes round          0.0       8     0.25        1.96  EXEMPT
+     3 srgb      yes round          0.1       1    -0.10        7.71  EXEMPT
+     3 srgb      yes round          0.1       8    -0.00        0.21  EXEMPT
+     3 srgb      yes round          0.5       1    -0.02        2.12  PASS
+     3 srgb      yes round          0.5       8    -0.00        0.21  PASS
+     3 srgb      yes round          0.9       1    -0.01        1.27  PASS
+     3 srgb      yes round          0.9       8    -0.00        0.21  PASS
+     3 srgb      yes round          1.0       1     0.00        1.53  PASS
+     3 srgb      yes round          1.0       8    -0.00        0.21  PASS
+     3 srgb      yes random         0.0       1    -0.40        3.68  PASS
+     3 srgb      yes random         0.0       8    -0.03        0.63  PASS
+     3 srgb      yes random         0.1       1    -0.01        0.43  PASS
+     3 srgb      yes random         0.1       8    -0.00        0.26  PASS
+     3 srgb      yes random         0.5       1     0.03        0.40  PASS
+     3 srgb      yes random         0.5       8    -0.00        0.07  PASS
+     3 srgb      yes random         0.9       1    -0.01        0.53  PASS
+     3 srgb      yes random         0.9       8     0.01        0.06  PASS
+     3 srgb      yes random         1.0       1     0.02        0.46  PASS
+     3 srgb      yes random         1.0       8     0.01        0.07  PASS
+     3 srgb      yes mask           0.0       1     0.02        1.59  PASS
+     3 srgb      yes mask           0.0       8    -0.02        0.24  PASS
+     3 srgb      yes mask           0.1       1     0.04        0.49  PASS
+     3 srgb      yes mask           0.1       8     0.00        0.22  PASS
+     3 srgb      yes mask           0.5       1    -0.01        0.55  PASS
+     3 srgb      yes mask           0.5       8     0.00        0.09  PASS
+     3 srgb      yes mask           0.9       1     0.03        0.39  PASS
+     3 srgb      yes mask           0.9       8     0.00        0.13  PASS
+     3 srgb      yes mask           1.0       1     0.03        0.39  PASS
+     3 srgb      yes mask           1.0       8     0.00        0.12  PASS
+
+OVERALL PASS   x1000 linear, |mean|/band by threshold: round 1.4/5.0, random 2.0/8.0, mask 0.4/4.0
+
+=== impliedtest ===
+dither=/home/agent/dev/cpp/opencv/build/dither
+
+case                                                               result  detail
+------------------------------------------------------------------------------------------------
+--mask-sample implies threshold=mask                               PASS    noted and applied
+implied form matches the explicit one byte for byte                PASS    identical
+--mask-in implies threshold=mask                                   PASS    noted
+a markov-only parameter implies method and threshold together      PASS    both moved
+every sample generator can be implied, not just the two named in a list PASS    all three run their generator
+an explicit --threshold is never overridden, and conflicting with it refuses PASS    refused, naming both
+two conflicting user options refuse rather than dropping one       PASS    refused, naming both
+--markov-temp outranks --mask-calibrate, which measures one        PASS    honoured, and the no-op reported
+a generator that needs a sample says so, and one that cannot use it refuses PASS    both refused, naming the sample
+--threshold blue is the old spelling of mask, rewritten in silence PASS    identical and silent
+a plain run acquires nothing                                       PASS    unchanged
+------------------------------------------------------------------------------------------------
+OVERALL PASS
+
+=== devicetest ===
+dither=/home/agent/dev/cpp/opencv/build/dither
+simulating a display with exactly --levels of its own
+
+ levels  frames     device       srgb  result
+      8       1     -0.012     -0.387  PASS
+      8       4     -0.028     -0.394  PASS
+      3       1     -0.044     -0.852  PASS
+      3       4     -0.092     -0.886  PASS
+      4       1     -0.035     -0.035  PASS (both, as 255 divides)
+      4       4     -0.061     -0.061  PASS (both, as 255 divides)
+     16       1     -0.004     -0.004  PASS (both, as 255 divides)
+
+OVERALL PASS   |device| <= 0.2 per 1000 linear, and srgb worse by >= 0.15 where the ladders differ
+
+=== masktest ===
+dither=/home/agent/dev/cpp/opencv/build/dither
+
+generator    size    shape  flat/ends  joins: cols    rows   reloads  result
+blue      128x128       ok         ok         0.54    0.99        ok  PASS
+blue       160x96       ok         ok         1.17    1.25        ok  PASS
+dft       128x128       ok         ok         1.54    0.84        ok  PASS
+dft        160x96       ok         ok         1.69    1.22        ok  PASS
+markov    128x128       ok         ok         0.34    0.27        ok  PASS
+markov     160x96       ok         ok         1.13    1.80        ok  PASS
+inpaint   128x128       ok         ok         0.89    1.88        ok  PASS
+inpaint    160x96       ok         ok         1.74    0.35        ok  PASS
+direct    128x128       ok         ok         0.30    0.29        ok  PASS
+direct     160x96       ok         ok         1.19    0.61        ok  PASS
+
+direct    oriented: white at 10% -0.53 (vertical, like the bright grain), black at 90% +0.52 (horizontal, like the dark)  PASS
+markov    oriented: white at 10% -0.28 (vertical, like the bright grain), black at 90% +0.23 (horizontal, like the dark)  PASS
+inpaint   oriented: white at 10% -0.63 (vertical, like the bright grain), black at 90% +0.67 (horizontal, like the dark)  PASS
+
+OVERALL PASS   every generator's seam must score |z| < 3.0, and a broken copy of it over — except blue, whose join is genuinely undetectable from local statistics, which is the same property that makes it tile well
+
+=== scalecheck ===
+  scale 2: 0.000% out-of-band
+  scale 4: 0.000% out-of-band
+
+=== budgetcheck ===
+  first run recorded inpaint.rate = d:36740088.519423753
+  second run uses it
+
+=== shellcheck ===
+  no shell-outs in the sources
+
+=== outsizecheck ===
+  --out-size 200 -> 200x80
+  --out-size 100 -> 100x40
+  --out-size 800 -> 800x320
+  --out-size 0 -> 400x160
+  --supersample 4 --out-size 512 gives 5 tones — one resample
+  --supersample 8 --out-size 2048 keeps the grid whole, 2 tones
+  --save-frames writes frames at 64x64
+
+=== errorcheck ===
+  ok   a fractional --levels: refused
+  ok   a fractional --levels: said why
+  ok   a fractional --levels: wrote nothing
+  ok   an unknown threshold: refused
+  ok   an unknown threshold: said why
+  ok   an unknown threshold: wrote nothing
+  ok   markov with no sample: refused
+  ok   markov with no sample: said why
+  ok   markov with no sample: wrote nothing
+  ok   an unknown generator: refused
+  ok   an unknown generator: said why
+  ok   an unknown generator: wrote nothing
+  ok   a mask file that is absent: refused
+  ok   a mask file that is absent: said why
+  ok   a mask file that is absent: wrote nothing
+  ok   a mask file that is junk: refused
+  ok   a mask file that is junk: said why
+  ok   a mask file that is junk: wrote nothing
+  ok   a mask size of zero: refused
+  ok   a mask size of zero: said why
+  ok   a mask size of zero: wrote nothing
+  ok   a sample that is absent: refused
+  ok   a sample that is absent: said why
+  ok   a sample that is absent: wrote nothing
+  ok   an input image that is absent: refused and said why
+  ok   an output path that cannot be written: refused and said why
+  ok   an output in a missing directory: refused before the mask is built
+  ok   an output with no encoder: refused before the mask is built
+  ok   a mask output with no encoder: refused before the mask is built
+  ok   an option with no value: refused and said which
+  ok   temporaldither: a depth as wide as the word is refused
+  ok   temporaldither: a depth of zero is refused
+  ok   temporaldither: a negative depth is refused
+  ok   temporaldither: a depth that is not a number is refused
+  ok   temporaldither: a value past the source's range is refused
+  ok   temporaldither: an unknown strategy is refused
+  ok   temporaldither: a sound command still runs
+  ok   temporaldither: full scale into 1 bits, strategy 0
+  ok   temporaldither: full scale into 1 bits, strategy 1
+  ok   temporaldither: full scale into 1 bits, strategy 2
+  ok   temporaldither: full scale into 8 bits, strategy 0
+  ok   temporaldither: full scale into 8 bits, strategy 1
+  ok   temporaldither: full scale into 8 bits, strategy 2
+  ok   temporaldither: full scale into 16 bits, strategy 0
+  ok   temporaldither: full scale into 16 bits, strategy 1
+  ok   temporaldither: full scale into 16 bits, strategy 2
+  ok   temporaldither: full scale into 31 bits, strategy 0
+  ok   temporaldither: full scale into 31 bits, strategy 1
+  ok   temporaldither: full scale into 31 bits, strategy 2
+  ok   temporaldither: a target under one level, strategy 0 seed 1
+  ok   temporaldither: a target under one level, strategy 0 seed 2
+  ok   temporaldither: a target under one level, strategy 0 seed 3
+  ok   temporaldither: a target under one level, strategy 1 seed 1
+  ok   temporaldither: a target under one level, strategy 1 seed 2
+  ok   temporaldither: a target under one level, strategy 1 seed 3
+  ok   temporaldither: a target under one level, strategy 2 seed 1
+  ok   temporaldither: a target under one level, strategy 2 seed 2
+  ok   temporaldither: a target under one level, strategy 2 seed 3
+  0 failure(s)
+
+=== cachecheck ===
+  a sound entry is read back
+  9 hostile entries, the same mask from every one
+
+=== findcropscheck ===
+  EOS3-Delta3200-088b.jpg: the recorded window reproduces
+  Mamiya-2484-154.jpg: the recorded window reproduces
+  AutoRex-4X-449c.jpg: the recorded window reproduces
+  X570-TriX80-274a.jpg: the recorded window reproduces
+  EOS3-PanatomicX-134a.jpg: the recorded window reproduces
+  X570-Tri-X-032a.jpg: the recorded window reproduces
+  EQ_SIGMA 24.0 follows --direct-equalise 23.9872
+
+=== apicheck ===
+  ok   the scanner finds the first declaration, after a pragma and includes
+  ok   the scanner finds a directive continued over two lines
+  ok   the scanner finds a declaration inside a namespace
+  ok   the scanner finds a declaration over several lines
+  ok   the scanner finds an inline definition, which cannot fail to link
+  ok   a probe of an undefined first declaration fails to link
+  --   markovmodel.h not checked: private to markov.cpp and markovcalib.cpp
+  ok   app.h compiles alone and links 1 declarations
+  ok   bluenoise.h compiles alone and links 3 declarations
+  ok   calib.h compiles alone and links 9 declarations (1 overloaded, compiled only)
+  ok   cli.h compiles alone and links 7 declarations
+  ok   defaults.h compiles alone and links 5 declarations
+  ok   dftcalib.h compiles alone and links 1 declarations
+  ok   directmask.h compiles alone and links 3 declarations
+  ok   engine.h compiles alone and links 3 declarations
+  ok   generators.h compiles alone and links 5 declarations (1 overloaded, compiled only)
+  ok   inpaint.h compiles alone and links 4 declarations (1 overloaded, compiled only)
+  ok   inpaintcalib.h compiles alone and links 1 declarations
+  ok   markov.h compiles alone and links 5 declarations
+  ok   markovcalib.h compiles alone and links 1 declarations
+  ok   mask.h compiles alone and links 3 declarations
+  ok   maskcache.h compiles alone and links 4 declarations
+  ok   maskparams.h compiles alone and links 1 declarations
+  ok   maskutil.h compiles alone and links 16 declarations (2 overloaded, compiled only)
+  ok   options.h compiles alone and links 0 declarations
+  ok   samples.h compiles alone and links 7 declarations
+  ok   spectralmask.h compiles alone and links 4 declarations
+  ok   srgb.h compiles alone and links 9 declarations (2 overloaded, compiled only)
+  ok   experiments/inpaint-20260927/thread_control.cpp still compiles
+  ok   experiments/markov-20260927/draw.cpp still compiles
+  ok   the archived drivers were found at all
+  0 failure(s) of 30
+
+=== requestcheck ===
+  --mask-out alone writes the mask
+  --threshold round --mask-out is refused
+  --mask-sample 0001 stays 0001
+
+=== flagcheck ===
+  10 --mask-* options and 5 generators; no document names one that does not exist, and --help describes them all
+
+=== samplecheck ===
+  ok   --list-samples offers exactly the films present
+  ok   a film name takes all of its scans
+  ok   unequal widths keep every pixel, not a crop of each
+  ok   a file path is used alone
+  ok   direct takes one scan, and says which
+  ok   a film with no crop says where one would go
+  ok   direct takes the film's crop rather than a scan
+  ok   dft takes the film's crop rather than its scans
+  ok   markov and inpaint still pool the scans, not the crop
+  ok   a path is used as given even when its film has a crop
+  ok   a repeat of the same crop is served from the cache
+  ok   changing the crop changes the mask, so the key saw it
+  ok   a repeat of the same film is served from the cache
+  ok   adding a scan changes the mask, so the key saw it
+  ok   removing it again returns the first mask
+  ok   adding a scan changes what the name means
+  ok   an unknown film is refused, naming the ones that exist
+  ok   with no default film installed, a missing sample is refused
+  ok   direct with no sample takes the default film, and says so
+  ok   direct's implied film is byte-identical to naming it
+  ok   dft with no sample takes the default film, and says so
+  ok   dft's implied film is byte-identical to naming it
+  ok   a markov parameter alone implies markov and then the film
+  ok   dft's calibration is scored against the film's crop
+  ok   markov's calibration is scored against the film's crop
+  ok   a bare --threshold mask still builds blue noise
+  ok   completion offers exactly what --list-samples does
+  ok   completion restates no option list
+  ok   dither --list-options offers only flags
+  ok   dither offers the generator ceilings, which --help cannot show
+  ok   maketexture --list-options offers only flags
+  ok   maketexture does not offer dither's sizing policy
+  ok   maketexture offers no blue or direct parameters
+  ok   every flag maketexture offers, maketexture accepts
+  ok  0 failure(s)
+
+=== seamparams ===
+  ok   highpass 0: direct.equalise bench 0.000, program 0.000
+  ok   highpass 0: direct.overlap bench 8.000, program 8.000
+  ok   highpass 8: direct.equalise bench 5.997, program 5.997
+  ok   highpass 8: direct.overlap bench 8.000, program 8.000
+  ok   highpass 32: direct.equalise bench 23.987, program 23.987
+  ok   highpass 32: direct.overlap bench 12.000, program 12.000
+  ok   highpass 64: direct.equalise bench 47.974, program 47.974
+  ok   highpass 64: direct.overlap bench 24.000, program 24.000
+  seamlab --check builds and scores the program's mask, and fails when it cannot
+
+=== workflowcheck ===
+  ok   install_samples into an empty config
+  ok   every shipped film is offered
+  ok   every shipped film has a crop for direct
+  ok   a plain dither
+  ok   blue noise
+  ok   4 levels
+  ok   dft grain from Ilford-Delta3200, supersampled
+  ok   markov grain from Ilford-Delta3200, supersampled
+  ok   inpaint grain from Ilford-Delta3200, supersampled
+  ok   direct grain from Ilford-Delta3200, supersampled
+  ok   direct with no sample takes the default film
+  ok   --out-size fits the result in a square
+  ok   supersampled without reducing
+  ok   the default film is named, so the run says what it used
+  ok   a repeat run is served from the mask cache
+  ok   and is byte-identical to the first
+  ok   --save-frames writes every frame
+  ok   each frame holds the ladder's tones and together they hold the picture's
+  ok   without --save-frames, the run says the file is a preview
+  ok   --budget 5 finishes in about that
+  ok   and records a measured rate for the next run
+  ok   calibrate_samples measures a film
+  ok   a later plain run takes the calibration from the config
+  ok   and --explain reports it as measured
+  ok   --explain answers without an image
+  ok   --help
+  0 failure(s)
+
+--------------------------------------------
+coltest      pass  7s
+unittest     pass  7s
+tonetest     pass  2s
+impliedtest  pass  7s
+devicetest   pass  1s
+masktest     pass  8s
+scalecheck   pass  3s
+budgetcheck  pass  1s
+shellcheck   pass  0s
+outsizecheck pass  9s
+errorcheck   pass  1s
+cachecheck   pass  7s
+findcropscheck pass  39s
+apicheck     pass  2s
+requestcheck pass  1s
+flagcheck    pass  0s
+samplecheck  pass  7s
+seamparams   pass  2s
+workflowcheck pass  25s
+--------------------------------------------
+ALL PASS

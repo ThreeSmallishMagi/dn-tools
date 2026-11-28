@@ -1,0 +1,23 @@
+-Make frames for the expose program for 1, 3 or 8 bit monochrome digital enlarger
+-Expose a 16 bit image on an 8 bit display over multiple frames
+-Make a 1 bit photogravure etching mask that looks attractive and works within the resolution limits of the medium
+  Floyd Steinberg, blue noise, halftone
+-Add realistic looking film grain to a digital image
+-Print an image using a halftone mask
+-Dither a color image to 1 bit per channel
+
+-Make frames for the expose program for 1, 3 or 8 bit monochrome digital enlarger
+Choose image
+Choose print size
+Usually enlarger height sets size and print image should fit into 4132 square
+
+convert -size 256x256 gradient: -fx "sin(2*pi*i/8)*sin(2*pi*j/8)*0.5+0.5" sine_wave.png
+dither Foma100-701a-1500.jpg --mask-sample examples/Mamiya-2484-154.jpg --mask-method inpaint --inpaint-iters 1 --inpaint-db 2000000 --inpaint-checks 128 --supersample 6 --out-size 4096
+
+ dither examples/m039crop.png --mask-method inpaint   --mask-sample examples/sine_wave10.png  --mask-scale 10 --mask-size 8192x8192   --out t.png --mask-out mt.png   --budget 120
+ convert mt.png -filter point -resize 2048 mt2048.png
+ dither samples/Foma100-701a.jpg --mask-in mt2048.png --supersample 16 --out-size 6000
+ colordither IMG_8533a.jpg 8533a.png dither --mask-method inpaint --mask-size 8096x8096 --mask-sample examples/Mamiya-2484-154.jpg --supersample 16 --inpaint-db 4000000 --inpaint-cap 1.02 --inpaint-checks 256 --inpaint-iters 1  --inpaint-scales 4 --mask-scale 4.0
+
+ dither examples/ramp_256x256.png --mask-sample lines.png --set dft.iters=1 --set dft.smooth_cells=1 --spatial 0.1 &&analyse
+

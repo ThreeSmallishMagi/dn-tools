@@ -1,0 +1,102 @@
+x read 2DFilter code
+x rebase 2DFilter branch
+x 2dFilter ux pass
+x which code is checked in?
+x what would a markov model based solution look like?
+x markov random fields?
+x how to use pairs of pixels?
+x new tool? new cpp file?
+x make a ux claude agent
+
+code review
+x all tunable  parameters:
+x     is their design right?
+x     do they behave as designed?
+x     is their defaults expression correct?
+x     is their explain string terse but sufficient for understanding?
+x is the set of parameters exposed as cmdline arguments right? --mask-weight
+x --explain requires an image
+x --explain text should left align
+x is iters too high?    smooth reaction-diffusion/reticulation pattern.
+x no arguments usage should fit on one screen
+x --help should be comprehensive
+x markov long method?
+xall code block review: can this be written more cleanly and concisely?  make a list of each "yes" and f
+x go through the list after the pass
+x move files to test/ and docs/
+x add image files
+x look in .config/dither for samples
+x read  multiple samples
+x automatically cache masks
+x    only on --mask-out
+x   .config/dither/mask-base-size-1024x1024-mask-scale:1-mask.iters=6
+x   if dither/mask... exists , use it
+x remove inpaintmask
+x mask.highpass, spectral.smoothcells, markov.reuse
+x 16->8 bit support?
+x what is a  good definition for "best parameters"?
+x what are the best parameters for different methods and samples
+x architectural review
+multiple tiles for direct
+x overlapping seam for direct
+x understand high-pass side effect
+x     revert build edits
+x     examples are frog, greyd and kodak-4X
+x     methods are  no change, moisan, high pass
+x is rank_flat_rnd ever useful?
+x how to fix high pass filter
+x how to tell claude about hp_wrap
+x  abandon and try seam algorithm?
+x `what should dither have in it? fix in seamlab first
+blue noise for tie resolution ( or a blur of the image as a second sort order or a constant offset)
+x sine tiles good sizes
+x fix the -help text
+x change --set module.param=value to --module-param value 
+x implement code review comments 
+x image size change ?  --image-scale  or perhaps --scale  ( resolve -mask-scale and --supersample ):  -> add --scale.   supersample but don't reduce
+x    --out-size
+x push branch upstream
+x film samples in .config
+x 4096 max to 2048
+x code review recent changes
+x why does inpaint 2484 show speckling?
+
+Todo for release:
+  x add --out-size
+  x use whole sample for multiple source samples
+  x deploy correct samples
+  x way of choosing flat samples for --mask-method direct
+  x  add polynomial fit
+  x different default for --mask-method
+  x default value for --mask-sample
+  x --direct-overlap awkward UX
+  plumb branches and tags across repos
+  x list real workflows and test them: doc/uses.txt's, at reduced size, 22 Nov
+  x integrate accuracy fixes to v1: 2dd719e, 3155d8f
+  x new features page: https://claude.ai/artifact/HbXkfenepb2N9rCDRZqzac, version 2,
+    rebuilt by doc/tour/build.sh
+  x re-measure doc/bugs.txt: every case within 3/1000 a band
+  x build and test a clean export of master: 19 of 19
+  x colordither: returned rather than exiting the shell, no EXIT trap
+  tag the release and push master
+  decide which doc/ notes deploy publishes (reviews, triage, improvements)
+  remove or commit ditherV1, ditherV1a, ditherV1b, examples/lines-warped.png
+  rerun calibrate_samples after upgrading: calibration keys changed
+
+x   What should the end user workflow for --mask-method direct be? Here's what I think.  Crops are installed to .config/dither/crops by test/findcrops at install time. dither generators will not look at crops/ --mask-sample will choose the sample from crops/ Only one crop is made, and the whole sample is used by default.  films.tsv should live in examples/  and install_samples() installs the full images for the generators. Findcrops looks at examples/films.tsv, and the internal CHOSEN list moves to films.tsv.   We choose good values for  the shipped grain samples. When an end user installs a new crop, they add it to .config/dither/samples/ and run test/findcrops --write .config/dither/samples/new.jpg to select a crop for crops/   or perhaps they add the file to examples/, add to films.tsv and rerun install_samples()
+x   Also, I think that --direct-equalise 12 is too small. a default of 18-32 would be better.
+
+x Direct waves:
+  x can image be flattened using some sort of warp/scale?
+  x   parametric flattening: 32x32 blur image points 16,16, W/2,16, -16,16, 16,H/2,...
+  x        linear transform that makes all alignment points have the same value
+  x 3 cases:  greyd.png: 2 tones, Kodak-4X-1.png: black and mid,  Kodak-4X-2.png: mid only
+  x   find case where --quantise is useful (greyd with highpass)
+  x output low pass debug image
+  x is there an off by one error?
+  x does a different implementation show the problem?
+
+Next release:
+  halftone overlap support
+  halftone channel rotation
+

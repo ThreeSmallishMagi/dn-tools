@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Would a patch of this mask disappear if you dropped it into the sample?
+
+  patchfit <sample> <mask> [<mask> …] --method M | --highpass PX [--block N] [--csv FILE]
+
+`maskfit` compares radial spectra and `levelfit` compares how much each level
+set clumps. Both are necessary and neither is sufficient: a texture can match a
+spectrum and a clumping profile and still look nothing like film, because
+neither sees the *shape* of what clumped. The known case is markov at high
+`markov.iters`, where the clumps stretch into connected worm-like ridges —
+CLAUDE.md records that this "has to be checked by eye", which is what this
+replaces.
+
+The question here is the one you would ask by eye: cut a patch out of the mask,
+paste it into the sample, and see whether the join shows. That is a two-sample
+problem, so it is answered like one. Both fields get the treatment a mask gets
+(high-pass, crop, rank flat), each is cut into blocks, each block becomes a
+feature vector, and the mask's mean feature vector is scored against the
+distribution of real patches of that film by Mahalanobis distance.
+
+The unit is therefore "standard deviations of real patch variation", and the
+floor is not zero: film is not stationary, so one real patch already differs
+from the others. patchfit prints that floor, by leave-one-out over the real
+patches, and every number should be read against it.
+
+Measured on 4Xcrop at 256x256 blocks of 32:
+
+    real patch (floor)   2.8 median, 5.1 worst
+    dft                 14
+    markov              23 to 35 depending on markov.iters
+    white noise         87
+    void-and-cluster   362
+
+The features, eleven of them, and what each is for:
+
+  energy/ridgeness x 3 octaves
+      Band energy is the spectrum, which is what dft already matches. Ridgeness
+      is the structure-tensor coherence of that band -- 0 where the band is
+      locally isotropic, 1 where it is a ridge -- and it is the one that sees
+      worming. Across markov.iters 3/12/40/80 the coarse figure reads
+      1.2/10.0/14.7/15.3 while the clumping metrics sit on a plateau.
+  env corr fine-mid, mid-coarse
+      Correlation between the envelopes of adjacent octaves: in real grain a
+      coarse feature and the fine detail riding on it occur together. This lives
+      entirely in the phase, so it is zero-cost for a generator to get wrong.
+  clump at 0.25 / 0.50 / 0.75
+      Low-frequency energy of each level set, which is levelfit's measurement
+      taken locally. Ranking both fields flat makes their marginals identical by
+      construction, so tone-dependent clumping only shows level by level. dft
+      reads -9.2 at the midpoint: its level sets do not clump at all.
+
+Two cautions. The total is a weighted combination, and the weighting comes from
+how much real patches vary in each feature, not from how visible each is -- it
+is a statistical distance, not a perceptual one, and the per-feature columns are
+the part to trust. And a low total says the eleven features match, not that the
+textures are identical; no fixed feature set can say that.
+"""
+import argparse, os, sys
+import numpy as np
+import cv2
+import maskref
+
+FEATURES = ['energy fine', 'ridgeness fine', 'energy mid', 'ridgeness mid',
+            'energy coarse', 'ridgeness coarse', 'env corr f-m', 'env corr m-c',
+            'clump@0.25', 'clump@0.50', 'clump@0.75']
+SHORT    = ['Efine', 'Rfine', 'Emid', 'Rmid', 'Ecoar', 'Rcoar',
+            'Cfm', 'Cmc', 'L.25', 'L.50', 'L.75']
+NSCALE = 3
+
+ap = argparse.ArgumentParser()
+ap.add_argument('sample', help="the film the masks are imitating")
+ap.add_argument('mask', nargs='+', help="mask(s) to score")
+maskref.add_arguments(ap, "the real patches")
+ap.add_argument('--block', type=int, default=32, metavar='N',
+                help="feature block size (default 32). Blocks do not overlap, so "
+                     "no two share a pixel")
+ap.add_argument('--patches', type=int, default=64, metavar='N',
+                help="most real patches to cut from the sample (default 64)")
+ap.add_argument('--csv', metavar='FILE', help="write per-mask per-feature z-scores here")
+args = ap.parse_args()
+maskref.resolve(args, ap)
+
+
+def blur(f, sigma):
+    """Gaussian blur in the frequency domain: exactly periodic, which is what a
+       toroidal mask needs and what the sample's high-pass already assumes."""
+    H, W = f.shape
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.fftfreq(W)[None, :]
+    g = np.exp(-2 * np.pi ** 2 * sigma ** 2 * (fy ** 2 + fx ** 2))
+    return np.real(np.fft.ifft2(np.fft.fft2(f) * g))
+
+
+def rank_flat(a):
+    """Values replaced by their rank on [0,1). The mask is already flat; this is
+       what puts the sample on the same footing, so nothing below is measuring
+       the difference between a photograph and a threshold mask."""
+    flat = a.ravel()
+    out = np.empty(flat.size)
+    out[np.argsort(flat, kind='stable')] = np.arange(flat.size) / flat.size
+    return out.reshape(a.shape)
+
+
+def real_patches(img, size):
+    """Every non-overlapping `size` crop of the sample, each treated as a mask."""
+    f = img.astype(np.float64)
+    if args.highpass:
+        f = f - blur(f, 0.1874 * args.highpass)
+    H, W = size
+    out = []
+    for y in range(0, f.shape[0] - H + 1, H):
+        for x in range(0, f.shape[1] - W + 1, W):
+            # Negated, so the patch is the mask it would be: brightest lowest,
+            # since a mask lights its lowest cells first.
+            out.append(rank_flat(-f[y:y + H, x:x + W]))
+            if len(out) >= args.patches:
+                return out
+    return out
+
+
+def feature_maps(f):
+    """Per-pixel maps whose block means make up the feature vector."""
+    maps = []
+    f = f - f.mean()
+    prev = f
+    envelopes = []
+    for s in range(NSCALE):
+        smooth = blur(f, 1.4 * (2 ** s))
+        band = prev - smooth
+        prev = smooth
+        maps.append(band * band)
+        # Structure tensor, differenced toroidally. Its eigenvalue ratio is the
+        # difference between a field of blobs and a field of ridges, which no
+        # spectrum and no clump count distinguishes.
+        gx = (np.roll(band, -1, 1) - np.roll(band, 1, 1)) * 0.5
+        gy = (np.roll(band, -1, 0) - np.roll(band, 1, 0)) * 0.5
+        maps += [gx * gx, gy * gy, gx * gy]
+        e = np.abs(band)
+        envelopes.append((e - e.mean()) / (e.std() + 1e-12))
+    for s in range(NSCALE - 1):
+        maps.append(envelopes[s] * envelopes[s + 1])
+    for g in (0.25, 0.50, 0.75):
+        indicator = (f > np.quantile(f, g)).astype(np.float64) - (1 - g)
+        maps.append(blur(indicator, 4.0) ** 2)
+    return maps
+
+
+def features(f):
+    """One row per non-overlapping block of f, one column per feature."""
+    w = args.block
+    H, W = f.shape
+    def block_means(m):
+        return m[:H // w * w, :W // w * w].reshape(H // w, w, W // w, w).mean((1, 3)).ravel()
+    mb = [block_means(m) for m in feature_maps(f)]
+    cols = []
+    for s in range(NSCALE):
+        energy, jxx, jyy, jxy = mb[4 * s:4 * s + 4]
+        cols.append(np.log(energy + 1e-12))
+        trace = jxx + jyy
+        disc = np.sqrt(np.maximum(trace * trace / 4 - (jxx * jyy - jxy * jxy), 0))
+        cols.append(2 * disc / (trace + 1e-12))
+    rest = mb[4 * NSCALE:]
+    cols += list(rest[:NSCALE - 1])                                  # envelope correlations
+    cols += [np.log(np.abs(m) + 1e-9) for m in rest[NSCALE - 1:]]    # clump energies
+    return np.column_stack(cols)
+
+
+def model(patches):
+    """Mean, inverse covariance and spread of the real patches' feature vectors.
+       Shrunk towards its diagonal: there are a few dozen patches and eleven
+       features, so the raw covariance is not well enough determined to invert."""
+    X = np.array([features(p).mean(0) for p in patches])
+    C = np.cov(X.T)
+    C = 0.75 * C + 0.25 * np.diag(np.diag(C) + 1e-12)
+    return X.mean(0), np.linalg.pinv(C), X.std(0) + 1e-12
+
+
+def distance(mu, Cinv, f):
+    d = features(f).mean(0) - mu
+    return float(np.sqrt(max(d @ Cinv @ d, 0)))
+
+
+sample = cv2.imread(args.sample, cv2.IMREAD_GRAYSCALE)
+if sample is None:
+    sys.exit(f"cannot read {args.sample}")
+first = cv2.imread(args.mask[0], cv2.IMREAD_GRAYSCALE)
+if first is None:
+    sys.exit(f"cannot read {args.mask[0]}")
+size = first.shape
+if sample.shape[0] < size[0] or sample.shape[1] < size[1]:
+    sys.exit(f"{args.sample} is {sample.shape[1]}x{sample.shape[0]}, smaller than the "
+             f"{size[1]}x{size[0]} patch it would have to be cut into")
+
+patches = real_patches(sample, size)
+if len(patches) < 8:
+    sys.exit(f"only {len(patches)} real patches of {size[1]}x{size[0]} fit in the sample; "
+             f"at least 8 are needed to say how much real patches vary")
+mu, Cinv, sd = model(patches)
+
+# Leave-one-out: a real patch scored against the others is the floor, and the
+# floor is not zero because film is not stationary.
+loo = []
+for i in range(len(patches)):
+    m2, C2, _ = model(patches[:i] + patches[i + 1:])
+    loo.append(distance(m2, C2, patches[i]))
+
+print(f"sample {os.path.basename(args.sample)}: {len(patches)} real patches of "
+      f"{size[1]}x{size[0]}, blocks of {args.block}, highpass {args.highpass:g}")
+print(f"floor (a real patch against the others): median {np.median(loo):.1f}, "
+      f"worst {max(loo):.1f}\n")
+print(f"{'mask':<24} {'dist':>6}  " + "".join(f"{n:>7}" for n in SHORT))
+print(f"{'':<24} {'':>6}  " + "".join(f"{'-'*len(n):>7}" for n in SHORT))
+
+rows, results = [], []
+for path in args.mask:
+    m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        sys.exit(f"cannot read {path}")
+    if m.shape != size:
+        sys.exit(f"{path} is {m.shape[1]}x{m.shape[0]}, not {size[1]}x{size[0]} like "
+                 f"{os.path.basename(args.mask[0])}; the patch size has to be one thing")
+    f = m.astype(np.float64) / 255.0
+    z = (features(f).mean(0) - mu) / sd
+    d = distance(mu, Cinv, f)
+    results.append((path, d, z))
+    print(f"{os.path.basename(path):<24} {d:6.1f}  " + "".join(f"{v:7.1f}" for v in z))
+    rows += [(os.path.basename(path), n, zi) for n, zi in zip(FEATURES, z)]
+
+if args.csv:
+    with open(args.csv, 'w') as fh:
+        fh.write('mask,feature,z\n')
+        for name, feat, zi in rows:
+            fh.write(f"{name},{feat},{zi:.4f}\n")
+
+print("\n  E/R = band energy / ridgeness, at fine, mid and coarse octaves."
+      "  C = envelope correlation,\n  fine-mid and mid-coarse.  L = level-set clumping at that quantile."
+      "\n  All in real-patch standard deviations; sign says which way it is wrong.")
+for path, d, z in results:
+    worst = FEATURES[int(np.argmax(np.abs(z)))]
+    print(f"RESULT kind=patch mask={os.path.basename(path)} dist={d:.3f} "
+          f"floor={np.median(loo):.3f} worst={worst.replace(' ', '_')}={z[np.argmax(np.abs(z))]:.2f}")

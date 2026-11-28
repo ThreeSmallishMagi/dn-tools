@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Per-column density check.
+
+  colstats <out> [<ref>] [--linear] [--tol Z] [--cols first:last] [--group N]
+
+Compares column means of <out> (the image being evaluated) against <ref>
+(default: examples/ramp_256x256.png). For a correctly density-preserving
+dither, the linear-light mean of each output column should match the linear
+mean of the corresponding reference column to within counting noise (~σ/√N).
+A 0.5 LSB noise floor is assumed: deviations smaller than a fraction of an 8-bit
+output level are never flagged regardless of sample count.
+
+--group N tests N adjacent columns at a time instead of one. Every term of the
+standard error falls as 1/√samples, so a fixed bias reads √N larger in z and a
+small one applied everywhere stops hiding under per-column noise. A dither can
+pass every single column at 3σ and still be systematically off: scaling the
+diffused residual by --spatial once shifted the shadows by 27/1000 in linear
+light while colstats reported PASS on all 256 columns. Try --group 16 or 32 when
+a result looks wrong but every column passes.
+
+How much to trust a grouped PASS
+--------------------------------
+The standard error here assumes the samples are independent. They are, for a
+stochastic threshold with no diffusion, and there the model is well calibrated:
+measured against the spread of 20 seeds, --threshold random --spatial 0 reads
+1.07 to 1.21x the true standard error at groups of 8 to 32.
+
+They are emphatically not independent once error diffusion or a mask is
+involved. Both actively cancel error, so the mean over a region converges nearer
+1/n than 1/√n and the true standard error is far below the model:
+
+    --threshold mask --spatial 1, model / true SE
+    group      1      8     16     32
+    ratio   1.5x   4.3x   6.3x   8.3x
+
+So a grouped FAIL is strong evidence and a grouped PASS is weaker than its
+z-score suggests -- by group 32, up to 8x weaker for diffused output. The √N
+gain in z for a fixed bias is real and is why grouping works; what is not
+claimed is that 3σ here means a 0.3% false-negative rate.
+
+Two ways of estimating the standard error from the image itself were tried and
+are worse, so it is not worth rediscovering them. Row-batch means is unstable at
+small groups and degenerates for a deterministic threshold, where the batches
+agree, the estimate collapses and everything fails: --threshold round with full
+diffusion has no seed-to-seed variation at all. Two-dimensional block means is
+stable but still 3 to 8x conservative for diffused output, because the
+anti-correlation error diffusion creates is long-range and no estimator built
+from blocks inside one image can see it. Calibrating this properly needs either
+a noise model per dither type or a multi-seed reference run, neither of which
+belongs in a tool that looks at one image.
+"""
+import os, sys, math, argparse
+import cv2
+import numpy as np
+
+DEFAULT_REF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'examples', 'ramp_256x256.png')
+
+ap = argparse.ArgumentParser()
+ap.add_argument('out', help="image being evaluated")
+ap.add_argument('ref', nargs='?', default=DEFAULT_REF,
+                help=f"reference image (default: {DEFAULT_REF})")
+ap.add_argument('--linear', action='store_true',
+                help="treat pixel values as raw linear (skip sRGB decode)")
+ap.add_argument('--tol',   type=float, default=3.0, help="pass if |z| <= tol (default 3σ)")
+ap.add_argument('--cols',  default=None, help="column range 'first:last' (default full width)")
+ap.add_argument('--group', type=int, default=1, metavar='N',
+                help="pool N adjacent columns per test (default 1). Cuts the noise "
+                     "by sqrt(N), exposing systematic error that hides in it")
+ap.add_argument('--csv',   default=None, metavar='FILE',
+                help="write per-column stats (col,ref_lin,out_lin,dev_lin,z) to FILE")
+args = ap.parse_args()
+if args.group < 1: sys.exit("--group must be at least 1")
+
+def load(path):
+    # ANYDEPTH so a 16-bit reference keeps its precision. Without it imread
+    # silently hands back 8 bits: the tone is right but the reference is
+    # quantised to the same grid as the output, which understates how well a
+    # 16-bit input was rendered -- the one thing such a comparison is for.
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
+    if img is None: sys.exit(f"cannot read {path}")
+    # Everything below speaks the [0,255] code scale. 16-bit white and 8-bit
+    # white are the same colour, so this is a change of units, not of tone.
+    scale = 255.0 / 65535.0 if img.dtype == np.uint16 else 1.0
+    return img.astype(np.float64) * scale
+
+def _srgb_decode(img):
+    """img: float array in [0,255] → linear float in [0,1]."""
+    x = img / 255.0
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+def _srgb_encode(linear):
+    """linear: scalar in [0,1] → sRGB pixel value in [0,255]."""
+    if linear <= 0.0031308:
+        return linear * 12.92 * 255.0
+    return (1.055 * linear ** (1.0 / 2.4) - 0.055) * 255.0
+
+def to_linear(img):
+    if args.linear:
+        return img / 255.0
+    return _srgb_decode(img)
+
+def to_display(lin_mean):
+    """Convert a linear-space mean to a display pixel value for printing."""
+    if args.linear:
+        return lin_mean * 255.0
+    return _srgb_encode(float(lin_mean))
+
+# Column sampling: dense at the start of the requested range, then log-spaced.
+def sampled(first, last):
+    offset = 1
+    while first + offset - 1 < last:
+        j = first + offset - 1
+        yield j
+        offset = max(offset + 1, int(offset * 1.2))
+    yield last
+
+def parse_cols(spec, W):
+    if spec is None: return 0, W - 1
+    parts = spec.split(':')
+    if len(parts) != 2: sys.exit(f"--cols expects 'first:last', got {spec!r}")
+    return int(parts[0]), int(parts[1])
+
+def multiset_s(data):
+    """Return a string  {value: count}... for the given iterable."""
+    unique_vals, counts = np.unique(data, return_counts=True)
+    d = dict(zip(unique_vals, counts))
+    return ','.join(f"{v:.0f}:{c}" for v, c in d.items())
+
+out = load(args.out)
+ref = load(args.ref)
+if out.shape != ref.shape:
+    sys.exit(f"shape mismatch: out {out.shape} vs ref {ref.shape}")
+
+W = out.shape[1]
+N = out.shape[0]
+first, last = parse_cols(args.cols, W)
+first = max(0, min(first, W - 1))
+last  = max(first, min(last, W - 1))
+
+ref_lin = to_linear(ref)
+out_lin = to_linear(out)
+
+print(f"out={args.out} ref={args.ref} colorspace={'linear' if args.linear else 'sRGB'} "
+      f"N={N} tol={args.tol}σ" + (f" group={args.group}" if args.group > 1 else ""))
+print(f"SE:Standard error  z:z-score=dev/se <{args.tol}σ to pass")
+print(f"ref/out: sRGB-encoded linear mean (px).  Δ/σ/SE: linear × 255.")
+print(f"{'cols' if args.group > 1 else 'col':>7} {'ref':>7} {'out':>6} {'diff':>5} {'Δpx':>7} {'σpx':>6} {'SEpx':>6} {'z':>6} {'#white':>6} {'result':>6}")
+
+def slab_stats(lo, hi):
+    """Statistics for columns [lo, hi] pooled together. hi == lo is one column."""
+    ref_slab, out_slab = ref_lin[:, lo:hi + 1], out_lin[:, lo:hi + 1]
+    cols = hi - lo + 1
+    n = ref_slab.size                       # N rows x cols columns of samples
+    expect, actual = ref_slab.mean(), out_slab.mean()
+    # Spread of the *deviation*, so a reference that varies across the slab
+    # contributes its structure to neither the mean nor the noise. For a single
+    # ramp column the reference is constant and this is out_slab.std() exactly.
+    sigma = (out_slab - ref_slab).std()
+    # Three floors on the standard error, largest wins, each falling as
+    # 1/sqrt(samples) so pooling genuinely tightens the test:
+    #   measured: sigma/sqrt(n)
+    #   binomial: sqrt(p(1-p)/n) — the true SE for single-frame binary output
+    #   LSB floor: half a level per column mean, pooled down by sqrt(cols) —
+    #              stops z blowing up at sRGB endpoints where binomial SE -> 0
+    p = min(max(expect, 1e-12), 1 - 1e-12)
+    se = max(sigma / math.sqrt(n),
+             math.sqrt(p * (1 - p) / n),
+             0.5 / 255.0 / math.sqrt(cols))
+    return expect, actual, sigma, se, np.sum(out_slab >= 0.999)
+
+
+# One entry per test: a single column by default, a slab of --group otherwise.
+groups = [(lo, min(lo + args.group - 1, last))
+          for lo in range(first, last + 1, args.group)]
+
+# Check every group for overall pass/fail; print only the sampled subset.
+shown = set(sampled(0, len(groups) - 1)) if len(groups) > 1 else {0}
+fails = 0
+worst_z = 0.0
+worst_col = first
+abs_z_sum = 0.0
+csv_rows = []
+for gi, (lo, hi) in enumerate(groups):
+    expect, actual, sigma, se, white = slab_stats(lo, hi)
+    dev = actual - expect
+    z = dev / se
+    abs_z_sum += abs(z)
+    ref_pix, out_pix = to_display(expect), to_display(actual)
+    ok = abs(z) <= args.tol
+    if not ok: fails += 1
+    if abs(z) > abs(worst_z): worst_z, worst_col = z, lo
+    label = str(lo) if lo == hi else f"{lo}-{hi}"
+    if args.csv is not None:
+        csv_rows.append((label, round(ref_pix, 1), round(out_pix, 1),
+                         round(out_pix - ref_pix, 1), round(z, 3)))
+    if gi in shown:
+        print(f"{label:>7} {ref_pix:7.2f} {out_pix:6.2f} {round(out_pix - ref_pix):+5d} "
+              f"{dev*255:+7.2f} {sigma*255:6.2f} {se*255:6.2f} {z:+6.1f} {white:6d} "
+              f"{'PASS' if ok else 'FAIL'} "
+              # The reference multiset is one entry per tone, so for a slab it is
+              # just a list of the tones in it. Only the output's is worth seeing.
+              + (f"{multiset_s(ref[:, lo:hi+1])}   " if lo == hi else "")
+              + multiset_s(out[:, lo:hi + 1]))
+
+if args.csv is not None:
+    import csv
+    with open(args.csv, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['cols' if args.group > 1 else 'col', 'ref', 'out', 'dev_px', 'z'])
+        w.writerows(csv_rows)
+
+cols_checked = len(groups)
+average_abs_z = abs_z_sum / cols_checked
+verdict = 'PASS' if fails == 0 else 'FAIL'
+print('-' * 60)
+print(f"checked={cols_checked} fails={fails} worst |z|={abs(worst_z):.1f} at col {worst_col}  "
+      f"OVERALL {verdict}")
+# Machine-readable trailer: parsed by coltest. Keep stable across versions.
+print(f"RESULT verdict={verdict} checked={cols_checked} fails={fails} "
+      f"worst_z={abs(worst_z):.3f} worst_col={worst_col} "
+      f"average_abs_z={average_abs_z:.3f}"
+      # Only when grouping, so --group 1 leaves the trailer byte-identical for
+      # anything already parsing it.
+      + (f" group={args.group}" if args.group > 1 else ""))
+sys.exit(0 if fails == 0 else 1)

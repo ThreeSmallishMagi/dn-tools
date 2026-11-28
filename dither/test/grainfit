@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Does this mask's grain have the film's *shape*, without assuming a high-pass?
+
+  grainfit <sample> <mask> [<mask> …] [--block N] [--levels g,g,…] [--csv FILE]
+
+`patchfit` answers the same question and cannot be used to judge a change to the
+field preparation, which is why this exists. Its reference is the sample put
+through `prepare_texture_sample` -- a *subtractive* high-pass at a chosen cutoff
+-- so a mask built any other way is scored against a reference that already
+embodies the choice being tested. Measured: a mask from a logarithmic high-pass
+reads 22.9 on patchfit against a subtractive one's 3.6, and by eye it is the
+better mask. That number is mostly the preparation disagreeing with itself.
+
+So nothing here filters either field.
+
+**Tone is removed by a quantile, not by a convolution.** A level set is taken at
+each field's own g-quantile, which needs no cutoff, no sigma and no window: it
+is defined by the ordering alone. Both the sample and the mask get exactly the
+same treatment, and the treatment is invariant under any monotone remapping of
+values -- which is the whole family of differences between one preparation and
+another that a ranked mask can express. A spatial filter is not monotone, but
+nothing here applies one, so there is nothing for it to disagree with.
+
+**What is measured is the shape of the level set, not its size.** Each binary
+pattern is cut into blocks and each block becomes four numbers:
+
+  boundary      share of pixels with an unlike 4-neighbour. Fine grain has more
+                boundary per unit area than coarse grain; this is the scale.
+  components    connected components of the on-set per unit area. Together with
+                boundary it separates "many small clumps" from "few large ones"
+                and from "one connected labyrinth" -- which is what worming is.
+  corr length   mean radius of the block's autocorrelation, weighted by its
+                positive part. The scale again, measured a second way, because
+                boundary is a local count and this is not. A weighted mean
+                rather than a 1/e crossing because every pattern has one and no
+                crossing search can miss it on a noisy block.
+  anisotropy    eccentricity of the autocorrelation's second moments. 0 is
+                round, 1 is a stripe. This is what catches grain with a
+                direction, and a generator that invents one.
+
+Four features at each of three quantiles is twelve, scored the way patchfit
+scores its eleven: the mask's mean feature vector against the distribution of
+*real* patches of the film, by Mahalanobis distance, so the unit is standard
+deviations of real patch variation and the floor is not zero. The floor is
+printed, by leave-one-out, and every number should be read against it.
+
+**On-fraction is deliberately not one of the features.** It measures local
+density rather than shape, it is the thing a non-flat mask gets wrong, and
+folding it in would make one number answer two questions. It is reported in its
+own column instead -- `dens`, the spread of block on-fractions about the
+quantile they should hold, which is what `seamlab`'s `flat` column measures and
+what a high-passed natural image gets wrong.
+"""
+import argparse
+import os
+import sys
+
+import cv2
+import numpy as np
+
+ap = argparse.ArgumentParser(description=__doc__,
+                             formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument('sample')
+ap.add_argument('mask', nargs='+')
+ap.add_argument('--block', type=int, default=12, metavar='N',
+                help='block side the features are measured over (default: 12)')
+ap.add_argument('--prep', default='raw,sub,log', metavar='P,P',
+                help='reference preparations to score against: raw, sub '
+                     '(subtractive high-pass), log (logarithmic) (default: all three)')
+ap.add_argument('--highpass', type=float, default=32.0, metavar='PX',
+                help='cutoff for the sub and log preparations (default: 32)')
+ap.add_argument('--levels', default='0.25,0.5,0.75', metavar='G,G',
+                help='quantiles the level sets are taken at (default: 0.25,0.5,0.75)')
+ap.add_argument('--patches', type=int, default=64, metavar='N',
+                help='most real patches to model the film with (default: 64)')
+ap.add_argument('--csv', metavar='FILE', help='also write the per-feature table')
+args = ap.parse_args()
+
+LEVELS = [float(g) for g in args.levels.split(',')]
+if not all(0.0 < g < 1.0 for g in LEVELS):
+    sys.exit('--levels must be strictly between 0 and 1')
+
+
+def level_set(f, g):
+    """The cells a mask lights at density g: the field below its own
+       g-quantile, a mask lighting its lowest cells first. No filter, no cutoff:
+       the only thing this depends on is the ordering of the values, so it says
+       the same of a field and of any monotone remapping of it."""
+    return f < np.quantile(f, g)
+
+
+def block_features(b):
+    """The four shape numbers for one binary block."""
+    b = b.astype(np.float64)
+    n = b.size
+    on = b.mean()
+    # A block that is entirely one phase has no shape to measure. Returning NaN
+    # rather than zeros keeps it out of the mean instead of dragging it down.
+    if on <= 0.0 or on >= 1.0:
+        return [np.nan] * 4
+
+    # boundary: unlike 4-neighbours, counted on the interior so no border
+    # convention is needed and the sample and the mask are treated alike.
+    h = np.abs(np.diff(b, axis=1)).sum()
+    v = np.abs(np.diff(b, axis=0)).sum()
+    boundary = (h + v) / n
+
+    comps = cv2.connectedComponents(b.astype(np.uint8), connectivity=8)[0] - 1
+    comps = comps / n
+
+    # Autocorrelation of the zero-mean block, by FFT. Normalised so the peak is
+    # 1, which makes the two numbers below pure shape.
+    z = b - on
+    p = np.abs(np.fft.fft2(z)) ** 2
+    ac = np.fft.fftshift(np.real(np.fft.ifft2(p)))
+    peak = ac.max()
+    if peak <= 0:
+        return [boundary, comps, np.nan, np.nan]
+    ac = ac / peak
+    cy, cx = np.array(ac.shape) // 2
+
+    yy, xx = np.mgrid[:ac.shape[0], :ac.shape[1]]
+    r = np.hypot(yy - cy, xx - cx)
+    # correlation length: the mean radius weighted by the positive part of the
+    # autocorrelation, which is finite for every pattern and needs no crossing
+    # search that a noisy block could miss.
+    w = np.clip(ac, 0.0, None)
+    corr = float((r * w).sum() / max(w.sum(), 1e-12))
+
+    # anisotropy: eccentricity of that same weight's second moments.
+    dy, dx = yy - cy, xx - cx
+    sw = max(w.sum(), 1e-12)
+    myy = float((w * dy * dy).sum() / sw)
+    mxx = float((w * dx * dx).sum() / sw)
+    mxy = float((w * dx * dy).sum() / sw)
+    tr, det = myy + mxx, myy * mxx - mxy * mxy
+    disc = max(tr * tr / 4.0 - det, 0.0) ** 0.5
+    l1, l2 = tr / 2.0 + disc, tr / 2.0 - disc
+    aniso = float((l1 - l2) / l1) if l1 > 0 else np.nan
+
+    return [boundary, comps, corr, aniso]
+
+
+def features(f):
+    """One feature vector per block, over every quantile.
+
+    **The quantile is taken inside each block, not over the patch**, and that is
+    the whole reason this metric can judge a preparation. Over a patch, the
+    level set at g=0.5 is simply the brighter half of the patch -- the subject,
+    not the grain -- and a raw film patch then looks nothing like any mask. Over
+    a block small enough that the tone is near enough constant, the level set
+    *is* the grain at that block's density. A high-pass subtracts something
+    nearly constant there, and a quantile threshold does not notice a constant,
+    which is exactly the invariance wanted: the same block scores the same
+    whether it was high-passed, log-high-passed or left alone."""
+    B = args.block
+    rows = []
+    for y in range(0, f.shape[0] - B + 1, B):
+        for x in range(0, f.shape[1] - B + 1, B):
+            blk = f[y:y + B, x:x + B]
+            v = []
+            for g in LEVELS:
+                v += block_features(level_set(blk, g))
+            rows.append(v)
+    return np.array(rows, dtype=np.float64)
+
+
+def density(f):
+    """Spread of block on-fractions about the quantile they should hold.
+
+    Separate from the features on purpose: this is local *density*, not shape.
+    A field whose level set is not evenly spread dithers some regions lighter
+    than others, which is a tone error rather than a texture one."""
+    B = args.block
+    out = []
+    for g in LEVELS:
+        s = level_set(f, g)
+        fr = [s[y:y + B, x:x + B].mean()
+              for y in range(0, f.shape[0] - B + 1, B)
+              for x in range(0, f.shape[1] - B + 1, B)]
+        out.append(np.std(fr))
+    return float(np.mean(out))
+
+
+def mean_vec(f):
+    X = features(f)
+    with np.errstate(invalid='ignore'):
+        return np.nanmean(X, axis=0)
+
+
+def prepare(img, how):
+    """The sample as one of several references.
+
+    The point of having more than one is that no single preparation can be
+    neutral: a mask built from a subtractively high-passed field matches a
+    subtractively high-passed reference partly because they were made the same
+    way. Scoring against all of them turns that circularity into something
+    visible -- if each mask wins only under its own preparation, none of them is
+    better, and if one wins under all three the result does not rest on the
+    choice."""
+    f = img.astype(np.float64)
+    if how == 'raw':
+        return f
+    sigma = 0.1874 * args.highpass
+    if how == 'sub':
+        return f - cv2.GaussianBlur(f, (0, 0), sigma, sigma, borderType=cv2.BORDER_REFLECT)
+    if how == 'log':
+        lg = np.log(f + 1.0)
+        return lg - cv2.GaussianBlur(lg, (0, 0), sigma, sigma, borderType=cv2.BORDER_REFLECT)
+    sys.exit(f"unknown preparation {how}")
+
+
+def real_patches(img, size):
+    """Every non-overlapping mask-sized crop of the sample."""
+    f = img
+    H, W = size
+    out = []
+    for y in range(0, f.shape[0] - H + 1, H):
+        for x in range(0, f.shape[1] - W + 1, W):
+            out.append(f[y:y + H, x:x + W])
+            if len(out) >= args.patches:
+                return out
+    return out
+
+
+def model(vecs):
+    """Mean and inverse covariance of the real patches, shrunk toward the
+       diagonal: a few dozen patches do not determine twelve features well
+       enough to invert raw. The same treatment patchfit gives its eleven."""
+    X = np.array(vecs)
+    keep = ~np.any(~np.isfinite(X), axis=0)      # a feature no patch could give
+    X = X[:, keep]
+    C = np.cov(X.T)
+    C = 0.75 * C + 0.25 * np.diag(np.diag(C) + 1e-12)
+    return X.mean(0), np.linalg.pinv(C), keep
+
+
+def distance(mu, Cinv, keep, v):
+    d = v[keep] - mu
+    if not np.all(np.isfinite(d)):
+        return float('nan')
+    return float(np.sqrt(max(d @ Cinv @ d, 0.0)))
+
+
+sample = cv2.imread(args.sample, cv2.IMREAD_GRAYSCALE)
+if sample is None:
+    sys.exit(f"cannot read {args.sample}")
+first = cv2.imread(args.mask[0], cv2.IMREAD_GRAYSCALE)
+if first is None:
+    sys.exit(f"cannot read {args.mask[0]}")
+size = first.shape
+if sample.shape[0] < size[0] or sample.shape[1] < size[1]:
+    sys.exit(f"{args.sample} is {sample.shape[1]}x{sample.shape[0]}, smaller than the "
+             f"{size[1]}x{size[0]} patch it would have to be cut into")
+
+PREPS = [p.strip() for p in args.prep.split(',') if p.strip()]
+
+print(f"{args.sample}: blocks of {args.block}, levels {','.join(str(g) for g in LEVELS)}, "
+      f"preparations {'/'.join(PREPS)}")
+
+models, floors = {}, {}
+for how in PREPS:
+    # Negated, so each patch is the mask it would be: brightest lowest, since a
+    # mask lights its lowest cells first.
+    pats = real_patches(-prepare(sample, how), size)
+    if len(pats) < 8:
+        sys.exit(f"only {len(pats)} real patches of {size[1]}x{size[0]} fit in "
+                 f"{args.sample}; at least 8 are needed to say how much real "
+                 f"patches vary")
+    vecs = [mean_vec(p) for p in pats]
+    models[how] = model(vecs)
+    # Leave-one-out: film is not stationary, so one real patch already differs
+    # from the others and that difference is the floor every number is read
+    # against.
+    loo = []
+    for i in range(len(vecs)):
+        m, Ci, k = model(vecs[:i] + vecs[i + 1:])
+        loo.append(distance(m, Ci, k, vecs[i]))
+    loo = [v for v in loo if np.isfinite(v)]
+    floors[how] = float(np.median(loo)) if loo else float('nan')
+
+print("  real patch floor:  " + "   ".join(f"{h} {floors[h]:.2f}" for h in PREPS))
+print()
+head = "".join(f"{h:>9}" for h in PREPS)
+print(f"  {'mask':<30}{head}{'worst':>9}{'dens':>9}")
+
+rows = []
+for path in args.mask:
+    m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        print(f"  {os.path.basename(path):<30}{'unreadable':>9}")
+        continue
+    if m.shape != size:
+        print(f"  {os.path.basename(path):<30}{'size differs':>18}")
+        continue
+    f = m.astype(np.float64)
+    v = mean_vec(f)
+    # Each score in units of that preparation's own floor, so the columns are
+    # comparable with each other and with 1.0, which is a real patch.
+    sc = {h: distance(*models[h], v) / max(floors[h], 1e-9) for h in PREPS}
+    worst = max(sc.values())
+    de = density(f)
+    print(f"  {os.path.basename(path):<30}"
+          + "".join(f"{sc[h]:>9.2f}" for h in PREPS)
+          + f"{worst:>9.2f}{de:>9.4f}")
+    rows.append((os.path.basename(path), sc, worst, de))
+
+print()
+print("  Each column is the mask's distance from real patches of the film under")
+print("  that preparation, in units of that preparation's own real-patch floor:")
+print("  1.00 is a real patch. `worst` is the headline -- a mask that is only")
+print("  good under the preparation it was built from is not good, it is circular.")
+print("  `dens` is local density rather than shape, and is not in the distance.")
+
+for name, sc, worst, de in rows:
+    cols = " ".join(f"{h}={sc[h]:.3f}" for h in sc)
+    print(f"RESULT kind=grain mask={name} {cols} worst={worst:.3f} dens={de:.4f} "
+          f"block={args.block}")
+
+if args.csv:
+    with open(args.csv, 'w') as fh:
+        fh.write("mask," + ",".join(PREPS) + ",worst,density\n")
+        for name, sc, worst, de in rows:
+            fh.write(f"{name}," + ",".join(f"{sc[h]:.6f}" for h in PREPS)
+                     + f",{worst:.6f},{de:.6f}\n")

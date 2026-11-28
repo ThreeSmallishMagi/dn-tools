@@ -7,16 +7,34 @@ Makefile
 *_env
 __pycache__/
 
-# Compiled binaries
+# Compiled binaries. `dither` is unanchored on purpose -- it is built both here
+# and at the repo root -- so the completion script of the same name has to be
+# excepted by hand.
 dither
+!completion/dither
 displayimage
 temporaldither
 srgbtest
+maketexture
+unittest
+libdither_lib.a
 
+experiments/
+scratchpad
+samples/
+MarkovJunior
 # Tool output
 *.png
 *.jpg
 dither.csv
 !images/*.png
+
+
+# …but the film scans are inputs, not output: committed so every measurement
+# here starts from the same pixels. See examples/README.md.
 !examples/*.png
 !examples/*.jpg
+examples/grey.png
+examples/lines.png
+examples/ramp32.png
+examples/sine_wave*.png

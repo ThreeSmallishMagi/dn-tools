@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Whole-image tone check: does the output average to the input?
+
+  tonetest [dither-binary]
+
+colstats asks whether each *column* mean is right, and answers with a z-score
+against counting noise. That is the right question for local density, but it is
+nearly blind to a small bias applied everywhere: a systematic shift of a few
+parts per thousand disappears into per-column noise of thirty. Averaging the
+whole image instead reduces that noise by the square root of the pixel count and
+makes the bias plain.
+
+This exists because such a bug shipped. Scaling the diffused residual by
+--spatial discarded a fraction of every quantisation error, and with a mask
+threshold those errors are not zero-mean -- the mask is a fixed function of
+position, so it correlates with the error field feeding back into it. Half
+strength lifted the shadows by 27/1000 in linear light and crushed the
+highlights by 19/1000. Every colstats column passed.
+
+--levels is a dimension here because a second such bug shipped behind the first
+one's blind spot. This check swept threshold, spatial and frames but only ever
+at the default --levels 2, where the ladder has two rungs, display units are
+proportional to linear light and the two cannot disagree. Every level count
+above 2 under the default --level-spacing srgb has an uneven ladder, and
+diffusing the residual in display units there conserved the wrong quantity:
++49/1000 in linear light at --levels 3 --spatial 1, peaking at the intermediate
+rungs. Uniform ladders stayed clean throughout, which is exactly why nothing
+caught it.
+"""
+import concurrent.futures, glob, os, shutil, subprocess, sys, tempfile
+import cv2
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
+                         else os.path.join(ROOT, 'build', 'dither'))
+REF = os.path.join(ROOT, 'examples', 'ramp_256x256.png')
+
+# Tolerances in units of 1/1000 linear, per threshold, because the three have
+# genuinely different floors and one number for all of them is as loose as the
+# loosest. Each is about twice the worst reading that rule produces when it is
+# behaving, so a bias has to double the noise to pass:
+#
+#   random  the only stochastic rule, so a band mean carries real counting
+#           noise -- 8192 pixels of a coin toss is 5.5/1000 of a standard
+#           error, and it measures 0.95 / 5.28.
+#   round   deterministic, but partial diffusion leaves it a small residual:
+#           0.65 / 2.50, worst at --spatial 0.5.
+#   mask    deterministic *and* error-cancelling, so it has no excuse for any
+#           offset at all and is held to a tenth of a level step. It measures
+#           0.20 / 2.86.
+#
+# The mask bound is the tight one on purpose. Comparing frac against 255 rather
+# than the 254 threshold_byte ranks onto biased every mask run up by half a mask
+# step, and at 1.17 / 3.87 it passed a flat 1.5 / 6.0 -- indistinguishable from
+# random's honest noise under a shared tolerance, and separated at once by
+# giving the deterministic rule the bound its determinism earns.
+#
+# `round` without diffusion is not density-preserving at all -- the documented
+# reason coltest allows it 200 failing columns -- so it is exempted rather than
+# pretended about.
+TOL_MEAN = {'round': 1.4, 'random': 2.0, 'mask': 0.4}
+TOL_BAND = {'round': 5.0, 'random': 8.0, 'mask': 4.0}
+EXEMPT = {('round', '0.0'), ('round', '0.1')}
+
+
+def srgb_to_linear(x):
+    x = np.asarray(x, dtype=np.float64) / 255.0
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(L):
+    L = np.asarray(L, dtype=np.float64)
+    return 255.0 * np.where(L <= 0.0031308, L * 12.92,
+                            1.055 * np.maximum(L, 0) ** (1 / 2.4) - 0.055)
+
+
+def ladder(levels, use_srgb, spacing):
+    """The rungs vision::make_levels builds: (pixel value, linear light) each."""
+    code = np.arange(levels) / (levels - 1)
+    if spacing == 'srgb':
+        px = np.rint(255.0 * code)
+        return px, srgb_to_linear(px) if use_srgb else px / 255.0
+    if spacing == 'linear':
+        return np.rint(linear_to_srgb(code) if use_srgb else code * 255.0), code
+    return np.rint(255.0 * code), srgb_to_linear(255.0 * code) if use_srgb else code
+
+
+def light(paths, rung_px, rung_lin):
+    """Light emitted by a run, as the mean over its frames of each frame's
+       rungs -- read as level indices and mapped to the ladder's exact linear
+       values, not decoded from the 8-bit file.
+
+       The distinction is the whole sensitivity of the `linear` and `device`
+       rows. Their rungs sit at exact linear k/(levels-1), which 8 bits cannot
+       represent: the mid rung of a 3-level linear ladder is written as pixel
+       188 and reads back as 0.5030, so decoding the file charges the dither
+       +1.1/1000 for the file format's rounding. That is 70% of the tolerance
+       spent before the dither has done anything, and a real bias of 0.6 would
+       have hidden underneath it. Reading the index instead asks what the
+       display emits, which is what the ladder promised. srgb rows are
+       unaffected -- their rungs are exact 8-bit codes -- so this changes what
+       is measured only where it was wrong."""
+    imgs = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in paths]
+    if any(i is None for i in imgs):
+        return None
+    idx = [np.abs(i.astype(np.float64)[..., None] - rung_px[None, None, :]).argmin(-1)
+           for i in imgs]
+    return np.mean([rung_lin[i] for i in idx], axis=0)
+
+
+ramp = cv2.imread(REF, cv2.IMREAD_GRAYSCALE)
+if ramp is None:
+    sys.exit(f"reference not found: {REF}")
+ramp = ramp.astype(np.float64)
+
+# (levels, --level-spacing, sRGB). 2 is the uniform ladder the rest of the
+# pipeline defaults to; 3 is the most uneven ladder there is and the worst case
+# for anything confusing display units with linear light; 4 confirms it is the
+# unevenness and not the level count.
+#
+# The spacing is a dimension because the three put the rungs in three different
+# places and only one of them was ever swept. `linear` is the mirror image of
+# the default: evenly spaced in *light* and unevenly in pixel value, so a ledger
+# that conserves the wrong quantity errs the other way and a check that only
+# ever saw `srgb` could not tell the two apart. `--linear` is here for the same
+# reason one level down -- it removes the curve from the encode/decode boundary
+# rather than from the ladder, and nothing else exercises that path for tone.
+CONFIGS = [('2', 'srgb', True), ('3', 'srgb', True), ('4', 'srgb', True),
+           ('3', 'linear', True), ('8', 'linear', True), ('4', 'device', True),
+           ('3', 'srgb', False)]
+
+print(f"dither={DITHER}\nref={REF}\n")
+print(f"{'levels':>6} {'spacing':<8} {'lin':>4} {'threshold':<9} {'spatial':>8} {'frames':>7}"
+      f" {'mean':>8} {'worst band':>11}  result")
+
+fails = 0
+
+# One mask build, not seventy. Every `mask` row here wants the same
+# void-and-cluster tile -- the size follows the image and the seed is fixed, and
+# none of levels, spacing, spatial or frames reaches the mask -- but --no-config
+# turned the cache off, so each of the seventy rebuilt it from scratch at a
+# second apiece. An isolated XDG_CONFIG_HOME keeps the developer's cache and
+# config out of the run, which is all --no-config was wanted for, and lets the
+# second row onwards reuse the first's mask. A cache hit is byte-identical to a
+# build -- unittest pins that -- so nothing is traded for the time.
+#
+# The rows are independent, so they also run concurrently; each needs its own
+# output path, which is what kept them serial.
+_isolated = tempfile.mkdtemp(prefix='tonetest.')
+os.environ['XDG_CONFIG_HOME'] = os.path.join(_isolated, 'config')
+
+def run_row(job):
+    """One row: dither once, read the frames back, score. Returns the printable
+       line and whether it passed, so the output stays in matrix order however
+       the rows finish."""
+    levels, spacing, use_srgb, threshold, spatial, frames, slot, ref, rung_px, rung_lin = job
+    tmp = os.path.join(_isolated, f'row{slot}.png')
+    args = [DITHER, REF, '--threshold', threshold, '--spatial', spatial,
+            '--frames', frames, '--levels', levels, '--level-spacing', spacing,
+            '--out', tmp]
+    if not use_srgb:
+        args.append('--linear')
+    nf = int(frames)
+    if nf > 1:
+        args.append('--save-frames')
+    r = subprocess.run(args, capture_output=True, text=True)
+    lead = (f"{levels:>6} {spacing:<8} {'yes' if not use_srgb else '-':>4} "
+            f"{threshold:<9} {spatial:>8} {frames:>7}")
+    if r.returncode != 0:
+        return f"{lead} {'':>8} {'':>11}  RUN FAILED", False
+    stem, ext = os.path.splitext(tmp)
+    out = light([f'{stem}-{k}{ext}' for k in range(nf)] if nf > 1 else [tmp],
+                rung_px, rung_lin)
+    if out is None:
+        return f"{lead} {'':>8} {'':>11}  MISSING FRAMES", False
+    d = out.mean(0) - ref.mean(0)
+    mean = 1000 * d.mean()
+    # Worst 32-column band: a bias that cancels between shadows and highlights
+    # still shows here, and tonal compression does exactly that -- the mean
+    # alone would have missed half of the original bug.
+    band = max(abs(1000 * d[t:t + 32].mean()) for t in range(0, 256, 32))
+    ok = ((threshold, spatial) in EXEMPT or
+          (abs(mean) <= TOL_MEAN[threshold] and band <= TOL_BAND[threshold]))
+    note = ('EXEMPT' if (threshold, spatial) in EXEMPT
+            else 'PASS' if ok else 'FAIL')
+    return f"{lead} {mean:8.2f} {band:11.2f}  {note}", ok
+
+jobs = []
+for levels, spacing, use_srgb in CONFIGS:
+    # Under --linear the file carries linear light directly, so both sides are
+    # read the same way the program wrote them.
+    ref = srgb_to_linear(ramp) if use_srgb else ramp / 255.0
+    rung_px, rung_lin = ladder(int(levels), use_srgb, spacing)
+    for threshold in ('round', 'random', 'mask'):
+        for spatial in ('0.0', '0.1', '0.5', '0.9', '1.0'):
+            for frames in ('1', '8'):
+                jobs.append((levels, spacing, use_srgb, threshold, spatial, frames,
+                             len(jobs), ref, rung_px, rung_lin))
+
+# The first mask row alone, so the mask is in the cache before the rest start:
+# seventy concurrent misses would each build the same tile.
+_first = next((i for i, j in enumerate(jobs) if j[3] == 'mask'), None)
+if _first is not None:
+    line, ok = run_row(jobs[_first])
+    _done = {_first: (line, ok)}
+else:
+    _done = {}
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as pool:
+    futures = {pool.submit(run_row, j): i for i, j in enumerate(jobs) if i not in _done}
+    for f in concurrent.futures.as_completed(futures):
+        _done[futures[f]] = f.result()
+
+for i in range(len(jobs)):
+    line, ok = _done[i]
+    fails += not ok
+    print(line)
+
+shutil.rmtree(_isolated, ignore_errors=True)
+
+print(f"\n{'OVERALL PASS' if not fails else f'OVERALL FAIL ({fails})'}"
+      f"   x1000 linear, |mean|/band by threshold: "
+      + ', '.join(f"{k} {TOL_MEAN[k]}/{TOL_BAND[k]}" for k in TOL_MEAN))
+sys.exit(1 if fails else 0)

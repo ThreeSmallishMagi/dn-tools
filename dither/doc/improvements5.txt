@@ -1,0 +1,802 @@
+CODE REVIEW — TWO WEEKS ENDING 2026-10-08
+========================================
+
+Scope and conclusion
+--------------------
+Reviewed the changes from 2026-09-24 through 2026-10-08 in cpp/opencv:
+baseline 08b23b79c562d309a083c24f62484ca8c5e23e82,
+HEAD     30500406efec099903216a545e558482b4a2bfb6.
+The interval contains 45 project commits and changes 76 files, including
+20 C++ implementation files. Current uncommitted aliases and doc/todo.txt
+edits were included. Unrelated untracked experiments and binaries were not
+treated as changes under review. Locations below refer to the current files.
+
+The generator table, reusable synthesis functions, stricter dither parsing,
+atomic cache writes, and expanded tests are worthwhile improvements. The
+highest-priority defect is that a cached Markov calibration can override
+explicit user settings. Other substantial problems concern calibration
+identity and scoring, combining samples, and maketexture's duplicated parser.
+
+This report records 20 actionable findings, followed by block-level cleanup
+and architecture recommendations. P1 means fix first; P2 means a correctness
+or reliability defect; P3 means a lower-impact behavioral/documentation defect.
+“Reproduced” identifies a focused experiment, not just a suspicious pattern.
+Static findings are identified separately. A review cannot guarantee that no
+other defects remain. No production implementation was changed for this review.
+
+Findings
+--------
+
+F01 [P1] Markov calibration cache hits overwrite explicitly pinned settings
+Location: markovcalib.cpp:313-317, 357-377.
+
+The key hashes the initial radius and weighting values but not whether those
+values were pinned. An unrestricted search starting at flat/radius 5 and a
+search explicitly restricted to flat/radius 5 consequently share a key.
+On a hit, the code writes the cached weighting and radius unconditionally;
+Params::set does not enforce precedence between User and Measured origins.
+
+Reproduced through the actual calibration entry point: seed a legitimate-shaped
+unrestricted result (temperature .22, ml, radius 8), then explicitly pin flat
+and 5. The hit reports .22/ml/8 and the registry actually becomes ml/8.
+The reverse order is also wrong: a restricted result can suppress the broader
+search. Merely preserving pinned fields on a hit is insufficient because its
+temperature was optimized with a different weighting/radius.
+
+Fix: include the search constraints/pinned axes in the calibration request and
+key; never apply a result that contradicts them. Validate and apply the whole
+result together. Test both ordering directions and each independently pinned
+axis, including explicit values equal to defaults.
+
+F02 [P2] Inpaint calibration identity omits inpaint.cap
+Location: inpaintcalib.cpp:72-96, 125-131; inpaint.cpp:sweep_level.
+
+The cap changes when a candidate stops sweeping, hence the candidate masks and
+the winning sweep count. InpaintParams now includes cap and the builder reads
+it, but calibration_key hashes every listed input except cap and the answer.
+Reproduced: the same image/settings/seed with cap 1.25 and cap 0 has exactly
+the same calibration key. An existing answer is therefore reused without
+evaluating the requested stopping policy.
+
+Fix: hash cap, bump the calibration version, and add a key-sensitivity test for
+every actual synthesis input, not just for the separate finished-mask cache.
+
+F03 [P2] Calibration caches survive incompatible algorithm changes
+Location: markovcalib.cpp:306, 366-381; inpaintcalib.cpp:86, 127-131.
+
+Static/history finding: Markov's calib/2 prefix and input encoding existed
+before joint weighting/radius search. The old temperature-only result is still
+accepted: missing .w/.r fields simply retain the initial values and return a
+hit. Inpaint's icalib/1 likewise predates the directionality cap and still
+identifies answers produced before that change. The executable identity used
+by maskcache does not protect these separate calibration entries.
+
+Thus upgrading can preserve an older answer indefinitely even when the user
+asks for the improved calibration. A rebuild of the finished mask cannot fix
+the stale calibration that supplies its parameters.
+
+Fix: version the complete calibration semantics (objective, search, synthesis
+behavior, and result schema). Require a complete result for that version.
+Add migration tests using fixtures from the preceding format. Intentional
+cross-build reuse is fine if incompatible changes reliably invalidate it.
+
+F04 [P2] Invalid cached calibration results stop the run instead of rebuilding
+Location: defaults.cpp:649; markovcalib.cpp:366-377;
+inpaintcalib.cpp:127-129; dftcalib.cpp:116-118.
+
+Unknown hashed entries are checked for finiteness when loaded, but not for
+their result's range or structure. Cache-hit branches then call set or lround
+without validating the whole result. A finite but invalid cached sweep count
+raises an exception; partially missing Markov results are accepted piecemeal.
+
+Reproduced by remembering an Inpaint result of 1000 under its current key:
+calibrate_inpaint_for throws “inpaint.iters: 1000 is outside the permitted
+range [1, 64]”. In dither this becomes a failed run, although the cache is
+documented as disposable. Very large finite values also reach lround before
+any range check.
+
+Fix: decode a typed result, check ranges/integrality/required fields before
+mutating P, and treat invalid entries as misses. Do not catch arbitrary build
+errors as misses. Test corrupt, incomplete, and old cached results explicitly.
+
+F05 [P2] DFT calibration has an invalid frequency domain and wrong scale units
+Location: dftcalib.cpp:138; calib.cpp:128-140.
+
+--mask-highpass 2 is valid, but sets lowCut=.5. At Nyquist,
+log(r/lo)/log(hi/lo) is 0/0 and is cast to int before clamp can help.
+Reproduced with the actual spectrum_profile under undefined-behavior and
+float-cast-overflow sanitizers: calib.cpp:140 reports “-nan is outside the
+range of representable values of type 'int'”.
+
+For 0 < highpass < 2, the interval is empty. Values <=1 actually disable the
+generator's high-pass, yet calibration excludes all frequencies. For scale
+other than 1, the cutoff also remains in source-pixel units while the reference
+and generated mask are measured in mask-pixel units. E.g. hp=32, scale=4 moves
+the nominal cutoff to 1/128, not 1/32.
+
+Fix: derive the scoring cutoff using the same high-pass enable rule and scale
+as preprocessing; explicitly handle lowCut >= Nyquist and empty measurements.
+Do not convert nonfinite bin coordinates. Test hp 0, .5, 1, 2 and scale .5/4.
+
+F06 [P2] Inpaint's calibration “ridging” score measures global orientation
+Location: calib.cpp:94-109; inpaintcalib.cpp:144-178;
+comparison implementation: test/patchfit:145-165.
+
+Jxx/Jyy/Jxy are accumulated over the entire field before coherence is computed.
+Different local ridge directions cancel, so curved worms or balanced horizontal
+and vertical ridges can score near zero. patchfit instead computes coherence
+per 32x32 block and then aggregates. These are different quantities, not merely
+different implementations of the claimed ridging measure.
+
+Reproduced the formulas on a 256x256 concentric-ring fixture. Global octave
+coherences were approximately 1.12e-8, 1.11e-8, 5.38e-9; mean local coherences
+were .946, .956, .948. Very strong ridges look globally isotropic to calibration.
+The subsequent log-ratio also becomes sensitive to tiny orientation noise.
+
+Fix: measure local coherence before aggregation if the objective is worming,
+and validate it on curved/mixed-orientation fixtures and held-out film scans.
+Keep whole-field coherence for the deliberately directional inpaint.cap;
+do not silently replace that distinct policy with a local metric.
+
+F07 [P2] One broken sample symlink hides later valid scans
+Location: samples.cpp:31-38, 76-88.
+
+images_in reuses ec for entry status. Once is_regular_file(ec) fails, !ec is
+false for every subsequent entry, so those files are never examined. The
+library listing has a related shared-error/early-break problem. Directory
+enumeration order is not guaranteed, so the omitted set varies by filesystem.
+Reproduced: a directory containing a dangling a.png symlink followed by a valid
+b.pgm resolved to zero files. This can reject a film or silently fit only part
+of it. The range-for iterator also uses throwing increments despite its
+error-code constructor.
+
+Fix: use a fresh error_code for each entry and explicit increment(ec), as
+maskcache::trim_cache already does. Skip/report one bad entry without poisoning
+the rest. Test dangling links, unreadable entries, and absent library roots.
+
+F08 [P2] Stacking raw scans manufactures structure at exposure boundaries
+Location: samples.cpp:142-157; calib.cpp:164-171;
+maskutil.cpp:prepare_texture_sample; spectralmask.cpp:sample_amplitude.
+
+The new library explicitly supports scans with different exposures, but raw
+images are concatenated before high-pass filtering/model fitting. A change in
+mean tone becomes a horizontal edge. Filtering spreads it into both scans;
+neighborhood harvesting and the DFT then learn structure no scan contained.
+With two equal-height images, the calibration reference is centered exactly
+on that artificial seam. The header's single same-film crop comparison does
+not establish safety for varying exposure or many short scans.
+
+Reproduced with identical noise of standard deviation 2 placed at means 64
+and 192. After hp=32, stacking before filtering added an artificial residual
+of up to 59.89 input codes; its RMS in the central 128 rows was 13.35. This
+is substantially larger than the real texture, not a rounding effect.
+
+Fix: retain sample boundaries. Preprocess each scan separately, exclude joins
+from neighborhood harvesting, pool per-scan spectral estimates for DFT, and
+sample calibration references from real patches. Test identical grain at
+different exposures and verify that adding a scan does not introduce a seam.
+
+F09 [P2] The multi-file mask hash does not encode file boundaries
+Location: maskcache.cpp:169-174.
+
+Hashing the file count followed by concatenated file bytes does not identify
+the grouping of those bytes. [A, B+C] and [A+B, C] have the same count and
+hashed stream even though the images decoded from each file differ.
+
+Reproduced with three tiny PGM images (pixel values 10, 20, 30). At the same
+two paths, [A, B+C] decoded to a stack with mean 15; [A+B, C] decoded to mean
+20. Both produced the same valid maskcache key. OpenCV reads the first PGM
+image and permits trailing bytes. This is an encoding ambiguity, independent
+of the probability of an FNV hash collision.
+
+Fix: include a fixed-width byte length for every file, or hash a framed list
+of per-file digests. Preferably hash the exact decoded sample snapshot used
+by the build. Bump maskcache's serialization version and retain this fixture.
+
+F10 [P2] maketexture silently accepts malformed numeric arguments
+Location: maketexture.cpp:137-138.
+
+atof and strtoull are used without checking consumption or overflow. Both
+--highpass typo and --seed typo completed successfully in focused CLI tests;
+they became zero. Negative seeds and overflowing values are also not checked
+against the command's intended seed domain. This defeats reproducibility and
+makes a mistyped experiment appear valid.
+
+Fix: share the strict numeric parsers with dither, require complete consumption,
+and validate finite values and ranges before synthesis. Test invalid suffixes,
+empty input, negative values, NaN/infinity, and integer overflow.
+
+F11 [P2] maketexture's generic options disagree with dither's semantics
+Location: maketexture.cpp:152-175, 212-225, 273-278.
+
+Every exposed registry option is admitted, but the tool neither follows switch
+arity nor validates applicability/the selected generator. Some accepted values
+are later overwritten or never used.
+
+Reproduced: --mask-highpass 32 succeeds but announces and uses highpass 0,
+because line 213 overwrites it. --markov-report without a value is rejected as
+“needs a value”, although dither documents it as a switch. Static inspection
+also shows that markov_validate is never called: unknown weighting strings
+fall through the sampler as flat weighting. Unrelated options such as a mask
+input/calibration can be accepted without performing the requested operation.
+
+Fix: share option metadata, arity, value parsing, and generator validation.
+Give this frontend an explicit set of applicable options. Make --highpass an
+alias of one registry value with last-occurrence semantics; reject unsupported
+options. Resolve only the selected generator's parameter block.
+
+F12 [P2] maketexture aborts on ordinary user errors
+Location: maketexture.cpp:102-326, especially 213, 218-225, 304, 318.
+
+Only the generic P.set parsing arm is protected. Later range/type errors and
+OpenCV exceptions escape main. Reproduced --highpass -1 and an output with an
+unsupported extension: both terminated with SIGABRT (Python returncode -6),
+instead of a normal diagnostic/nonzero exit. A 1x1 sample at scale .05 also
+aborted inside resize. Core dumps were disabled for these review probes.
+
+Fix: add the same process-level exception boundary used in main.cpp, reuse
+write_image for both outputs, and check prepared dimensions before resizing.
+An exception boundary is still needed after adding specific validations.
+Keep error exit tests separate from successful synthesis-quality tests.
+
+F13 [P2] maketexture geometry parsing can wrap oversized integers
+Location: maketexture.cpp:86-97, 202; spectralmask.cpp:synthesise_spectral_order.
+
+sscanf into int does not provide checked integer conversion. Reproduced
+--size 4294967312x16: the command returned success and generated a 16x16
+image. The requested width wrapped to 16 on this platform. Unlike dither's
+bounded mask dimensions, the new frontend also exposes generator code using
+int H*W to sizes without an area bound.
+
+Fix: tokenize and use checked integer parsing; validate dimensions, offsets,
+scaled dimensions, and pixel-count multiplication before constructing ROIs or
+allocating. Reject out-of-range input rather than relying on scanf behavior.
+Test overflows without actually allocating enormous images.
+
+F14 [P2] Pasting a smaller texture restores tone from the wrong coordinates
+Location: maketexture.cpp:253-254, 310-317.
+
+The coarse component is resized from the entire sample to --size, but paste
+places that result into only the top-left intersection of the original sample.
+For unequal sizes, the restored tone no longer corresponds to that region.
+
+Reproduced on a 128x128 horizontal ramp, hp=32, size=64x64, DFT with one
+iteration. The replaced region should have mean 63; it had mean 126.999.
+Its last column should be 126; the output column averaged 245.06. A visible
+tonal boundary is introduced independently of the texture model's quality.
+
+Fix: either require --size == --sample dimensions when --paste is requested,
+or define a paste coordinate mapping and extract the coarse component from
+the actual destination region. Test a gradient with smaller and larger sizes.
+
+F15 [P2] Public Inpaint defaults no longer match the CLI defaults
+Location: inpaint.h:29-32; inpaint.cpp:register_inpaint_params.
+
+The parameter study changed registered defaults to 3 sweeps and 64 checks,
+but InpaintParams{} still means 6 sweeps and 128 checks. Direct callers of the
+newly exposed synthesis API get the older, slower, more worm-prone behavior.
+The CLI is unaffected because inpaint_params_from fills every field.
+
+Fix: define constant defaults once and use them in the registry and parameter
+struct, or require callers to use a factory instead of presenting independent
+default initializers. MarkovParams' 20-sweep default versus the registry's 2
+is an older instance of the same architectural problem, not a new discovery
+to attribute wholly to this interval. Test public default requests against
+the registered defaults where equivalence is the intended contract.
+
+F16 [P2] The integer-validation repair still accepts user fractions
+Location: defaults.cpp:320-324; cli.cpp:need_int and set_typed.
+
+The relative tolerance is applied to user values as well as derived ones.
+At 1e9 the allowed deviation is 1, so any representable fractional part passes.
+Reproduced: --seed 1000000000.4 is rejected, but --set seed=1000000000.4
+with --explain succeeds and integer() rounds it. This leaves the very
+two-spellings-disagree defect the changed block claims to repair.
+
+Fix: require integral user input and reserve an explicitly justified tolerance
+for derived arithmetic. Prefer rule type metadata so integer validation happens
+at the boundary. Test large fractional seeds, not just supersample=2.9.
+This is an incomplete repair of an existing behavior, rather than a regression
+from previously strict --set parsing.
+
+F17 [P3] Pinned Markov temperature reports a search that never happens
+Location: markovcalib.cpp:332-346.
+
+The message says calibration “can only choose the weighting” if temperature
+is pinned, but the function immediately returns. Neither weighting nor radius
+is searched. The comment also explicitly promises the missing work.
+
+Fix: either implement a search over the remaining free axes at that temperature
+or clearly say that calibration is skipped when temperature is supplied. Do
+not claim that two pinned values leave nothing to decide while radius is free.
+Test the work performed and resulting values, not just that the run succeeds.
+
+F18 [P3] Completion offers invalid choices and omits valid ones
+Location: completion/dither:15-17, 39-40; cli.cpp:usage_ceilings;
+maketexture.cpp:usage.
+
+The shared method list offers blue/direct for maketexture, which rejects both.
+Scraping maketexture --help finds only a few example generator options, omitting
+most accepted flags. The new dither ceilings table uses --<gen>-... placeholders,
+so its concrete flags also disappear from scraped completion unless mentioned
+elsewhere. Reproduced: --inpaint-max-size is missing from dither completion;
+maketexture's list contains just 11 flags and omits --inpaint-db and --mask-scale.
+Unquoted command substitutions also split filenames and film names with spaces.
+The “source aliases does this for you” comment is false: aliases does not
+source completion/dither.
+
+Fix: expose machine-readable option/choice metadata per frontend and consume
+it with line-preserving arrays. Generate human help separately from the same
+metadata. Test candidate acceptance, completeness, and paths containing spaces.
+
+F19 [P3] Install helpers mask failures and can report successful work as failure
+Location: aliases:46-48, 63-72 (line 72 includes the uncommitted edit).
+
+install_completion ignores ln -sf failure, then returns success from echo.
+install_samples ignores failed copies and silently skips missing mapped crops;
+its final optional executable test determines the whole function's exit status.
+After successfully installing samples, absence of ./dither makes it return 1.
+The uncommitted version also tests ./dither but executes dither through PATH,
+which can name a different binary or no binary at all.
+
+Fix: propagate required copy/link failures, summarize missing source files,
+and explicitly return success after successful installation. Pick one binary
+using command -v or a checked absolute build path, and invoke that same path.
+Keep the informational film listing optional. Test these functions in a
+temporary installation tree with mocked failure cases.
+
+F20 [P2] foreach removes literal -- arguments from the command it executes
+Location: aliases:376-385.
+
+Every token equal to -- is consumed as the separator, even after the command
+has begun. A command's own end-of-options marker is therefore removed. This
+can turn a filename beginning with '-' into an option to the invoked command.
+Reproduced: foreach a -- printf '%s|%s\n' -- {} prints 'a|' instead of '--|a'.
+
+Fix: consume the separator only while collecting input items, then preserve
+all command tokens verbatim. Reject an absent/empty command and keep arg local.
+Use quoted arrays throughout; test spaces, literal --, and option-like items.
+
+Block-by-block cleanup and coverage
+----------------------------------
+The following covers every changed C++ implementation file and the new blocks
+within them. Recommendations below are not additional proven defects unless
+they refer to a finding above. Clear existing code need not be rewritten just
+to reduce its line count.
+
+bluenoise.cpp — Parameter registration and hidden rate option:
+  The shared applicability variable is a sensible simplification. No new
+  algorithmic defect found in these changes. Keep the existing numerical loops.
+
+calib.cpp — Level-set selection, profiles, filters, distance, reference crop:
+  Correct the domain and metric problems in F05/F06. Represent “unmeasurable”
+  explicitly rather than the magic valid-looking score 1e9. Separate profile
+  construction from score comparison so zero-energy bands have a defined
+  policy. State/assert CV_8U, contiguity, and minimum size for level_set_low,
+  which indexes a flat pointer. Keep any deliberate divergence from levelfit
+  documented. Avoid recomputing preprocessing when DFT tries smaller probes.
+
+cli.cpp — Pair/integer parsing, config prescan, typed options, reconciliation,
+validation, generator help, ceilings table:
+  The config prescan and parser now agree on value consumption; keep that fix.
+  Extract the text-to-typed-value helper for both frontends (F10/F11/F16).
+  Parse once into a request where practical, then load configuration and apply
+  overrides; this avoids maintaining two token walks as options grow.
+  Print ranges/arity from metadata rather than implying that all are generated
+  when only names/defaults are. Factor word wrapping into a small helper and
+  initialize its column count from the actual lhs width, not always 22.
+  Rename transitional comments still centered on --set. The help still says
+  “Two generators can” calibrate, omitting the newly supported DFT method.
+
+defaults.cpp — Serialization, flag mapping, option metadata, integer conversion,
+reconciliation bound, cache load/save:
+  Preserve round-trip serialization and the overflow-safe trial-count guard.
+  flag_for's seenDot state is redundant: both '.' branches emit '-'. A direct
+  loop replacing '.' and '_' expresses the same mapping more clearly.
+  Declare parameter types and enum choices; a numeric range [0,1] should not
+  be the definition of “boolean switch”. Distinguish display formatting from
+  serialization as the current code does. Move persistence of typed calibration
+  records out of the generic unknown-double bucket (F01-F04).
+  PID-named temporary files are adequate for the current sequential CLI; use
+  unique temporaries if same-process concurrent saves become supported.
+  Concurrent writer merging is explicitly unsupported, so it is not claimed
+  here as a newly discovered atomicity defect.
+
+dftcalib.cpp — Request key, sample/probe selection, ladder, score, persistence:
+  Resolve/preprocess the sample once. Use an explicit scored-candidate record
+  instead of parallel score/ok arrays if more result fields are added. The
+  current four/five-element arrays are otherwise readable. Share persistence
+  mechanics with the other calibrators while retaining this distinct objective.
+  Validate transfer from the small probe to large requested masks: smooth_power
+  depends on the sample/output area ratio, so size independence needs evidence.
+  This is a validation gap, not a claim that every selected value is wrong.
+
+directmask.cpp — Overlap/geometry validation, crop ownership, registration:
+  The new guard and reduced copies are improvements. Keep the intentional
+  distinction between shrinking for insufficient sample and refusing an overlap
+  that consumes the tile. Update errors to the named --direct-overlap flag.
+  No new seam-cut defect found in the changed blocks.
+
+dither.cpp — Config scan, sample resolution/loading, calibration/build handoff:
+  Pass one loaded sample snapshot through calibration, hashing, and building.
+  It is currently loaded here, re-resolved/reloaded by calibration, and resolved
+  again/read as bytes by maskcache. Besides excess decoding, files modified
+  during calibration can produce a mask keyed/calibrated for different bytes.
+  The old single-file path also had a related load/hash race; directory support
+  increases its surface. Remove the duplicate generators.h include and stale
+  comments claiming Markov is the sole calibration method.
+
+engine.cpp — Changed comments around snapping and spatial accounting:
+  Changes are explanatory, not an engine algorithm rewrite. Preserve the
+  exact-budget ledger and existing float/snapping behavior. Comments near
+  ditherPass still start by describing spatial as a deposited fraction while
+  quantize_scan correctly describes separate decision/accounting values; use
+  one consistent explanation. Unit and column-tone checks passed.
+
+generators.cpp — Wrappers, typed parameter extraction, validation, capabilities,
+table registration:
+  Keep table-driven dispatch. Move the shared mask.calibrate registration out
+  of register_markov_params now that it is a multi-generator capability.
+  A single typed request should serve build, calibration, and identity. Reuse
+  inpaint_params_from in maketexture instead of copying its assignments.
+  Keep each generator's work formula separate; they count different work.
+
+inpaint.cpp — PatchDatabase seeding/search, sweep cap, synthesis split, defaults:
+  Explicit index seeding and bounded search stripes are sensible improvements.
+  Extract the cap predicate/measurement into a small named helper. Compute
+  coherence only when cap is enabled and a reference is applicable; currently
+  it scans every field even on uncapped coarse levels and with cap=0.
+  Preserve the explicit block-average arithmetic: the documented numerical
+  differences from INTER_AREA make a cosmetic replacement inappropriate.
+  Keep checks before database allocation. Document library input/parameter
+  preconditions at the new public synthesis entry point. Synchronize defaults
+  (F15), and test repeatability before/after calibration in one process.
+
+inpaintcalib.cpp — Key, cached result, reference, ladder, normalized objective,
+margin, result storage:
+  F02-F04/F06 apply. Factor scoring a single candidate into a function and keep
+  the selection/margin visible. The comment says probes are 128 square while
+  kProbe is 256; correct it and tie benchmark claims to the measured revision.
+  A declined calibration is rerun every time, even before a finished-mask hit.
+  Consider caching a versioned “no improvement” result; changing the objective
+  should invalidate it by version, not require repeating an unchanged search.
+
+maketexture.cpp — Parse/validate, patch extraction, restoration, synthesis,
+histogram mapping, writing/paste:
+  Split main into parse_request, synthesize_texture, and write_results. Keep
+  only a short exception boundary in main. Use shared parsing/validation and
+  typed parameter factories (F10-F15). Keep restoration/paste coordinates in
+  one explicit request. The announcement always prints Inpaint's sweep count
+  even for DFT/Markov; report the actual selected method's settings.
+  “Exact histogram” holds only in the corresponding equal-count mapping case;
+  resampling the distribution, scaling, clipping, and coarse restoration alter
+  it. Describe the actual guarantee instead of promising exact tone everywhere.
+
+markov.cpp — Report signatures, N derivation, to_logp reuse, fit/draw split,
+order-returning API, registration/defaults:
+  Deriving N locally and reusing to_logp are cleaner. Keep the fit/draw split:
+  it avoids refitting for each temperature. No changed-loop arithmetic defect
+  found beyond the input-boundary issues identified for the new frontend.
+  The null-log contract is not uniform: fit_markov_model errors and report_fit
+  still write stderr. Route diagnostics consistently or narrow that contract.
+  Distinguish reported requested radius from any radius reduced during fitting.
+
+markovcalib.cpp — Search axes, shared fits, parallel draws, scoring/interpolation,
+key, result application:
+  Use a CalibrationRequest containing search constraints, and a typed result
+  containing all three answers. F01/F03/F04/F17 show why those belong together.
+  Extract score_scheme(model, request, scheme) to remove the deeply nested
+  radius/scheme/task/realization loops without hiding their order or seed policy.
+  Keep common seeds, immutable fitted models, endpoint rejection, and guarded
+  interpolation. Clearly label the logged score as the measured grid score:
+  the interpolated temperature is not itself re-evaluated.
+
+mask.cpp — Shared sizing policy, registry, sample errors, dispatch, rate recording,
+cache lookup, calibration dispatch:
+  Keep the explicit order of constraints. Express kMaskSides as the sole ladder
+  definition and correct stale “powers of four” prose now that 2048 is included.
+  For budgets, evaluate actual ladder candidates: choosing a continuous size
+  and rounding up can greatly exceed its estimated work. Floors and soft
+  ceilings are intentional, but explain which constraint caused an overshoot.
+  Move calibration dispatch to consume the already loaded sample. Retain the
+  corrupt/wrong-size mask fallback and avoid recording file reads as build speed.
+
+maskcache.cpp — Identity/framing, file reads, atomic publication, eviction:
+  Preserve full-precision parameter keys, read-failure checks, checked close,
+  and nonfatal cache I/O. Correct multi-file framing (F09). Reuse the robust
+  directory iteration pattern in samples.cpp. Hash a sample snapshot rather
+  than reading independently from the model input. The explanatory sidecar is
+  still written directly; atomic replacement would keep concurrent readers
+  from observing a partial explanation, although the PNG remains atomic.
+
+maskutil.cpp — Whole-field coherence:
+  The implementation clearly expresses global directionality. Keep that name
+  and contract distinct from local ridging. A tiny shared tensor/coherence
+  primitive could avoid duplicate gradient math, but do not merge the two
+  aggregation policies to save lines.
+
+samples.cpp — Extensions, resolver, library listing, primary selection, loading:
+  F07/F08 apply. Return a LoadedSamples value with provenance and boundaries.
+  primary currently decodes every candidate and load decodes the winner again;
+  retain the winning Mat alongside its path. The public primary contract says
+  ties are broken by sorted path, but the function relies on the caller having
+  sorted paths; either enforce that or document the precondition explicitly.
+  Preserve case-insensitive extensions and literal-path precedence.
+
+spectralmask.cpp — Synthesis-order extraction and registration:
+  The ordering/mask split is a useful reuse boundary. Keep it. Add request-size
+  validation before int area calculations exposed through maketexture. For a
+  real sample collection, pool per-scan spectra rather than transforming one
+  artificial tall image. No new projection-loop defect found in the extraction.
+
+unittest.cpp — Numeric/round-trip cases, per-generator keys, fixture extraction,
+quantization/ranking tests and corrected claims:
+  Smaller independent assertions and fresh registries are improvements. The
+  “round-trip” serialization test uses strtod, not save_config/load_config;
+  retain it as a formatter check and add one actual persistence round trip.
+  Key sensitivity for finished masks does not cover calibration keys. Add the
+  behavioral cases above rather than only inspecting which fields are hashed.
+  Keep the meaningful image/math invariants; avoid snapshots of incidental
+  formatting or tests that merely duplicate the implementation formula.
+
+Headers/build/support code:
+  Reviewed the changed declarations/capabilities alongside their call sites.
+  Correct stale Inpaint “no worming” and Markov mutual-information-calibration
+  claims; remove duplicate iosfwd in generators.h. CMake correctly links the
+  new sources and executable. Register meaningful checks with CTest and allow
+  the Python test drivers to accept a binary/build directory, avoiding their
+  hard-coded build/ requirement for fresh or sanitizer builds.
+  test/samplecheck often checks log substrings without asserting return codes;
+  it can pass after a command announces work and then fails. Equal images also
+  prove determinism, not that the cache was actually used. Assert success,
+  outputs, and the expected hit/miss diagnostic where reuse is the contract.
+  test/flagcheck considers --help text authoritative, so a nonexistent flag
+  mentioned in help can validate its own mention. Derive accepted flags from
+  machine metadata or execute parser checks; do not validate prose with itself.
+  The changed alias gallery helpers still use fixed working filenames and run
+  onward after failures. Use a local temporary directory/subshell, quote paths,
+  use arrays for option groups, and propagate failures. compare should document
+  its required foreach-style -- command syntax and preserve the caller's traps.
+  Remove the stray four-backtick line in aliases. Review crop metadata as input
+  fixtures, but do not treat added photographic assets as verified quality gains.
+
+Architecture improvements, in recommended order
+-----------------------------------------------
+
+1. Make calibration a typed operation, independent of configuration I/O.
+   CalibrationRequest should contain the sample identity, resolved synthesis
+   settings, seed, free/pinned axes, and semantic version. CalibrationResult
+   should be a complete method-specific value or an explicit reason no answer
+   was obtained. A cache wrapper validates/deserializes it; a small application
+   function applies it respecting user constraints. This directly fixes the
+   repeated identity, partial-result, and precedence defects without inventing
+   one generic search algorithm for three different objectives.
+
+2. Give both executables one option contract.
+   Extend Rule with value kind, choices, visibility and frontend applicability.
+   Reuse parsing, validation, generated help facts and completion metadata.
+   Keep frontend-specific workflows separate: dither processes an image through
+   a mask; maketexture synthesizes a field and maps its ranks to sample values.
+   Do not reuse dither's threshold-reconciliation policy blindly in maketexture.
+
+3. Resolve samples once and preserve their boundaries.
+   LoadedSamples should own images/identities and the chosen primary image.
+   Calibration and builders consume that object, not another path lookup.
+   Generator-specific model fitting decides how to combine independent samples.
+   This removes repeated decoding, prevents load/hash disagreement, and makes
+   correct multi-scan statistics possible. It is more useful than adding more
+   special cases to vertical concatenation.
+
+4. Resolve immutable execution requests after calibration.
+   Params currently mixes user intent, lazy derived values, measurements, and
+   persistence; set() does not invalidate every previously memoized dependent.
+   After applying calibration, explicitly invalidate/re-resolve derived values
+   or build an immutable request from the final settings. Hash exactly that
+   request and execute it. This is a preventative architecture recommendation,
+   not a claim that every current calibration path produces stale dimensions.
+
+5. Separate benchmark evidence from executable invariants.
+   Keep short comments explaining units, boundary conditions, determinism, and
+   non-obvious arithmetic choices. Move long historical score narratives to
+   versioned experiment documents with commands, inputs and revision IDs.
+   Several comments already contradict current constants/behavior. Concision
+   here will improve reviewability more than compressing straightforward loops.
+
+Verification and limits
+-----------------------
+Fresh Release build succeeded with GCC 13.3.0 and OpenCV 4.6.0:
+  cmake -S . -B /tmp/dither-review-20261008 -DCMAKE_BUILD_TYPE=Release
+  cmake --build /tmp/dither-review-20261008 -j 8
+
+Passed:
+  unittest: 59/59.
+  test/run coltest: pass (27 seconds).
+  test/run impliedtest: pass (22 seconds).
+  test/run samplecheck: pass (10 seconds).
+  test/run flagcheck: pass.
+
+Integration scripts were copied into /tmp/dither-review-suite and its build
+directory pointed at the fresh build, with project inputs linked in. Their
+temporary XDG configuration isolation was retained. No existing build binary
+or personal configuration was substituted or overwritten.
+
+Focused probes confirmed pinned-cache overrides, missing cap identity,
+malformed-cache propagation, multi-file hash ambiguity, broken-symlink omission,
+numeric/geometry parsing errors, abort behavior, completion omissions, smaller
+paste tone distortion, integer-parser disagreement, and foreach token loss.
+The spectral-domain probe used -fsanitize=undefined,float-cast-overflow on
+calib.cpp/maskutil.cpp and reported the nonfinite-to-int conversion.
+Synthetic formula comparisons quantified the global/local coherence difference
+and the artificial stacked-scan high-pass residual. Probe sources, fixtures,
+executables and test logs are under /tmp/dither-review-probes for this session.
+
+Not performed: the entire image-quality parameter study, exhaustive seed/size
+searches, whole-project sanitizer coverage, every test/run target, or production
+installation. Quality recommendations needing broader validation are explicitly
+separated from reproduced defects. Passing the existing checks does not cover
+the new calibration/cache/frontend edge cases documented above.
+
+
+FOLLOW-UP REVIEW — 2026-10-08 RESPONSE CHANGES
+============================================
+Reviewed 3050040..d969779, including today's response commits and current
+tracked working-tree edits. The earlier report above remains historical.
+No production code was changed during this follow-up review.
+
+Several repairs are sound: Markov keys now include pinned axes; cache hits
+preserve those axes; Inpaint hashes cap; semantic versions were advanced;
+ridge coherence is local; DFT guards the empty frequency interval and uses
+scaled units; directory errors no longer poison subsequent entries; file hashes
+are framed; maketexture rejects malformed geometry and catches exceptions;
+unequal-size paste is refused; foreach preserves subsequent -- tokens.
+
+However, the “all twenty done” status in doc/triage4.txt is premature. The
+following are reproduced regressions or incomplete fixes. P2 findings deserve
+correction before calling this response complete; P3 findings are lower impact.
+
+R01 [P2, regression] maketexture lost its default highpass=0
+Location: maketexture.cpp:247-251, 269-270.
+The old frontend explicitly supplied highpass 0. The rewritten frontend calls
+register_mask_params and reads its default 32 without supplying the texture
+frontend's documented default. A normal command therefore filters/restores
+coarse structure rather than modeling the entire patch as before.
+
+Reproduction using a 64x64 noise fixture:
+  maketexture noise.png --mask-method dft --dft-iters 1 --size 16x16 --out o.png
+announces “highpass 32”; adding --highpass 0 announces 0. Both succeed, but
+they ask the generator different questions. Help still promises default 0.
+Fix: initialize the frontend-specific registry default before applying flags,
+preserving last-occurrence behavior between --highpass and --mask-highpass.
+Add an omitted-option versus explicit-zero behavioral comparison.
+
+R02 [P2, regression] Enumeration completion now returns one invalid argument
+Location: completion/dither:25-27, 46-59.
+_dither_words changes IFS to newline, but its method/threshold/spacing/weight
+callers still pass space-separated strings. compgen treats each whole string
+as one word. With COMP_WORDS=(dither --mask-method ""), COMPREPLY contains
+one entry: “blue dft markov inpaint direct”. With prefix “ma”, it is empty.
+The same regression affects maketexture methods and the other enumerations.
+Fix: pass newline-separated candidates consistently or use arrays and filter
+each item explicitly. Exercise completion through COMP_WORDS/COMP_CWORD and
+assert individual candidates, including non-first prefixes.
+
+R03 [P2, regression/incomplete F08] Mean matching uses pixels that are discarded
+Location: samples.cpp:155-166.
+The offset is computed from the full scan, then applied to a center crop whose
+mean may be different. Unequal-width scans with matching retained regions can
+therefore acquire a tone step that did not exist before this repair.
+
+Reproduced through samples::load: image A is 128x64, its middle 64 columns are
+100 and outer columns 0; image B is 64x64 at 100. Both retained crops originally
+have mean 100. The combined result now has half means 125 and 75: a new
+50-code seam. Photographic subjects or scan borders outside the retained crop
+can cause the same failure.
+Fix: select the actual retained regions first, then measure/normalize those
+regions. This narrow fix does not require the full SampleSet redesign. Mean
+matching still cannot guarantee continuity for gradients or arbitrary local
+boundary tone; document that remaining limitation rather than asserting that
+the join carries no tone step.
+
+R04 [P2, regression] Mean matching clips away sample contrast
+Location: samples.cpp:165-166.
+convertTo(band, m.type(), ...) keeps CV_8U. Adding/subtracting an exposure offset
+therefore clips at 0/255 and rounds fractional shifts. This is not the promised
+pure translation preserving grain amplitude; it can also defeat mean matching.
+
+Reproduced with an image containing seven-eighths zero and one-eighth 255,
+combined with an image at 224. The first image's range falls from 255 to 159;
+the resulting half means are 115.875 and 128 rather than equal. The texture
+statistics change before the high-pass or model sees them.
+Fix: shift in floating point and keep that representation through preprocessing.
+The downstream preprocessing already converts to float. Test both highlights
+and shadows, fractional offsets, and the retained means after normalization.
+
+R05 [P2, incomplete F04] Cached-result validation still admits invalid answers
+Location: markovcalib.cpp:343-365, 376; inpaintcalib.cpp:129-132.
+Markov accepts any finite temperature in (0,10], but the registry minimum is
+.01. A cache entry of .001 with otherwise valid fields passes cached_calibration
+and then throws in apply: “markov.temp: 0.001 is outside the permitted range
+[0.01, 100]”. The optional cache can still stop a run.
+
+Integer results are also rounded before checking their ranges. Reproduced
+through calibrate_inpaint_for: a cached value 2.6 is reported as a previous
+calibration of 3 instead of being discarded. Markov weighting/radius have the
+same rounding pattern, and radius/iters values absent from the searched ladders
+can pass their interval checks. Huge finite values still reach lround first.
+Fix: validate floating values against the result's actual domain before any
+conversion; require integrality and membership where the answer is discrete.
+Validate the whole record before mutating Params. Use the same constraints as
+the search/registry, not independently chosen bounds.
+
+R06 [P2, incomplete F11] maketexture still accepts options it never uses
+Location: maketexture.cpp:86-94, 210-235.
+The new accepted predicate admits every key in a generator namespace, including
+max_size and max_repeats. Those control dither's automatic mask-size selection;
+maketexture chooses size directly from Request/sample and never reads them.
+For example, --mask-method dft --dft-max-size garbage succeeds and writes an
+image; the value is neither validated as numeric nor used. These options are
+also advertised by --list-options, reinforcing the false contract.
+Fix: distinguish synthesis inputs from dither sizing-policy inputs and expose
+only parameters consumed by this frontend, or explicitly implement their
+semantics. Add acceptance tests that check effects/rejection, not just spelling.
+
+R07 [P3, incomplete F18] Option metadata and path completion remain incomplete
+Location: cli.cpp:260-268; completion/dither:44, 60-67;
+maketexture.cpp:100-104.
+The new dither --list-options omits the real --mask-out flag, so it disappears
+from completion. maketexture lists blue/direct parameters even though neither
+method can be selected. Filename branches still use unquoted command substitution
+outside the helper's local IFS; a file “a b.png” produces two candidates (“a”
+and “b.png”). All three were verified against the current scripts/executables.
+Fix: include every supported pipeline flag, filter impossible frontend methods,
+and populate arrays using a line-preserving read loop/mapfile with appropriate
+filename completion behavior. Test actual candidate lists and spaced paths.
+
+R08 [P3, unresolved F19] Installer fixes are recorded as done but absent
+Location: aliases:46-48, 63-72; doc/triage4.txt:F19.
+ln failure is still ignored, failed copies still do not propagate, and the
+optional [ -x dither ] test still determines install_samples' exit status.
+Its tested executable and PATH-invoked executable can still differ.
+Reproduced in a temporary installation tree: the function prints “1 added,
+0 already there”, installs the file successfully, then returns status 1 because
+there is no ./dither. Today's working-tree edit changes the gallery's film name,
+not these functions.
+Fix: implement the previously accepted error handling/explicit successful return,
+or reopen F19 in the triage. Optional informational output must not determine
+whether installation succeeded.
+
+Lower-impact remaining work and test quality
+------------------------------------------
+* F16 is narrower but not fully strict: an absolute 1e-6 tolerance still applies
+  to user values. --set seed=1.0000005 is rounded although --seed rejects it.
+  Check origin/type if user input must be integral; reserve tolerance for
+  derived arithmetic. The new comment claiming all integer parameters are
+  below 1e6 is also false for seed and several work limits.
+* The new struct-default test covers selected integers and Inpaint cap, but not
+  Markov's derived temperature. MarkovParams{} still gives temp .4 whereas the
+  registry at two sweeps gives about .247487. That mismatch predates this patch;
+  the new claim that both APIs now share all defaults should be narrowed or
+  completed. A typed request factory is preferable to copying derived rules.
+* maketexture still duplicates set_typed and the Inpaint parameter factory.
+  Reuse the existing inpaint_params_from; share numeric/option parsing instead
+  of maintaining two bodies under comments claiming identical semantics.
+* The new samplecheck assertions only verify that metadata starts with '--'
+  and contains a ceiling flag. They do not establish parser acceptance or
+  correct completion. They passed despite R02, R06 and R07. Most calibration
+  repairs still lack committed behavioral regression tests.
+* The local-ridge objective change is sensible, but the old empirical claims
+  for the 10% selection margin were measured under another objective. Rerun the
+  held-out quality checks before presenting those numbers as current evidence.
+
+Verification
+------------
+Fresh Release build at /tmp/dither-rereview succeeded (GCC 13.3/OpenCV 4.6).
+unittest: 60/60 pass.
+samplecheck: pass, 10 seconds; impliedtest: pass, 20 seconds.
+The integration scripts ran in /tmp/dither-rereview-suite against the fresh
+binary, with their temporary configuration isolation retained.
+Focused C++ probes exercised the real sample loader and calibration cache
+functions; CLI/Bash probes exercised parsing, defaults, metadata, completion,
+and installation status. Sources/fixtures/logs are in
+/tmp/dither-rereview-probes for this session. The entire suite, full sanitizer
+build, and film quality study were not repeated.

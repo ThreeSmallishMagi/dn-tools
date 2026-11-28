@@ -1,0 +1,122 @@
+ref=/home/agent/host/claude1/cpp/opencv/examples/ramp_256x256.png
+dither=/home/agent/host/claude1/cpp/opencv/build/dither
+colstats=/home/agent/host/claude1/cpp/opencv/test/colstats
+
+test                                         group  worst |z|    avg |z|  fails  result
+---------------------------------------------------------------------------------------
+identity sanity check                            1      0.000      0.000      0  PASS
+identity sanity check                           16      0.000      0.000      0  PASS
+identity sanity check                           32      0.000      0.000      0  PASS
+round   defaults (spatial=1)                     1      2.343      0.602      0  PASS
+round   defaults (spatial=1)                    16      1.123      0.274      0  PASS
+round   defaults (spatial=1)                    32      0.971      0.283      0  PASS
+random  spatial=0                                1      2.747      0.722      0  PASS
+random  spatial=0                               16      1.366      0.574      0  PASS
+random  spatial=0                               32      0.965      0.475      0  PASS
+random  spatial=0 lin                            1      2.977      0.784      0  PASS
+random  spatial=0 lin                           16      3.065      0.883      1  EXPECTED <= 1
+random  spatial=0 lin                           32      1.831      0.923      0  PASS
+random  levels=8 spatial=0                       1      1.534      0.132      0  PASS
+random  levels=8 spatial=0                      16      0.395      0.122      0  PASS
+random  levels=8 spatial=0                      32      0.472      0.157      0  PASS
+random  levels=8 spatial=0 lin                   1      1.040      0.135      0  PASS
+random  levels=8 spatial=0 lin                  16      0.271      0.103      0  PASS
+random  levels=8 spatial=0 lin                  32      0.241      0.105      0  PASS
+random  levels=4 frames=8 spatial=0.5            1      2.187      0.066      0  PASS
+random  levels=4 frames=8 spatial=0.5           16      0.690      0.120      0  PASS
+random  levels=4 frames=8 spatial=0.5           32      0.557      0.144      0  PASS
+random  frames=16 spatial=0                      1      0.435      0.089      0  PASS
+random  frames=16 spatial=0                     16      0.319      0.121      0  PASS
+random  frames=16 spatial=0                     32      0.305      0.121      0  PASS
+random  frames=64 spatial=0                      1      0.360      0.050      0  PASS
+random  frames=64 spatial=0                     16      0.422      0.093      0  PASS
+random  frames=64 spatial=0                     32      0.195      0.084      0  PASS
+random  frames=128 spatial=0                     1      0.375      0.043      0  PASS
+random  frames=128 spatial=0                    16      0.388      0.079      0  PASS
+random  frames=128 spatial=0                    32      0.185      0.070      0  PASS
+random  spatial=1                                1      2.076      0.630      0  PASS
+random  spatial=1                               16      0.603      0.212      0  PASS
+random  spatial=1                               32      0.343      0.160      0  PASS
+random  frames=16 spatial=1                      1      1.832      0.104      0  PASS
+random  frames=16 spatial=1                     16      0.336      0.120      0  PASS
+random  frames=16 spatial=1                     32      0.375      0.156      0  PASS
+random  frames=16 spatial=0.5                    1      1.832      0.100      0  PASS
+random  frames=16 spatial=0.5                   16      0.411      0.153      0  PASS
+random  frames=16 spatial=0.5                   32      0.373      0.182      0  PASS
+random  frames=128 spatial=0.1                   1      1.187      0.051      0  PASS
+random  frames=128 spatial=0.1                  16      0.397      0.106      0  PASS
+random  frames=128 spatial=0.1                  32      0.384      0.097      0  PASS
+round   spatial=0                                1     15.908      7.219    200  EXPECTED <= 200
+round   spatial=0                               16     55.045     27.015     16  EXPECTED <= 16
+round   spatial=0                               32     69.484     38.306      8  EXPECTED <= 8
+round   levels=16 spatial=0                      1      4.386      0.775      7  EXPECTED <= 7
+round   levels=16 spatial=0                     16      0.595      0.311      0  PASS
+round   levels=16 spatial=0                     32      0.572      0.425      0  PASS
+round   levels=16 spatial=0 lin                  1      2.879      0.769      0  PASS
+round   levels=16 spatial=0 lin                 16      0.251      0.166      0  PASS
+round   levels=16 spatial=0 lin                 32      0.335      0.234      0  PASS
+round   frames=64 spatial=0                      1      1.508      0.276      0  PASS
+round   frames=64 spatial=0                     16      3.077      0.389      1  EXPECTED <= 1
+round   frames=64 spatial=0                     32      0.831      0.215      0  PASS
+round   spatial=1 lin                            1      2.819      0.638      0  PASS
+round   spatial=1 lin                           16      0.579      0.198      0  PASS
+round   spatial=1 lin                           32      0.379      0.173      0  PASS
+round   frames=16 spatial=1                      1      0.770      0.160      0  PASS
+round   frames=16 spatial=1                     16      0.266      0.128      0  PASS
+round   frames=16 spatial=1                     32      0.333      0.143      0  PASS
+round   frames=16 spatial=0.5                    1      1.434      0.186      0  PASS
+round   frames=16 spatial=0.5                   16      0.286      0.129      0  PASS
+round   frames=16 spatial=0.5                   32      0.369      0.126      0  PASS
+round   levels=4 spatial=1                       1      2.014      0.282      0  PASS
+round   levels=4 spatial=1                      16      0.186      0.077      0  PASS
+round   levels=4 spatial=1                      32      0.127      0.042      0  PASS
+round   levels=8 frames=4 spatial=1              1      0.616      0.102      0  PASS
+round   levels=8 frames=4 spatial=1             16      0.500      0.105      0  PASS
+round   levels=8 frames=4 spatial=1             32      0.411      0.117      0  PASS
+mask    spatial=0                                1      2.322      0.627      0  PASS
+mask    spatial=0                               16      0.426      0.175      0  PASS
+mask    spatial=0                               32      0.321      0.084      0  PASS
+mask    levels=4 frames=8 spatial=0.5            1      1.718      0.067      0  PASS
+mask    levels=4 frames=8 spatial=0.5           16      0.671      0.120      0  PASS
+mask    levels=4 frames=8 spatial=0.5           32      0.534      0.142      0  PASS
+mask    frames=16 spatial=0                      1      0.425      0.082      0  PASS
+mask    frames=16 spatial=0                     16      0.318      0.105      0  PASS
+mask    frames=16 spatial=0                     32      0.357      0.131      0  PASS
+mask    frames=128 spatial=0                     1      0.361      0.043      0  PASS
+mask    frames=128 spatial=0                    16      0.403      0.079      0  PASS
+mask    frames=128 spatial=0                    32      0.208      0.072      0  PASS
+mask    mask=32x32 spatial=0                     1      4.782      1.562     19  EXPECTED <= 19
+mask    mask=32x32 spatial=0                    16      2.169      0.742      0  PASS
+mask    mask=32x32 spatial=0                    32      1.578      0.584      0  PASS
+mask    mask=128x128 spatial=0                   1      4.310      0.952      4  EXPECTED <= 4
+mask    mask=128x128 spatial=0                  16      1.028      0.279      0  PASS
+mask    mask=128x128 spatial=0                  32      0.626      0.230      0  PASS
+mask    seed=7 sigma=2.5 spatial=0               1      2.304      0.628      0  PASS
+mask    seed=7 sigma=2.5 spatial=0              16      0.625      0.262      0  PASS
+mask    seed=7 sigma=2.5 spatial=0              32      0.508      0.208      0  PASS
+mask    spatial=0.5                              1      2.004      0.583      0  PASS
+mask    spatial=0.5                             16      0.388      0.134      0  PASS
+mask    spatial=0.5                             32      0.292      0.106      0  PASS
+mask    spatial=0.9                              1      2.220      0.629      0  PASS
+mask    spatial=0.9                             16      0.472      0.170      0  PASS
+mask    spatial=0.9                             32      0.229      0.127      0  PASS
+mask    spatial=1                                1      2.255      0.617      0  PASS
+mask    spatial=1                               16      0.316      0.123      0  PASS
+mask    spatial=1                               32      0.186      0.100      0  PASS
+mask    frames=8 spatial=0.5                     1      1.794      0.163      0  PASS
+mask    frames=8 spatial=0.5                    16      0.479      0.150      0  PASS
+mask    frames=8 spatial=0.5                    32      0.503      0.188      0  PASS
+random  spatial=0.5                              1      2.348      0.701      0  PASS
+random  spatial=0.5                             16      0.472      0.197      0  PASS
+random  spatial=0.5                             32      0.249      0.120      0  PASS
+round   spatial=0.5                              1      3.297      0.727      1  EXPECTED <= 1
+round   spatial=0.5                             16      2.426      0.524      0  PASS
+round   spatial=0.5                             32      2.587      0.597      0  PASS
+blue    alias spatial=0                          1      2.322      0.627      0  PASS
+blue    alias spatial=0                         16      0.426      0.175      0  PASS
+blue    alias spatial=0                         32      0.321      0.084      0  PASS
+---------------------------------------------------------------------------------------
+Totals over clean tests                          1      48.23       9.80      0
+Totals over clean tests                         16      19.41       6.12      0
+Totals over clean tests                         32      19.05       7.20      0
+OVERALL PASS

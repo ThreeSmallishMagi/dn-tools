@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Does --level-spacing device hold its tone on the panel it is for?
+
+  devicetest [dither-binary]
+
+Every other tone check in test/ reads the output as an 8-bit sRGB image, which is
+the right question for --level-spacing srgb and the wrong one for device. There
+the 8-bit file is only a carrier: the display has exactly --levels of its own,
+and what it emits for level k is sRGB(k / (levels-1)), not what the file's
+rounded 8-bit stand-in decodes to. Those differ whenever levels-1 does not divide
+255, by up to 2% of a rung's light -- a 3-bit panel's lowest rung emits
+sRGB(1/7) = 0.0180 where pixel 36 decodes to 0.0176.
+
+So this simulates the panel: read each output pixel back to the level index it
+stands for, emit sRGB of that index over levels-1, and integrate. Multi-frame
+runs are integrated over the frames too, which is what a screen showing them in
+sequence does.
+
+Both directions are asserted. `device` has to be right on the panel, and `srgb`
+has to be measurably wrong there -- otherwise the two have been silently unified
+and the mode has stopped meaning anything.
+"""
+import os, subprocess, sys, tempfile
+import cv2
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
+                         else os.path.join(ROOT, 'build', 'dither'))
+REF = os.path.join(ROOT, 'examples', 'ramp_256x256.png')
+
+# In units of 1/1000 linear. The pass mark is what the panel must reproduce; the
+# fail mark is how wrong `srgb` has to be there for the distinction to be real.
+TOL, MIN_GAP = 0.20, 0.15
+
+
+def srgb_to_linear(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def panel_light(img, levels):
+    """What a display with exactly `levels` of its own emits for this image."""
+    index = np.round(img.astype(np.float64) * (levels - 1) / 255.0)
+    return srgb_to_linear(index / (levels - 1))
+
+
+def run(spacing, levels, frames, work):
+    out = os.path.join(work, 'o.png')
+    args = [DITHER, REF, '--levels', str(levels), '--frames', str(frames),
+            '--level-spacing', spacing, '--no-config', '--out', out]
+    if frames > 1:
+        args.append('--save-frames')
+    if subprocess.run(args, capture_output=True).returncode != 0:
+        return None
+    stem = out[:-4]
+    paths = [f'{stem}-{k}.png' for k in range(frames)] if frames > 1 else [out]
+    imgs = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in paths]
+    if any(i is None for i in imgs):
+        return None
+    return np.mean([panel_light(i, levels) for i in imgs], axis=0)
+
+
+def main():
+    for path in (DITHER, REF):
+        if not os.path.exists(path):
+            sys.exit(f"not found: {path}")
+    target = srgb_to_linear(cv2.imread(REF, cv2.IMREAD_GRAYSCALE) / 255.0)
+
+    print(f"dither={DITHER}\nsimulating a display with exactly --levels of its own\n")
+    print(f"{'levels':>7} {'frames':>7} {'device':>10} {'srgb':>10}  result")
+    fails = 0
+    with tempfile.TemporaryDirectory(prefix='devicetest.') as work:
+        # 3 and 8 are level counts where the two spacings differ; 8 is a 3-bit
+        # panel. 5 also differs and is deliberately left out: the two ladders
+        # are close enough there that srgb reads -0.171 against device's -0.020,
+        # a gap of 0.151 against a MIN_GAP of 0.15. It is a true result sitting
+        # a thousandth from failing, and a row that marginal reports drift
+        # rather than defects. 4 and 16 pin the other half of the rule -- 255/3 and 255/15 are whole
+        # numbers, so there the ladders coincide and both must pass. 16 also
+        # checks that the distinction does not simply fade out as the rungs get
+        # close together, which is the way a wrong implementation would still
+        # look right at every count anyone tried. The frames rows ask the same
+        # question of a sequence integrated on the panel rather than a single
+        # exposure, at a level count from each half of the rule.
+        for levels, frames in ((8, 1), (8, 4), (3, 1), (3, 4),
+                               (4, 1), (4, 4), (16, 1)):
+            errs = {}
+            for spacing in ('device', 'srgb'):
+                light = run(spacing, levels, frames, work)
+                if light is None:
+                    print(f"{levels:>7} {frames:>7} {'':>10} {'':>10}  RUN FAILED")
+                    fails += 1
+                    errs = None
+                    break
+                errs[spacing] = 1000 * (light.mean(0) - target.mean(0)).mean()
+            if errs is None:
+                continue
+            ok = abs(errs['device']) <= TOL
+            # Where levels-1 divides 255 the two are the same ladder, so srgb is
+            # required to be just as good rather than worse.
+            agree = 255 % (levels - 1) == 0
+            if agree:
+                ok = ok and abs(errs['srgb']) <= TOL
+                note = 'PASS (both, as 255 divides)' if ok else 'FAIL'
+            else:
+                ok = ok and abs(errs['srgb']) - abs(errs['device']) >= MIN_GAP
+                note = 'PASS' if ok else 'FAIL'
+            fails += not ok
+            print(f"{levels:>7} {frames:>7} {errs['device']:+10.3f} {errs['srgb']:+10.3f}  {note}")
+
+    print(f"\n{'OVERALL PASS' if not fails else f'OVERALL FAIL ({fails})'}"
+          f"   |device| <= {TOL} per 1000 linear, and srgb worse by >= {MIN_GAP}"
+          f" where the ladders differ")
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == '__main__':
+    main()

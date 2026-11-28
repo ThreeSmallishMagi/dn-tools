@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Level-set fit between synthesised masks and the sample they imitate.
+
+  levelfit <sample> <mask> [<mask> …] --method M | --highpass PX [--levels g,g,…]
+
+The higher-order counterpart to `maskfit`. A threshold mask is used one level set
+at a time — at density g, the g lowest-valued pixels are what gets lit — so what
+matters is how *those* patterns are arranged, not the spectrum of the whole mask.
+maskstats' `low` measures it: clumping of the pattern shown at each density,
+normalised so uncorrelated noise reads 1.
+
+The reference is the sample turned into the mask it would be if it could be used
+directly: high-passed, centre-cropped to the first mask's size, ranked to a flat
+0..254 with its brightest pixel lowest, since a mask lights its lowest cells
+first. That is the same treatment every synthesised mask has had, so the
+comparison is like with like. Pass `--reference-is-mask` when the reference is
+already a mask: it is then only cropped, and compared in its own order.
+
+  clump  RMS of log10(low / low_ref) over the densities — the headline number
+  slope  clumping of the sample's darkest tenth over its brightest -- low at
+         the highest density over low at the lowest, since a mask lights the
+         brightest first. A film's dark grain clumps far harder than its light
+         grain, so its slope runs ~6;
+         anything that randomises phase flattens this to ~1 whatever its
+         spectrum says, which is the whole reason this tool exists
+  aniso  mean directionality in dB, and void the mean void radius, both
+         straight from maskstats for context rather than scored
+"""
+import argparse, os, re, subprocess, sys, tempfile
+import cv2
+import numpy as np
+import maskref
+
+MASKSTATS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'maskstats')
+
+ap = argparse.ArgumentParser()
+ap.add_argument('sample', help="the image the masks are imitating")
+ap.add_argument('mask', nargs='+', help="mask(s) to score")
+maskref.add_arguments(ap, "the reference")
+ap.add_argument('--reference-is-mask', action='store_true',
+                help="the sample is already a mask: crop it and compare it as it is")
+ap.add_argument('--levels', default='0.1,0.25,0.5,0.75,0.9',
+                help="densities to analyse (default 0.1,0.25,0.5,0.75,0.9)")
+ap.add_argument('--ref-out', metavar='FILE', help="keep the reference mask here")
+args = ap.parse_args()
+if args.reference_is_mask:
+    args.highpass = 0.0
+else:
+    maskref.resolve(args, ap)
+
+
+def stats(path):
+    """maskstats' per-density table; returns (g, low, aniso, void)."""
+    r = subprocess.run([MASKSTATS, path, '--levels', args.levels],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr.strip() or r.stdout.strip() or f"maskstats failed on {path}")
+    rows = [l.split() for l in r.stdout.splitlines() if re.match(r'^\s*0\.\d+\s', l)]
+    want = len(args.levels.split(','))
+    if len(rows) != want:
+        sys.exit(f"maskstats gave {len(rows)} density rows for {path}, expected {want}")
+    cols = np.array([[float(v) for v in row] for row in rows])
+    return cols[:, 0], cols[:, 1], cols[:, 5], cols[:, 6]
+
+
+def reference(sample_path, size):
+    """The sample as the mask it would be: high-pass, centre-crop, rank flat."""
+    img = cv2.imread(sample_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        sys.exit(f"could not read {sample_path}")
+    H, W = size
+    if img.shape[0] < H or img.shape[1] < W:
+        sys.exit(f"{sample_path} is {img.shape[1]}x{img.shape[0]}, too small to crop "
+                 f"a {W}x{H} reference from")
+    if args.reference_is_mask:
+        y0, x0 = (img.shape[0] - H) // 2, (img.shape[1] - W) // 2
+        return img[y0:y0 + H, x0:x0 + W].copy()
+    f = img.astype(np.float64)
+    f -= f.mean()
+    if args.highpass:
+        # Toroidal Gaussian high-pass, half power at 1/px — the same convention
+        # maskstats, spectralmask.cpp and markov.cpp all use.
+        fy = np.fft.fftfreq(f.shape[0])[:, None]
+        fx = np.fft.fftfreq(f.shape[1])[None, :]
+        gauss = np.exp(-2 * np.pi ** 2 * (0.1874 * args.highpass) ** 2 * (fy ** 2 + fx ** 2))
+        f = np.real(np.fft.ifft2(np.fft.fft2(f) * (1 - gauss)))
+    y0, x0 = (f.shape[0] - H) // 2, (f.shape[1] - W) // 2
+    crop = f[y0:y0 + H, x0:x0 + W].ravel()
+    # 0..254, never 255: the same endpoint convention the mask builders use,
+    # and the brightest lowest, as they rank it.
+    out = np.empty(crop.size, np.uint8)
+    out[np.argsort(-crop, kind='stable')] = np.round(
+        np.arange(crop.size) * 254 / max(1, crop.size - 1))
+    return out.reshape(H, W)
+
+
+sizes = {}
+for path in args.mask:
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        sys.exit(f"could not read {path}")
+    sizes[path] = img.shape
+first = sizes[args.mask[0]]
+odd = [p for p, s in sizes.items() if s != first]
+if odd:
+    print(f"note: reference is cropped to {first[1]}x{first[0]} from "
+          f"{os.path.basename(args.mask[0])}; {', '.join(os.path.basename(p) for p in odd)} "
+          f"differ in size, so their figures are not strictly comparable\n")
+
+ref_path = args.ref_out
+if not ref_path:
+    fd, ref_path = tempfile.mkstemp(suffix='.png')
+    os.close(fd)
+cv2.imwrite(ref_path, reference(args.sample, first))
+
+g, rl, ra, rv = stats(ref_path)
+if not args.ref_out:
+    os.unlink(ref_path)
+
+print(f"reference: {os.path.basename(args.sample)} "
+      + (f"as a mask, cropped to {first[1]}x{first[0]}\n" if args.reference_is_mask else
+         f"high-passed at {args.highpass:g} px, cropped to {first[1]}x{first[0]}, "
+         f"ranked flat\n"))
+head = '  '.join(f'g={x:g}' for x in g)
+print(f"{'':<28} {'clump':>6} {'slope':>6} {'aniso':>6} {'void':>6}   {head}")
+
+
+def show(name, low, an, void, clump=None):
+    lows = '  '.join(f'{v:5.1f}' for v in low)
+    print(f"{name:<28} {'   ref' if clump is None else f'{clump:6.3f}'} "
+          f"{low[-1] / low[0]:6.2f} {an.mean():+6.2f} {void.mean():6.2f}   {lows}")
+
+
+show(os.path.basename(args.sample), rl, ra, rv)
+results = []
+for path in args.mask:
+    _, low, an, void = stats(path)
+    clump = float(np.sqrt((np.log10(low / rl) ** 2).mean()))
+    results.append((path, clump, low[-1] / low[0]))
+    show(os.path.basename(path), low, an, void, clump)
+
+print()
+print(f"RESULT kind=level ref={os.path.basename(args.sample)} "
+      f"slope={rl[-1] / rl[0]:.3f} highpass={args.highpass:g}")
+for path, clump, slope in results:
+    print(f"RESULT kind=level mask={os.path.basename(path)} "
+          f"clump={clump:.4f} slope={slope:.3f}")

@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Check that naming an option moves the defaults it needs, and says so.
+
+  impliedtest [dither-binary]
+
+An option the user supplied should not be ignored because a *different*
+parameter was left at its default: --mask-sample is a request for a mask, so
+--threshold has to move off `round` by itself. Params::reconcile does that, and
+what it moved is printed as `Note: assuming ...`.
+
+The property worth pinning is stronger than "it prints a note": the implied form
+must produce the *same image* as spelling every option out. That is what makes
+the shorthand safe to use, and it is what would break if a rule's candidates or
+the tie-break between them ever drifted.
+
+Three parts of the mechanism are easy to regress and each has a case here:
+
+  • The search is over the product of the candidate lists, not one parameter at
+    a time. A markov-only parameter needs mask.method=markov AND threshold=mask
+    together; neither alone rescues it, so a greedy pass silently finds nothing.
+  • Ties go to moving nothing, so a plain run must not acquire implied values.
+  • A default the user pinned is never moved. What is then left stranded is
+    blocked by another option the user gave, so it is refused rather than
+    quietly dropped -- the note-and-carry-on it replaced meant an option you
+    typed had no effect and the exit status said everything was fine.
+
+The same property is what the --markov-temp case checks from the other end. There
+the option is applicable and simply outranks the mechanism that would otherwise
+work the number out, and the way it failed is worth remembering: the guard asked
+Params::measured() when it meant Origin::User, so it never fired. Nothing in the
+output said so -- only the mask differed -- which is why that case compares
+images rather than logs.
+"""
+import concurrent.futures
+import os
+import threading, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
+                         else os.path.join(ROOT, 'build', 'dither'))
+IMG    = os.path.join(ROOT, 'examples', 'm039crop.png')
+SAMPLE = os.path.join(ROOT, 'examples', 'Kodak-4X-1.png')
+
+# Per case, not per run: the cases are independent but several of them write to
+# the same suffixes, which is what kept them serial. A thread-local prefix gives
+# each its own files and nothing else has to change -- every case names its
+# outputs through WORK.
+_local = threading.local()
+_WORK_ROOT = os.path.join(ROOT, 'examples', '.impliedtest')
+
+
+class _Work(str):
+    """WORK, but whichever case is asking. Still a string, so `WORK + '-a.png'`
+       reads the same as it always did."""
+    def __add__(self, other):
+        return getattr(_local, 'prefix', _WORK_ROOT) + other
+
+
+WORK = _Work(_WORK_ROOT)
+
+
+def run(args, out):
+    r = subprocess.run([DITHER, IMG, '--no-config', '--out', out] + args,
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def image(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+cases = []          # (label, check) -> check returns (ok, detail)
+
+
+def case(label):
+    def add(fn):
+        cases.append((label, fn))
+        return fn
+    return add
+
+
+@case("--mask-sample implies threshold=mask")
+def _():
+    rc, log = run(['--mask-sample', SAMPLE], WORK + '-a.png')
+    if rc != 0:
+        return False, f"exit={rc}"
+    if 'assuming threshold=mask' not in log:
+        return False, "no `assuming threshold=mask` note"
+    return True, "noted and applied"
+
+
+@case("implied form matches the explicit one byte for byte")
+def _():
+    run(['--mask-sample', SAMPLE], WORK + '-a.png')
+    run(['--threshold', 'mask', '--mask-method', 'dft', '--mask-sample', SAMPLE,
+         '--spatial', '0'], WORK + '-b.png')
+    same = image(WORK + '-a.png') == image(WORK + '-b.png')
+    return same, "identical" if same else "implied run differs from the spelled-out one"
+
+
+@case("--mask-in implies threshold=mask")
+def _():
+    # Build a mask to load back, so the case does not depend on a checked-in one.
+    run(['--threshold', 'mask', '--mask-out', WORK + '-m.png'], WORK + '-c.png')
+    rc, log = run(['--mask-in', WORK + '-m.png'], WORK + '-d.png')
+    if rc != 0:
+        return False, f"exit={rc}"
+    ok = 'assuming threshold=mask' in log and 'mask.in' in log
+    return ok, "noted" if ok else "mask supplied but threshold left on round"
+
+
+@case("a markov-only parameter implies method and threshold together")
+def _():
+    rc, log = run(['--mask-sample', SAMPLE, '--set', 'markov.temp=0.3'], WORK + '-e.png')
+    if rc != 0:
+        return False, f"exit={rc}"
+    ok = 'mask.method=markov' in log and 'threshold=mask' in log
+    return ok, "both moved" if ok else "needed a joint move and did not get one"
+
+
+@case("every sample generator can be implied, not just the two named in a list")
+def _():
+    # The candidate list used to be a literal {dft, markov} written before
+    # inpaint existed, so an inpaint-only option refused the run where the same
+    # shape for markov succeeded. It is a column in the generator table now, and
+    # this is the case that was broken: one row per sample generator, each
+    # implied by a parameter only it has.
+    # dft needs no move -- it is already the default once a sample is named, so
+    # nothing is "assumed" and no note is printed. The others have to be moved
+    # there, so for them the note is the evidence. Both must end up running the
+    # generator whose parameter was set, which the summary line reports.
+    probes = [('dft', 'dft.iters=8', False),
+              ('markov', 'markov.temp=0.3', True),
+              ('inpaint', 'inpaint.db=50000', True)]
+    bad = []
+    for method, setting, moved in probes:
+        rc, log = run(['--mask-sample', SAMPLE, '--set', setting,
+                       '--mask-size', '32x32'], f"{WORK}-cand-{method}.png")
+        if rc != 0:
+            bad.append(f"{method} refused (exit={rc})")
+        elif f'mask-method={method}' not in log:
+            bad.append(f"{method} not selected")
+        elif moved and f'mask.method={method}' not in log:
+            bad.append(f"{method} selected without a note")
+    return not bad, ("all three run their generator" if not bad
+                     else f"broken: {', '.join(bad)}")
+
+
+@case("an explicit --threshold is never overridden, and conflicting with it refuses")
+def _():
+    rc, log = run(['--threshold', 'round', '--mask-sample', SAMPLE], WORK + '-f.png')
+    if 'assuming' in log:
+        return False, "moved a default the user pinned"
+    if rc == 0:
+        return False, "ran anyway with --mask-sample ignored"
+    # Named as the user typed them, which is what they have to edit.
+    ok = '--mask-sample' in log and '--threshold' in log and '--set threshold' not in log
+    return ok, "refused, naming both" if ok else f"unhelpful refusal: {log.strip()}"
+
+
+@case("two conflicting user options refuse rather than dropping one")
+def _():
+    # Neither is a default, so reconcile has nothing to move: a mask cannot be
+    # both loaded and synthesised from a scaled sample.
+    run(['--threshold', 'mask', '--mask-out', WORK + '-m.png'], WORK + '-c.png')
+    rc, log = run(['--mask-scale', '2', '--mask-in', WORK + '-m.png'], WORK + '-h.png')
+    if rc == 0:
+        return False, "ran anyway with --mask-scale ignored"
+    ok = '--mask-scale' in log and '--mask-in' in log
+    return ok, "refused, naming both" if ok else f"did not name the blocker: {log.strip()}"
+
+
+@case("--markov-temp outranks --mask-calibrate, which measures one")
+def _():
+    # Two ways to decide the same number, so the one named on the command line
+    # wins -- as the code says it does. It did not: the guard asked
+    # Params::measured(), which is Origin::Measured, while a command-line value
+    # is Origin::User, so it never fired and the measurement silently replaced
+    # the request. The mask is the evidence, since --explain returns before
+    # calibration runs and never sees it.
+    common = ['--mask-sample', SAMPLE, '--mask-method', 'markov', '--threshold', 'mask',
+              '--mask-size', '64x64', '--markov-temp', '0.99']
+    rc1, log = run(common + ['--mask-calibrate', '--mask-out', WORK + '-tc.png'], WORK + '-i.png')
+    rc2, _   = run(common + ['--mask-out', WORK + '-tp.png'], WORK + '-j.png')
+    if rc1 or rc2:
+        return False, f"exit={rc1},{rc2}"
+    if image(WORK + '-tc.png') != image(WORK + '-tp.png'):
+        return False, "calibration overwrote the temperature it was given"
+    ok = 'Note:' in log
+    return ok, "honoured, and the no-op reported" if ok else "honoured, but --mask-calibrate did nothing silently"
+
+
+@case("a generator that needs a sample says so, and one that cannot use it refuses")
+def _():
+    # The two halves of the same rule, and before --mask-method existed neither
+    # case could be expressed: the sample's presence *was* the switch, so there
+    # was nothing to disagree with. Naming the method made both reachable and
+    # nothing covered either.
+    rc, log = run(['--mask-method', 'dft'], WORK + '-n1.png')
+    if rc == 0:
+        return False, "dft ran with no sample to imitate"
+    if 'mask-sample' not in log:
+        return False, f"did not say what was missing: {log.strip()}"
+    out = WORK + '-n2.png'
+    if os.path.exists(out):
+        os.remove(out)
+    rc, log = run(['--mask-method', 'blue', '--mask-sample', SAMPLE], out)
+    if rc == 0:
+        return False, "blue ran with a sample it cannot use"
+    if os.path.exists(out):
+        return False, "refused but wrote an output anyway"
+    ok = 'mask-sample' in log and 'blue' in log
+    return ok, "both refused, naming the sample" if ok else f"unhelpful: {log.strip()}"
+
+
+@case("--threshold blue is the old spelling of mask, rewritten in silence")
+def _():
+    # parseOptions rewrites it at the point of parsing so only one spelling
+    # reaches the rest of the program. The silence is deliberate -- coltest,
+    # budgettest and test/base.txt predate the rename and a deprecation note on
+    # stderr would change what they capture -- so the test is that the outputs
+    # match byte for byte *and* that nothing was said about it.
+    rc1, log1 = run(['--threshold', 'blue', '--mask-size', '32x32'], WORK + '-o1.png')
+    rc2, _    = run(['--threshold', 'mask', '--mask-size', '32x32'], WORK + '-o2.png')
+    if rc1 != 0 or rc2 != 0:
+        return False, f"exit={rc1}/{rc2}"
+    if open(WORK + '-o1.png', 'rb').read() != open(WORK + '-o2.png', 'rb').read():
+        return False, "the two spellings produced different images"
+    noisy = [w for w in ('deprecat', 'old spelling', 'assuming') if w in log1.lower()]
+    return not noisy, ("identical and silent" if not noisy
+                       else f"said something about it: {noisy}")
+
+
+@case("a plain run acquires nothing")
+def _():
+    rc, log = run([], WORK + '-g.png')
+    if rc != 0:
+        return False, f"exit={rc}"
+    ok = 'assuming' not in log and 'threshold=round' in log and 'spatial=1' in log
+    return ok, "unchanged" if ok else f"defaults moved with no reason to: {log.strip()}"
+
+
+def main():
+    for path in (DITHER, IMG, SAMPLE):
+        if not os.path.exists(path):
+            sys.exit(f"not found: {path}")
+    print(f"dither={DITHER}\n")
+    print(f"{'case':<66} result  detail")
+    print('-' * 96)
+    fails = 0
+
+    def one(job):
+        i, (label, fn) = job
+        _local.prefix = f"{_WORK_ROOT}-{i}"
+        try:
+            return label, *fn()
+        except Exception as e:                       # a crash is a failure, not a traceback
+            return label, False, f"{type(e).__name__}: {e}"
+
+    # --no-config is load-bearing here and stays: these cases assert that two
+    # spellings produce the same bytes, and a cache hit would make that vacuous.
+    # So the mask is rebuilt every time and the only speed available is running
+    # the cases at once, which they are already independent enough for.
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, os.cpu_count() or 4)) as pool:
+        results = list(pool.map(one, enumerate(cases)))
+    for label, ok, detail in results:
+        fails += not ok
+        print(f"{label:<66} {'PASS' if ok else 'FAIL':<6}  {detail}")
+    for f in os.listdir(os.path.dirname(_WORK_ROOT)):
+        if f.startswith(os.path.basename(_WORK_ROOT)):
+            os.remove(os.path.join(os.path.dirname(WORK), f))
+    print('-' * 96)
+    print('OVERALL', 'PASS' if not fails else f'FAIL ({fails})')
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == '__main__':
+    main()

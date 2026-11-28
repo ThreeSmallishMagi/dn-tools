@@ -1,0 +1,817 @@
+CODE REVIEW: CLARITY AND CONCISION
+Reviewed 2026-09-26
+
+Scope and approach
+------------------
+Reviewed all 20 project-owned .cpp files in the working tree, 6,880 lines,
+including unittest.cpp, the two diagnostic/demo programs, and the untracked
+hello.cpp. Reviewed each function, class, registration block, test case and
+its nested control flow. The coverage ledger below records both suggested
+changes and blocks worth retaining. Three CMake-generated compiler-identification
+.cpp files were excluded: they are generated build infrastructure, not project
+source. Relevant headers and callers were consulted to check contracts.
+
+References are to the working-tree line numbers at review time, based on commit
+08b23b7 plus local changes. In particular, cli.cpp already has a local edit to
+report_reconciliation; that version was reviewed. No application sources were
+changed. This report does not propose rewriting blocks merely because they can
+be made shorter.
+
+Read doc/improvements.txt and doc/improvements2.txt before forming suggestions.
+Their rejected rewrites remain rejected unless there is new evidence below.
+In particular, preserve numerical operation order, seeded random draws,
+ranking tie-breaks and output bytes during a cleanup. Changes to validation,
+cache formats or failure behavior are identified separately from refactors.
+
+Assessment
+----------
+The existing decomposition is generally good. The highest-value remaining work
+is to clarify boundaries: display formatting versus serialization, parsing
+versus validation, cached data versus authoritative input, and fitting versus
+reporting. Small changes can also remove redundant copies, wrappers and
+parameters. Broad abstractions over numerical loops would usually make this
+project harder to understand.
+
+Suggested order:
+  1. Address behavior-affecting findings R01-R07 and R13-R14 in separate fixes.
+  2. Take the small refactors R08-R10, R12, R15-R17 and R23 where useful.
+  3. Improve the relevant test coverage and diagnostics with R19-R22.
+  4. Consider R11, R24 and R25 when touching those areas; they are not a reason
+     for a general rewrite. Correct misleading comments under R18 throughout.
+
+Evidence and validation performed
+---------------------------------
+Configured a fresh Release build under /tmp/dither-code-review-20260926 with
+GCC 13.3 and the installed OpenCV 4.6.0. All CMake targets built successfully.
+The freshly built unittest passed all 54 cases. Existing root/build binaries
+were not used as evidence of current source behavior.
+
+Temporary, focused C++ probes against the current sources established:
+  * blue.sigma=1.8000001 and 1.8000002 produce identical mask cache keys.
+  * A saved calibration double 0.374123456789 reloads as approximately 0.374123.
+  * --levels 2.9 is accepted as 2; --supersample 2.9 becomes 2, whereas
+    --set supersample=2.9 becomes 3.
+  * --mask-size 32x32garbage and --debug-pixel 1,2garbage are accepted.
+  * Calibration keys do not change for the tested seed, reuse or sample-shape
+    changes described in R02.
+  * fit_expert and to_logp produce exactly equal smoothed tables and logp
+    vectors on 50 tables spanning Qc=2,3,8,16,32, including all-zero tables.
+    Computing MI after to_logp also exactly matched fit_expert's MI.
+  * A 16x16 direct mask with overlap=32 and a 128x128 sample reaches the
+    quilt_axis assertion instead of rejecting the relationship at its boundary.
+
+Fresh CLI probes with an isolated config directory established the config
+pre-scan errors in R03, acceptance of an invalid threshold under --explain,
+and rejection of the advertised --mask-cache flag.
+
+The full Python/shell image-quality suite was not run. No output-preservation
+claim is made for unimplemented refactors. Static findings are labeled as such
+where their failure path was not exercised. Probe sources and generated files
+are outside the repository under the temporary build directory.
+
+Detailed recommendations
+------------------------
+
+R01. Separate readable formatting from lossless serialization.
+     defaults.cpp:87-100,496-516; maskcache.cpp:100-125
+     Priority: high. Behavior fix with a small responsibility split.
+
+format() uses %.6g. That is reasonable for an explanation table, but value_of()
+also supplies the bytes hashed by key_for(). Distinct values therefore collapse
+before hashing: the sigma example above is a deterministic collision, not an
+unlikely hash collision. save_config() also uses short formatting for parameters
+and the stream's default precision for calibration entries. Persistence changes
+a measured temperature before the next build uses it.
+
+Keep the short display formatter. Add one explicit serialization path for
+identity/persistence, with round-trip double precision (max_digits10), a stable
+locale and unambiguous field boundaries/types. Use it in keys and saved numbers;
+the readable filename prefix may stay short. Do not solve this by making every
+--explain value seventeen digits long. Version changed cache encodings so old
+entries cannot accidentally be treated as new ones.
+
+Validation: close-but-distinct doubles produce different keys; saved values
+round-trip exactly; cold and warm calibration runs produce the same effective
+settings and masks. The current probes establish collisions and precision loss,
+not that the particular sigma pair changes a generated mask.
+
+R02. Build calibration identity from the actual calibration request.
+     markovcalib.cpp:223-285; generators.cpp:72-86; markov.cpp:813-880
+     Priority: high. Behavior fix; avoid another ad hoc list of inputs.
+
+calibration_key() hashes some registry values separately from the MarkovParams
+that calibrate_markov_temp() consumes. It omits seed, shortlist and reuse, even
+though the sampler or pair selection reads them. It hashes decoded bytes without
+dimensions, so the same pixel sequence arranged as 16x32 or 32x16 gets the same
+key despite different neighborhoods. There is no calibration-algorithm version.
+
+Resolve the calibration request once, then use the same request for its key and
+execution. Hash dimensions/type, pixels, seed, fitting/sampling settings and a
+calibration version. Preserve the intentional exclusion of final mask size where
+the transfer assumption holds. A fallback temperature returned when calibration
+cannot run should be distinguished from a successful measurement; do not cache
+it as a completed calibration without accounting for its inputs.
+
+This needs an explicit input contract, not reuse of the full-mask key unchanged:
+the two caches have different legitimate exclusions. A small shared byte-hash
+utility could remove the duplicate FNV loop, but input completeness is the real
+improvement. Preserve/version the existing hash convention if changing it.
+
+Validation: changing each consumed input invalidates calibration appropriately;
+reshaping identical bytes changes the key; an unchanged request reproduces the
+same result cold and warm. Seed/reuse/shape key omissions were reproduced;
+their end-to-end effect on calibrated temperatures was not measured here.
+
+R03. Replace the raw config-token search with an option-aware first pass.
+     dither.cpp:90-100; cli.cpp:123-254
+     Priority: high. Behavior fix and removal of conflicting parsing rules.
+
+The config pre-scan starts at argv[2], but parseOptions permits an option at
+argv[1]. With blue.rate=123 in an isolated default config:
+  dither --no-config --threshold mask --explain
+still reports measured rate 123; moving --no-config after --explain reports the
+fallback 3.4e6. The pre-scan also mistakes option values for flags: in
+  dither --explain --threshold mask --out --no-config
+it disables configuration even though parseOptions treats --no-config as the
+output path.
+
+Retain the useful load-before-parameter-resolution sequence. Share enough option
+arity information to identify real --config/--no-config tokens and skip values,
+then apply the parameter writes after loading. Alternatively, parse syntax into
+a small ordered list of assignments before applying them. Do not introduce a
+generic ArgCursor solely for style: that was rejected in the previous review.
+Specify precedence when both config flags occur; preserve it in both passes.
+
+Validation: flags at argv[1], with/without an input image, repeated config flags,
+missing values, and filenames that look like options. Keep all probe files in
+an isolated config directory.
+
+R04. Give numeric and paired arguments one strict parsing contract.
+     cli.cpp:38-61,138-159,173-189,212-250; defaults.cpp:18-36,210-217
+     Priority: high. Behavior fix that simplifies conversion paths.
+
+Integer flags parse as doubles and truncate, while Params::integer rounds
+doubles from --set. Two spellings of the same intent can therefore disagree.
+parse_size and parse_pixel accept successful prefixes through sscanf without
+checking that the whole string was consumed. The shared complete-number parsers
+already exist; use them instead of another permissive grammar.
+
+Split a pair at its required delimiter, parse both components completely and
+check bounds before narrowing. Use a dedicated integer argument reader for
+integer options. Decide explicitly whether integral spellings such as 2.0 are
+allowed, but reject fractional values consistently instead of silently choosing
+between truncation and rounding. Preserve the registry as the source of parameter
+ranges. Avoid the current artificial [-1e9,1e9] bounds where parsing alone is
+intended. Stop after need() fails so the same missing value does not also produce
+a format/range error.
+
+Validation: the reproduced cases above, integer limits, scientific notation,
+NaN/infinity and missing values across named flags and --set. This changes
+accepted input; it must be documented as a fix, not presented as neutral cleanup.
+
+R05. Validate threshold names once before either execution path.
+     cli.cpp:165-169,261-311; dither.cpp:164,176-184
+     Priority: medium. Behavior fix with simpler downstream assumptions.
+
+The parser validates generator and spacing names but not threshold names.
+--explain --threshold not-a-rule currently exits successfully, whereas an actual
+run reaches the later refusal. Normalize the legacy blue spelling and validate
+the threshold in one shared boundary step, including values supplied via --set.
+Keep the downstream defensive branch, but make it an invariant check rather
+than the primary user-input validator.
+
+Validation: round/random/mask, the legacy spelling, --set and invalid names have
+consistent outcomes with and without --explain.
+
+R06. Separate cache writing from eviction and make failures truly optional.
+     maskcache.cpp:50-82,154-225
+     Priority: high. Local refactor plus error-handling fixes.
+
+store() currently creates directories, encodes a PNG, writes metadata, renames,
+scans the directory and evicts entries. Extract two cohesive private operations:
+write_entry and trim_cache. Keep key construction separate. This makes error
+handling reviewable without introducing a cache framework.
+
+Specific issues revealed by reading the blocks (not fault-injected):
+  * cv::imwrite and cv::imread can throw, so returning false/empty is not their
+    only failure mode. Optional cache I/O should not abort a valid main output.
+  * A range-for over directory_iterator(dir, ec) still uses throwing iterator
+    increment. Use explicit increment(ec) if the contract is non-throwing.
+  * Eviction subtracts sz even when removing the PNG failed, and the following
+    metadata removal overwrites the error. Subtract only after confirmed removal.
+  * The stale-temp comment promises deletion, but .tmp entries are always skipped.
+    Either correct the claim or implement a policy that avoids deleting live
+    writers' files.
+  * hash_file returns true after read errors as well as EOF; reject incomplete
+    reads. build_identity overwrites file_size's error with last_write_time's;
+    check each result before using the metadata pair.
+
+Use a small temporary-file cleanup guard if it removes repeated cleanup paths;
+do not swallow failures from image generation itself. Validate with unwritable
+cache files, corrupt entries, concurrent deletion during eviction and a failed
+temporary write. Confirm the main output can still complete.
+
+R07. Give the config loader/writer explicit failure boundaries.
+     defaults.cpp:477-516; mask.cpp:248-258; markovcalib.cpp:280-284
+     Priority: medium. Behavior fix, not merely shorter I/O code.
+
+load_config says corrupt lines are ignored, but a parsed out-of-range registered
+number throws from set(). Unknown calibration entries accept non-finite doubles
+until their later use. save_config truncates the destination in place; it returns
+a status that both callers ignore, and its final check precedes stream closure.
+
+Keep the line parser simple. Define which invalid cached measurements can be
+skipped with a diagnostic, validate them at the read boundary, and distinguish
+them from fatal programmer errors. Write to a temporary file, check flush/close,
+then replace the old file. Return or report one deliberate best-effort outcome.
+Reuse an atomic-write idiom with R06 only if it remains small; PNG encoding and
+text serialization need not share a generic callback framework. Atomic replacement
+prevents partial files; it does not by itself merge concurrent writers' updates.
+
+Validation: malformed/out-of-range/non-finite lines, denied writes and interrupted
+replacement. R01 supplies the separate numeric precision requirement.
+
+R08. Reuse to_logp in fit_expert; the old uncertainty is now checkable.
+     markov.cpp:330-348,775-800
+     Priority: medium. Behavior-preserving refactor, subject to output checks.
+
+These blocks currently repeat the same three blur_axis calls and the same
+count-to-log-probability arithmetic. Unlike a blind deduplication, the present
+implementation was compared directly: all 50 probe tables matched exactly.
+to_logp leaves tbl smoothed, so MI can be calculated from it afterward without
+changing what it reads. A candidate body is:
+
+  Expert e;
+  e.d1 = d1;
+  e.d2 = d2;
+  to_logp(tbl, cells, Qc, Qv, e.logp);
+  e.mi = mutual_information(tbl, cells, Qv);
+  return e;
+
+This retires approximately fifteen duplicated lines. The earlier triages rejected
+this suggestion unless arithmetic identity was established; the current source
+and probe provide new evidence for reconsidering it. Keep the probability
+arithmetic unchanged. Validate full Markov masks, MI/report output and calibration
+before accepting it; table equivalence alone is not a whole-program regression
+test.
+
+R09. Remove redundant Markov parameters and forwarding layers.
+     markov.cpp:525-574,634-683,689-704,808-811,883-929;
+     generators.cpp:72-93,164-167; markovmodel.h:42
+     Priority: low. Small behavior-preserving cleanup.
+
+report_occupancy does not use radius; report_weights does not use weights.
+Remove those arguments and their call-site plumbing. gibbs_field accepts H, W
+and N even though N is always H*W; compute N locally. Keep Qv and Qc explicit:
+they represent different quantities.
+
+markov's exported prepare_sample forwards directly to
+maskutil::prepare_texture_sample. Its two production callers can use the latter
+directly and the extra declaration can go. Do not remove inpaint's same-named
+private helper: it also rank-flattens the sample.
+
+generators.cpp's markov_params_from_impl and its exported one-line wrapper can
+be one public definition, used by both build and calibration. The header already
+declares the public function, so this needs no new abstraction. Leave the
+explicit field assignments; they are a useful map between Params and the model.
+
+Validation: build with unused-parameter warnings, then compare the affected
+report and mask outputs. No numerical expression needs to change.
+
+R10. Compute the reference clumping profile once per calibration.
+     markovcalib.cpp:45-110,138-179
+     Priority: medium. Clearer data flow and removal of repeated work.
+
+clump_distance(a, ref) computes five level_set_low values for ref on every draw.
+The reference is unchanged across 24 draws, so this repeats 120 reference FFTs
+where five suffice. Represent the five density measurements as a small fixed-size
+profile; compute the reference profile before parallel_for_, and compare each
+probe profile with it. Keep the existing density order, validity checks and RMS
+formula. This also separates “measure a mask” from “compare measurements.”
+
+Validation: exact distances and selected temperatures for unchanged inputs,
+including invalid/zero profile entries and serial versus parallel execution.
+The repeated work is established by source inspection; speedup was not measured.
+
+R11. Keep a calibration score with its temperature and winning index.
+     markovcalib.cpp:181-214
+     Priority: low. Clarity improvement with edge-case behavior to define.
+
+ts and ds are parallel vectors; a second loop rediscovers the winner by floating
+point equality with best. Failed draws can remove temperatures, yet interpolation
+uses ts[1]-ts[0] as though the remaining points were equally spaced.
+
+Use a small ScoredTemperature record and retain the winning index during the
+existing ordered scan. Interpolate only if its neighboring temperatures have the
+expected spacing, or explicitly use unequal-spacing interpolation. Preserve the
+current first-winner tie rule and deterministic reduction order. Keep the raw
+score distinct from an interpolated temperature's unmeasured score in the log.
+
+Validation: interior and endpoint winners, equal minima, missing draws and a
+flat parabola. The missing-draw path was not induced in this review.
+
+R12. Give the direct mask one owned working field.
+     directmask.cpp:100-136,151-167
+     Priority: medium. Behavior-preserving copy/lifetime simplification.
+
+The ROI is cloned into tile; the zero-overlap branch clones the entire tile
+again; then field clones tile even though tile is not used afterward.
+Each quilt_axis call already returns its own result. Start with a read-only ROI
+view, quilt into owned outputs when overlap is nonzero, or clone once when it is
+zero. Quantise the resulting owned field directly. This makes the ownership
+boundary explicit and removes redundant image-sized copies without changing
+filtering, ranking, crop positions or cut order.
+
+The two sorts in tie_share and rank_order_random are a separate optimization
+candidate, not necessary for this cleanup. Do not change random tie-breaking
+merely to combine them. Validate zero/nonzero overlap, both axes, source
+immutability, identical masks and identical refusal messages.
+
+R13. Validate overlap against tile dimensions before quilt_axis.
+     directmask.cpp:75-113; maskutil.cpp:213-222;
+     generators.cpp:144-147; mask.cpp:94-111
+     Priority: high. Behavior fix with a clearer geometry contract.
+
+The builder bounds overlap by available sample room, but quilt_axis also requires
+keep > overlap. That relationship is not enforced by the independent parameter
+ranges. A 16x16 tile and overlap=32 reproduced the assertion even with enough
+sample pixels. The derived-size floor of 16 also cannot guarantee a tile fits
+an arbitrarily tiny sample or a sample limit consumed by overlap.
+
+Resolve a small geometry result before cropping: requested size, available size
+and effective overlap, or a precise failure. Define which derived quantities may
+shrink and which explicit requests must be refused. Share only the needed size
+calculation between the resolver and builder so they do not disagree. Keep the
+low-level assertion as a programmer invariant, not the normal user diagnostic.
+
+Validation: overlap=0, overlap=keep-1, overlap>=keep, small samples, rectangular
+tiles, scaling and pinned versus derived sizes.
+
+R14. Validate each inpaint level before allocating and querying it.
+     inpaint.cpp:61-76,157-168,246-266; maskutil.h:42
+     Priority: high. Static correctness finding and clearer phase ordering.
+
+The loop checks sample dimensions after downsample has already allocated and
+ranked the coarse image. It checks divisibility of the mask but not whether the
+coarse field supports wrap_near's one-period neighborhood lookup. For example,
+a 16x16 mask, five levels and radius 3 starts with a 1x1 field. For offset -3,
+wrap_near(-3,1) returns -2, so gather_queries can address outside that field.
+These individual settings fall within the registered ranges. This unsafe path
+was identified statically, not executed.
+
+Calculate and validate both the coarse sample dimensions and coarse field
+dimensions at the top of the level iteration. Either reject an incompatible
+neighborhood or deliberately support multiple wraps with wrap_any; decide based
+on the intended model, since repeated neighbors are not equivalent statistically.
+Perform this check before downsampling, database construction or the search.
+
+Validation: minimum-size masks at all supported levels/radii, samples that
+collapse below a usable size, and a sanitizer run of the rejected combinations.
+Normal valid configurations should remain byte-identical.
+
+R15. Do not construct a cache key when caching is disabled.
+     mask.cpp:277-305
+     Priority: low. Behavior-preserving removal of unnecessary work.
+
+obtain_mask always calls key_for, including with an empty cacheDir from
+--no-config. key_for reads sample contents and executable metadata and resolves
+registry values before load/store eventually do nothing. Gate key construction
+on a nonempty directory:
+
+  const auto key = cacheDir.empty() ? maskcache::Key{}
+                                   : maskcache::key_for(P, opt.maskSample);
+
+The existing invalid-key handling then suffices for load and store. Validate
+unchanged outputs with caching disabled and ordinary cache-hit behavior enabled;
+confirm the disabled path no longer reads the sample solely to hash it.
+
+R16. Construct one MaskRequest in build_with_method.
+     mask.cpp:216-240
+     Priority: low. Behavior-preserving local simplification.
+
+bare and q duplicate all request fields except the sample. Restrict the sample
+presence check and announcement to gen->needs_sample, then construct one request
+and call gen->build once. Supply an empty sample for non-sample generators if
+that remains the contract. This makes “validate/announce, then dispatch” explicit
+and avoids adding a second site whenever MaskRequest gains a field.
+
+Keep mask acquisition, rate recording and calibration routing separate: they
+already have distinct responsibilities. Compare announcements and all generator
+results; do not move calibration past the existing early-exit checks.
+
+R17. Reuse each registration block's applicability value.
+     bluenoise.cpp:162-207; spectralmask.cpp:200-248;
+     directmask.cpp:186-256; markov.cpp:946-1140
+     Priority: low. Small, optional readability improvement.
+
+inpaint already uses const auto mine = mask::generator("inpaint"). Apply that
+local pattern where other registration blocks repeat the same expression. Keep
+integer literals explicitly typed and keep derived lambdas next to their keys.
+Do not add the previously rejected family of add_const_i/add_const_d helpers,
+a range builder or another registration framework.
+
+Validation: unchanged registrations, applicability and --explain output. The
+benefit is a shorter block with more visible rules, not a different architecture.
+
+R18. Repair comments attached to obsolete code before adding more prose.
+     Multiple files; specific locations below.
+     Priority: medium for misleading contracts, low for orphaned commentary.
+
+Several earlier extractions left descriptions beside the wrong function or
+claims that now contradict the implementation. Clean these locally, keeping
+the measured rationale that prevents harmful “simplifications.”
+
+  engine.cpp:128-138: the mask comparison is 254, not 255.
+  engine.cpp:159-163,218-221: spatial scales the decision feedback; it does not
+    scale the residual deposit. The goal pass uses the chosen deposit function,
+    which can be spatial_none. The body already explains this correctly.
+  spectralmask.cpp:4-8: the fixed-point claim contradicts lines 234-244.
+  spectralmask.cpp:30: orphaned bin_freq description above smooth_power.
+  mask.cpp:24-35: obsolete “templated”/shared-work description above a
+    non-template mask_seconds wrapper.
+  mask.cpp:209-215: two acquisition/build descriptions stacked together.
+  directmask.cpp:210-245: the overlap rationale precedes the Quantise
+    registration; move it beside Overlap, retaining quantise's own explanation.
+  markov.cpp:89-112,183-190,262-269,520-524,803-805: orphaned or misattached
+    reuse, preparation, Expert, pair-pick, report and sampling comments.
+  markovcalib.cpp:128-132,218-221: model/default-rule headings with no such
+    block below them; remove or relocate.
+  dither.cpp:165-170; mask.cpp:310-312; markovcalib.cpp:253-256: calibration
+    cannot make this invocation's --explain show its new result because
+    --explain already returned. Describe the actual lifecycle.
+  generators.cpp:2,30,152-153: generator counts and “only failure” are stale;
+    direct also refuses excessive tie share.
+  cli.cpp:366-368,401-404,415-479: help misdescribes diffusion, advertises
+    unparsed --mask-cache, omits direct, promises ignored options where conflicts
+    are refused, and gives outdated temperature/default-size descriptions.
+
+Correct the current help directly; factual option coverage can be checked
+against the parser/table. Generating all explanatory prose is not required.
+The earlier reviews already discussed help generation, so this is evidence of
+remaining drift, not a newly discovered architectural cure.
+
+R19. Share test setup without sharing the expected answer.
+     unittest.cpp:913-1129
+     Priority: medium. Test clarity and coverage correction.
+
+cache_registry is useful, but each case repeats setting threshold, method and
+sample. Add a small configured_registry(method, sample) fixture and leave the
+case-specific mutations visible. The nested anonymous namespace at 913 is
+unnecessary because the whole section is already inside one.
+
+The “every parameter that applies” sweep actually fixes method=markov, so it
+never exercises blue, dft, inpaint or direct-specific keys. Its try-integer-first
+mutation also rounds real values and silently skips cases it cannot mutate.
+Iterate actual generators and use explicit, valid test perturbations with
+reported skips. Use fresh before/after registries so already-resolved dependency
+values do not conceal changes. Include close doubles to cover R01.
+
+The intermediate test deliberately covers blue only; state that limitation or
+extend it to other generators, particularly sample dimensions for direct. Avoid
+claiming full coverage from a minimum count of successful mutations.
+
+Validation: identify which generator/key failed, establish expected coverage,
+and prove a deliberately omitted consumed value is detected. Do not derive the
+expected key using the production serializer under test.
+
+R20. Make test assertions match the claims they print.
+     unittest.cpp:474-494,1090-1128,1238-1274
+     Priority: medium. Small test fixes with clearer scope.
+
+The reconstruction case computes worst and prints “exact,” but never asserts a
+bound on it. Moreover, s=u-p is manufactured in the test, so this is not an
+independent check of the decomposition. Keep the valuable mean-preservation
+assertion; narrow the title or add a clearly labeled numerical-roundoff bound,
+without pretending the subtraction proves the algorithm.
+
+The sample-content cache test compares an alternate key's name without checking
+that the key was valid. An unreadable alternate sample returns an empty name and
+can satisfy “different key” for the wrong reason. Store the alternate result,
+require ok, then compare. Keep missing-sample behavior in its own assertion.
+
+The direct test concludes “with and without rounding,” but the textured sample
+is only tested with rounding enabled; the disabled branch checks the flat sample
+only. Either narrow the conclusion or explicitly test the missing combination.
+
+Validation: make each intended failure fail the relevant case, rather than
+letting it pass through a missing fixture or an unasserted measurement.
+
+R21. Give the test runner a per-case exception boundary.
+     unittest.cpp:1418-1429
+     Priority: medium. Test infrastructure behavior improvement.
+
+c.run() can throw an OpenCV or parameter exception. Today that aborts the runner
+without a named failure or the remaining results. Catch std::exception around
+each case, mark that case failed with its message and continue. Keep signal/crash
+failures distinct; ordinary exception handling will not catch those.
+
+This is a short addition at the existing execution boundary, not a reason to
+replace the small CASE registry with a testing framework. Validate that an
+intentional throwing case names itself, later cases run, and the exit code fails.
+
+R22. Split the long compound test by invariant, not by implementation phase.
+     unittest.cpp:1131-1236; related titles/comments at 133,168,652-661
+     Priority: low. Test readability improvement.
+
+The 106-line quantise/tie_share/random-order case checks several independently
+useful properties and stops at the first failure. Separate quantise grid
+semantics, tie-share endpoints, randomized ranking/permutation/seed properties,
+and the manufactured-detail regression. A small synthetic-field fixture can
+share preparation; keep independent expectations and diagnostic names.
+
+Retain the explicit BudgetCase table: compressing it into a product of loops
+would obscure the deliberate combinations and might run unrequested cases.
+Fix stale test commentary: first pixel-code collision is asserted at 122, not
+“above 127”; the divisibility conclusion reverses its operands; and reflecting
+a ramp does not leave zero at the edges, as that very test later explains.
+
+Validation: preserve the existing invariant coverage and deterministic seeds;
+do not add tests that merely restate implementation expressions.
+
+R23. Simplify the scratch hello program only if it is retained.
+     hello.cpp:1-14 (untracked; not a CMake target)
+     Priority: low. Behavior-preserving local cleanup.
+
+Remove if (1) and combine the two adjacent literal writes. For example:
+
+  #include <cstdio>
+  int main() {
+      std::printf("hello worldhello");
+      for (int i = 0; i < 10; ++i) std::printf("%d", i);
+  }
+
+This preserves its exact output, including the absence of a newline. Adding a
+newline would be a separate choice. It has no bearing on the production tool;
+do not add it to the build or delete the user's scratch file as part of cleanup.
+
+R24. Bound reconciliation's trial count while multiplying it.
+     defaults.cpp:329-331
+     Priority: low. Defensive simplification of the existing limit.
+
+The product is accumulated before comparison with kMaxTrials. The current
+registry is small, but the intended cap does not prevent signed overflow if
+future candidate sets grow. Check the next factor against the remaining allowance
+before multiplication, or saturate to kMaxTrials+1. This expresses the actual
+question (“does the search fit?”) without computing an unneeded huge product.
+Keep exhaustive search, sorted candidate order and its existing tie-breaks.
+
+Validation: the current assignments and reporting stay unchanged, and an
+oversized synthetic candidate registry exits through the cap without overflow.
+
+R25. Make the generator log argument mean the same thing for every builder.
+     generators.cpp:25-42,89-94; markov.cpp:934-938;
+     markovcalib.cpp:257-272
+     Priority: low. API consistency with an observable logging change.
+
+MaskRequest carries an optional log, blue and inpaint honor it, but markov_build
+does not forward it and build_markov_mask hardcodes std::cerr. The comment that
+other rows treat null as quiet is therefore not a reliable contract. Likewise,
+calibrate_markov_for accepts log but writes some diagnostics to stderr directly.
+
+Choose a clear separation between progress/report output and errors, then thread
+the caller-owned stream only through the paths covered by that contract. Do not
+rewrite every fprintf mechanically or mix this with numerical changes. Keep the
+fit-report code with the fitter, as the earlier architectural decision requires.
+
+Validation: normal CLI messages remain available, null-log library calls have
+the documented behavior, and enabling reporting never changes generated bytes.
+
+Block-by-block coverage ledger
+------------------------------
+“Keep” means no worthwhile clarity/concision rewrite found after inspecting the
+block, not a proof of correctness. R references above describe proposed changes.
+Adjacent related blocks are grouped below to keep the ledger usable. Includes,
+file comments and declaration-only portions were also inspected; misleading
+commentary is covered by R18 rather than a cosmetic finding per blank line.
+
+bluenoise.cpp (207 lines)
+  21-39 Tap/makeSparseGaussian: keep explicit kernel construction and summation.
+  43-69 wrapped updates/Heap/pop_lowest_empty: keep lazy stale-entry semantics.
+  77-149 build: reviewed allocation, jitter, seed placement, heap initialization,
+    progress, selection and requeue loops; keep RNG and traversal order.
+  156-207 work/rules: keep work formula and derived radius; R17/R18.
+
+cli.cpp (494 lines)
+  20-35 write_image: keep friendly diagnostic followed by the OpenCV detail.
+  38-61 paired/budget parsers: R04; keep the simple seconds/minutes conversion.
+  64-81 report_reconciliation: keep the local structured-binding/separator edit.
+  83-121 Options cache/conflict reporting: keep explicit assignments and grammar.
+  123-254 parseOptions: inspected every flag arm, need/need_num/set_param lambda,
+    --set conversion and generator lookup; R03-R05. Keep the visible if-chain.
+  257-312 reconciliation/spatial/default/validation tail: R05; keep user choices
+    authoritative and generator-specific validation at its existing boundary.
+  314-484 brief/full usage: R18, including parser/help mismatch checks.
+  486-494 config_path: keep filesystem joins and environment fallback order.
+
+defaults.cpp (519 lines)
+  18-48 complete-number parsers/origin_name: keep direct forms; R04/R07 callers.
+  52-98 as_number/not_a_number/StackFrame/trim/format: keep helpers and RAII;
+    R01 separates serialization without introducing a variant visitor.
+  100-158 value_of/intermediate/Resolver forwarders/add_const/add/check_range/
+    set/known: R01; retain explicit Value types and one range-check mechanism.
+  160-261 resolve/numeric/string/applicability/cache/origin accessors: keep
+    dependency recording, cycle checks and purposeful named accessors; R04
+    requires a deliberate integer-conversion contract rather than incidental casts.
+  263-402 stranded/forget_unpinned/movable_defaults/apply_trial/reconcile/
+    applicability_inputs/conflicts: keep exhaustive search and named phases; R24.
+  404-475 explain/keys_ending: keep straight-line rendering and sorted traversal.
+  477-516 load/save: R01/R07.
+
+directmask.cpp (256 lines)
+  64-85 tie limit/preparation/size refusal: keep measured guard and explanation;
+    R13 adds relational geometry validation.
+  87-120 overlap/crop/two cuts: R12/R13; preserve column-before-row order.
+  122-168 quantise/tie-share refusal/ranking: R12; keep quantitative refusal.
+  170-184 work: keep the explicit sort-plus-cut cost expression.
+  186-256 registrations: R17/R18; keep overlap and quantise as distinct quantities.
+
+dither.cpp (198 lines)
+  22-36 prepare_target: keep explicit conversion and resize; changing the
+    interpolation domain would be an algorithm change, not a concise rewrite.
+  38-53 report_debug_pixel: keep target-sized check and measured diagnostic.
+  55-78 encoding/downsampling/output paths: keep simple loops and filesystem paths.
+  80-100 entry/setup/config: R03; retain registration and early usage behavior.
+  103-121 summary: already one contiguous job; no extraction solely for length.
+  123-159 RNG/input/sample preparation: keep native-depth input and one decoded
+    sample for the builders. Do not move calibration sample reads casually.
+  160-184 budget note/explain/calibration/threshold dispatch: R05/R18.
+  186-198 ladder/dither/output handoff: keep short pipeline.
+
+engine.cpp (296 lines)
+  11-46 RNG/no-op/Floyd-Steinberg: keep; the last-row denominator distinction is
+    intentional and was twice defended in earlier reviews.
+  48-59 for_serpentine: keep explicit traversal helper.
+  61-157 Space and every conversion/interval method: keep different linear and
+    display-domain searches, extrapolation and snapping; R18 for commentary.
+  159-206 quantize_scan: keep decide/account separate and retain sink callback.
+  208-294 ditherPass: reviewed goal pass, conversion, temporal ledger, frame loop
+    and debug sink; keep arithmetic together and double ledgers. R18.
+
+generators.cpp (221 lines)
+  20-69 blue/dft/markov work and build adapters: keep explicit scalar mappings;
+    R25 for log propagation.
+  72-93 MarkovParams/build: R09.
+  98-130 inpaint work/build and markov_validate: keep readable field assignments.
+  134-159 direct work/sample limit/build: R13/R18.
+  164-195 exported wrapper/table: R09; keep table rows and optional hooks.
+  197-221 generator_list/reconcile_candidates/find_generator: keep small loops;
+    replacing them with ranges or maps would add machinery without useful savings.
+
+hello.cpp (14 lines)
+  1-14 entry/literal writes/constant branch/counting loop: R23.
+
+inpaint.cpp (321 lines)
+  44-77 sample preparation/downsample: keep rank flattening and handwritten block
+    means; INTER_AREA previously changed 99.6% of output pixels.
+  81-143 PatchDatabase constructor/accessors/nearest/storage: keep ownership of
+    PCA/projected data/index and per-query parallel outputs. Do not remove clones
+    just because they look redundant without checking the FLANN storage contract.
+  147-186 offsets/gather/start_field: keep short helpers; R14 for caller bounds.
+  188-216 sweep_level: keep group vector and in-place ordering; prior rejection
+    of a strided rewrite still applies.
+  219-229 inpaint_work: keep formula and operation order; no claimed speedup.
+  234-275 build/levels: R14; existing phases are otherwise cohesive.
+  277-321 registrations: keep; this is the simple local pattern R17 recommends.
+
+main.cpp (17 lines)
+  9-17 process entry/exception boundary: keep. It already does exactly one job.
+
+markov.cpp (1,140 lines)
+  70-107 constants/rank_bins: keep rank-based bin arithmetic and explicit types.
+  113-181 mutual_information/tally/blur_axis: keep count layout, sampling bounds,
+    summation order and smoothing. Do not replace reductions indiscriminately.
+  191-258 symmetry/Neighbourhood/shortlist_offsets: keep deterministic orbit and
+    distance-band selection; the round-robin is meaningful, not incidental nesting.
+  260-328 Cand/best_unused_candidate/add_symmetry_orbit/pick_pairs: keep cohesive
+    helpers. Their repeated arguments do not yet justify a mutable search class.
+  330-437 to_logp/pooled_logloss/fit_weights_ml: R08 for duplication with fit_expert;
+    keep distinct accumulator loops with different precision and purposes.
+  440-518 highpass_field/PairSelection/select_pairs: keep zero-copy matrix view,
+    shortlist/reverse maps, candidate scoring and two-stage quota selection.
+  520-684 report_occupancy/holdout/weights/fit: R09/R18; keep diagnostics near
+    fitting data. Do not extract them into a module needing more public internals.
+  686-754 gibbs_field: R09 removes N; retain shuffles, draws, softmax and ranking
+    order. A shared generic expert accumulator remains unwarranted.
+  760-800 append_occupancy/fit_expert: keep occupancy before smoothing; R08.
+  808-881 preparation/model fitting: R09; keep radius adjustment, quantization,
+    selection, fit and model assembly visible.
+  883-944 sample/build/work: R09/R25; keep per-call weights off the shared model.
+  946-1140 every constant and Reuse/Iters/Shortlist/Pairs/Temp rule: R17/R18;
+    keep measured formulas and their dependency reads. Concision is not grounds
+    to retune defaults or change the budget allocation order.
+
+markovcalib.cpp (286 lines)
+  45-126 constants/level_set_low/clump_distance/reference_mask: R10; retain the
+    deliberately different metric from Python's radial-ring averaging.
+  135-179 calibration guards/model/probe tasks: R02/R10; keep per-task copies,
+    seed mapping and deterministic indexed writes.
+  181-215 averaging/winner/interpolation/report: R11.
+  223-251 calibration_key: R02.
+  253-286 override guard/read/cache hit/measure/save: R01/R02/R07/R25; retain
+    explicit user-temperature precedence before reading its sample.
+
+mask.cpp (322 lines)
+  19-112 budget reference/mask_seconds/mask_side: keep policy arithmetic; R13/R18.
+  114-207 all geometry/input/threshold/method/seed rules: keep the registry-driven
+    applicability and explicit intermediates; avoid another policy lookup table.
+  216-241 build_with_method: R16.
+  243-259 record_build_rate: keep post-build timing, never calibrate from a hit;
+    R07 for handling persistence status.
+  261-306 obtain_mask: keep load/build separation and dimension check; R15.
+  310-322 maybe_calibrate: keep tiny hook router; R18 fixes lifecycle comment.
+
+maskcache.cpp (228 lines)
+  20-39 cap/Fnv: keep tiny utility; sharing with calibration is optional under R02.
+  41-90 build_identity/tame/hash_file/hex: R06 for I/O results; no formatting rewrite.
+  94-152 dir_for/key_for: R01; keep readable prefixes separate from true identity.
+  154-170 load/touch/log: R06; dimensions are checked by obtain_mask afterward.
+  172-225 store/rename/metadata/enumeration/eviction: R06.
+
+maskutil.cpp (284 lines)
+  13-78 rank_order/quantise/tie_share/rank_order_random: keep sign-aware rounding,
+    stable ordering and position-based random keys. No generic rank framework.
+  80-108 unit/signed projection/threshold_mask: keep short, distinct formulas.
+  110-157 boundary_jump/periodic_component: keep corner accumulation and DC case.
+  159-211 mincut_path: reviewed initialization, all-start recurrence, tie policy,
+    endpoint selection and backtracking; keep explicit indices and comparisons.
+  213-246 quilt_axis: keep transpose-based reuse, two-candidate cost and no-mixing
+    splice; R13 concerns the caller's precondition handling.
+  248-284 toroidal high-pass/texture preparation: keep distinct padding/border
+    semantics. Do not revive the previously rejected unified blur helper.
+
+spectralmask.cpp (248 lines)
+  30-65 smooth_power: keep sample/mask ratio and frequency-grid smoothing; R18.
+  67-140 sample_amplitude/wrapped/sample_amplitude_at/amplitude_grid: keep
+    disabled-highpass mean removal, explicit bilinear order and Nyquist guard.
+  142-188 impose_amplitude/build: keep scratch buffers outside the iteration,
+    Gaussian draw order and alternating projections; R18 fixes fixed-point claim.
+  194-248 work/rules: keep work expression and measured iteration count; R17/R18.
+
+srgb.cpp (202 lines)
+  11-25 to_gray: keep explicit channel/depth paths and content-independent scaling.
+  27-65 table construction/cache/decode_into: keep typed loop and cached tables.
+    First use initializes both curves for that depth; per-curve laziness is an
+    optional performance question, not a compelling concision rewrite.
+  67-87 encode_gray8/decode_gray: keep small row/type dispatch.
+  89-137 make_levels/to_display: keep three explicit spacing cases and search.
+  139-170 decode_display/encode_levels/downsample_gray/average_gray: keep domain
+    boundaries visible; do not trade parallel forEach for cosmetic loop uniformity.
+  172-200 three-channel conversions: keep diagnostic-only implementation; earlier
+    rejection of pointer-loop modernization still applies.
+
+srgbtest.cpp (95 lines)
+  13-33 print_ramp_samples: keep fixed probe coordinates; they are the example.
+  35-69 column mixes/mid-grey: keep explicit calculations and output columns.
+  73-95 main/read/dimension guards: keep. No reason to convert this diagnostic
+    into assertions or rename it without a separate product decision.
+
+temporaldither.cpp (101 lines)
+  7-24 bitmax/strategy/three threshold functions: keep demo-local logic.
+  26-71 dither: reviewed accumulator and average-display branches and reporting;
+    do not split or modernize merely for style, as previously rejected.
+  73-101 main/arguments/seed/strategy dispatch: keep for this cleanup review.
+    atoi and unchecked bit shifts still limit input robustness; accepting
+    arbitrary inputs safely would be a separate hardening task if the demo is
+    promoted to supported use, not a claim that current validation is complete.
+
+unittest.cpp (1,431 lines)
+  35-54 Case/registry/macros/results: keep small registration mechanism; R21 runner.
+  61-169 four ladder cases: keep separate invariants and explicit sweeps; R22 text.
+  176-227 depth-preservation and decode agreement cases: keep.
+  229-290 shallow_ramp16/precision-benefit case: keep independent image comparison.
+  296-363 threshold-byte/rank-order/wrapping cases: keep explicit expectations.
+  375-472 periodic_field/cross_ratio/cross-removal/harmonicity: keep independent
+    criteria and checks that the fixtures actually expose a defect.
+  474-494 reconstruction/mean case: R20.
+  505-590 frequency bins and rank-range cases: keep even/odd and signed/unit cases.
+  592-649 threshold-mask firing case: keep histogram endpoint distinction.
+  652-723 texture preparation case: keep comparative border check; R22 text.
+  725-788 toroidal filter case: keep independent frequency-domain reference.
+  790-833 mincut case: keep planted optimum, structural and degenerate checks.
+  835-903 quilting case and ratio helper: keep per-pixel no-mixing oracle and
+    transpose/zero-overlap checks.
+  913-975 registry fixture/derived-size case: R19; expand tiny geometry under R13.
+  977-1031 parameter-key sweep: R19.
+  1033-1088 intermediate-key case: R19.
+  1090-1129 rates/content/unreadable-file case: R20.
+  1131-1236 quantise/ties/random-rank case and correlation lambda: R22; keep
+    stable ranking as a control and the independent correlation measurement.
+  1238-1275 direct refusal/acceptance case: R20.
+  1286-1357 flat_mask/BudgetCase/budget_holds: keep independent budget check and
+    distinguish the deterministic equality from stochastic one-level tolerance.
+  1361-1416 main/fixtures/budget registration: keep explicit scenario table; R22.
+  1418-1431 execution/summary/exit: R21.
+
+Implementation and verification boundaries
+------------------------------------------
+Use separate patches for mechanical refactors and behavioral fixes. For a small
+cleanup, rebuild the affected targets and run the relevant existing checks;
+compare hashes/messages where a change touches numerical or stochastic paths.
+Do not re-baseline differing masks as part of a supposed no-op refactor.
+
+For fixes, add focused regressions for the actual failure (precision, argument
+parsing, invalid geometry or cache I/O). Run the full image suite once a proposed
+algorithm-adjacent change is ready, with its isolated cache configuration. Avoid
+adding tests for trivial wrappers or literal scratch-program edits. Preserve
+the deliberate prior decisions about arithmetic, diagnostics, Options caching
+and generator independence.

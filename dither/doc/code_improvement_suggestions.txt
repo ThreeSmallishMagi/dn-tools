@@ -1,0 +1,736 @@
+Code Improvement Report
+=======================
+
+Scope
+-----
+
+Reviewed the tracked project `.cpp` files:
+
+  bluenoise.cpp
+  defaults.cpp
+  dither.cpp
+  inpaint.cpp
+  markov.cpp
+  spectralmask.cpp
+  srgb.cpp
+  srgbtest.cpp
+  temporaldither.cpp
+
+Excluded untracked scratch files such as `dither0.cpp`.
+
+This report is about making the implementation cleaner and more concise while
+preserving behavior. I would not shorten the empirical/design comments
+wholesale; many of them explain non-obvious measured tradeoffs. The better
+cleanup is to extract repeated mechanics into helpers so the long comments have
+less code to surround.
+
+Priority key:
+
+  P1: correctness or real maintenance risk
+  P2: worthwhile cleanup with clear readability/duplication payoff
+  P3: optional polish
+
+
+Cross-cutting improvements
+--------------------------
+
+P1 - Cache `inpaint.rate` when measuring build speed.
+
+  File: dither.cpp:1094, dither.cpp:1202
+
+  `register_inpaint_params()` defines `inpaint.rate`, and `obtain_mask()` can
+  measure inpaint work, but `save_config()` is called with only
+  `blue.rate`, `dft.rate`, and `markov.rate`. Add `inpaint.rate` to the saved
+  keys, preferably through one shared constant list.
+
+P2 - Add a small shared mask utility module.
+
+  Repeated operations appear in four generators:
+
+    rank/order values:
+      spectralmask.cpp:125
+      markov.cpp:96
+      markov.cpp:814
+      inpaint.cpp:41
+
+    map rank order to a 0..254 threshold mask:
+      bluenoise.cpp:125
+      spectralmask.cpp:171
+      markov.cpp:979
+      inpaint.cpp:200
+
+    high-pass and sample scaling:
+      spectralmask.cpp:56
+      markov.cpp:113
+      inpaint.cpp:55
+
+    wrap helpers:
+      bluenoise.cpp:36
+      spectralmask.cpp:79
+      markov.cpp:428
+      inpaint.cpp:93
+
+  A `maskutil.h/.cpp` with `wrap_index`, `rank_order`, `rank_uniform`,
+  `order_to_threshold_mask`, and `prepare_texture_sample` would remove real
+  duplication and make generator code shorter without hiding algorithms.
+
+P2 - Centralize generator work/rate calculation.
+
+  Files: dither.cpp:34, dither.cpp:1076
+
+  `mask_seconds()` and the post-build timing block both encode the same
+  generator-specific work formulas. Extract `mask_work(method, size, P, pairs)`
+  or a small `GeneratorSpec` table. That also prevents omissions like the missing
+  `inpaint.rate` cache key.
+
+P2 - Use small helpers for constant parameter rules.
+
+  Files:
+    bluenoise.cpp:149
+    spectralmask.cpp:191
+    markov.cpp:1068
+    inpaint.cpp:211
+    dither.cpp:99
+
+  The repeated `P.add({ key, [](Resolver&) { return constant; }, applies, range,
+  doc })` blocks are noisy. A local helper such as `add_const(P, key, value,
+  applies, range, doc)` would make the rules easier to scan and leave derived
+  rules visually prominent.
+
+
+bluenoise.cpp
+-------------
+
+P2 - `makeSparseGaussian()` can be a little clearer.
+
+  File: bluenoise.cpp:21
+
+  The function is fine, but the body mixes kernel generation, normalization, and
+  numeric fallback. Split the normalization into a helper or at least use clearer
+  local names:
+
+    radius instead of R
+    kernel instead of taps
+    normalize_kernel(kernel)
+
+  If this stays here, `taps.reserve((2 * R + 1) * (2 * R + 1))` is a cheap
+  clarity/performance win.
+
+P2 - `build_blue_noise_mask()` would benefit from two extracted helpers.
+
+  File: bluenoise.cpp:49
+
+  The algorithm is readable, but the heap loop is doing several jobs:
+
+    initialize jitter
+    seed first pixel
+    initialize heap
+    pop the best non-stale empty pixel
+    update affected neighbours
+    convert ranks to threshold bytes
+
+  `fill_jitter()`, `pop_current_empty()`, and shared
+  `order_or_rank_to_threshold_mask()` would shorten the function and make the
+  core progressive placement stand out.
+
+P3 - Make progress output optional or caller-owned.
+
+  File: bluenoise.cpp:95
+
+  `build_blue_noise_mask()` writes progress to `std::cerr` unconditionally.
+  Passing an optional `std::ostream*` or a boolean would make library-style use
+  cleaner and avoid hardwired output from a generator.
+
+P3 - Clean up namespace-key consistency.
+
+  File: bluenoise.cpp:149
+
+  The function starts using fully-qualified key names, then switches to
+  `using namespace bluenoise::keys`, then still fully qualifies some names. Pick
+  one style within the function.
+
+
+defaults.cpp
+------------
+
+P2 - Use a visitor or helper for `format()`.
+
+  File: defaults.cpp:32
+
+  `format()` is already short, but `std::visit` with overloads would remove the
+  chain of `get_if` calls and make adding another `Value` alternative harder to
+  forget.
+
+P2 - Factor numeric extraction from `check_range()`, `num()`, and `integer()`.
+
+  Files: defaults.cpp:56, defaults.cpp:138, defaults.cpp:146
+
+  The code has three small versions of "is this numeric, and as which type?".
+  A helper returning `std::optional<double>` for range checks, plus a separate
+  typed accessor path for `integer()`, would reduce duplication and error
+  message drift.
+
+P2 - Simplify `set()` with direct slot lookup.
+
+  File: defaults.cpp:74
+
+  This can be shorter as:
+
+    Slot& slot = slots_[std::string(key)];
+    slot.v = ...
+
+  The current find/emplace form is correct, but not buying much.
+
+P2 - Add a stack/probe guard for `resolve()` and `applicability_inputs()`.
+
+  Files: defaults.cpp:90, defaults.cpp:300
+
+  Both functions push onto `stack_` and must pop on every exit path. `resolve()`
+  has a manual try/catch just to pop. A small local RAII guard would make this
+  shorter and safer, and the applicability probe could erase its sentinel in the
+  same pattern.
+
+P2 - Split `reconcile()` into named steps.
+
+  File: defaults.cpp:230
+
+  The logic is good but dense. Clear extraction points:
+
+    movable_defaults()
+    trial_count(movable)
+    apply_trial(movable, pick)
+    count_stranded_after_trial()
+    rescued_between(before, after)
+
+  That would make the mixed-radix search much easier to audit without changing
+  behavior.
+
+P2 - Move `trim` and numeric config parsing out of the loop.
+
+  File: defaults.cpp:393
+
+  `trim` is recreated inside every `load_config()` line iteration. Make it a
+  private file-scope helper. A `parse_complete_double()` helper could also be
+  reused by CLI parsing in `dither.cpp`.
+
+P3 - Split `explain()` rendering from data collection.
+
+  File: defaults.cpp:330
+
+  `explain()` currently collects keys, separates live/idle, computes column
+  widths, prints the table, prints idle keys, then prints docs. That is a lot of
+  presentation logic in one block. Small helpers would make future format
+  changes less risky.
+
+
+dither.cpp
+----------
+
+P1 - Include `inpaint.rate` in saved cache keys.
+
+  Files: dither.cpp:1094, dither.cpp:1202
+
+  Define something like:
+
+    constexpr std::array kRateKeys = {"blue.rate", "dft.rate", "markov.rate", "inpaint.rate"};
+
+  and use it for every `save_config()` call.
+
+P2 - Replace `mask_seconds()` nested ternary with a shared `mask_work()` helper.
+
+  File: dither.cpp:34
+
+  The ternary expression is compact but hard to extend. A plain helper with
+  ordered `if` blocks is longer by a few lines but cleaner. Reuse it in the rate
+  measurement block.
+
+P2 - Split `parseOptions()` into parsing, reconciliation, and validation.
+
+  File: dither.cpp:540
+
+  The function is doing too much:
+
+    argument cursor helpers
+    every option handler
+    budget parsing
+    `--set` parsing
+    reconciliation reporting
+    default spatial policy
+    enum/string validation
+    conflict reporting
+    copying resolved params into `Options`
+
+  Keep the visible option `if` chain if desired; it is acceptable for a CLI of
+  this size. The high-payoff extractions are `parse_budget()`,
+  `parse_key_value()`, `parse_mask_size()`, `report_reconciliation()`,
+  `resolve_options_from_params()`, and `validate_options()`.
+
+P2 - Group `Options` into nested structs.
+
+  File: dither.cpp:499
+
+  `Options` now mixes input/output, color/levels, temporal/spatial, mask build,
+  and diagnostics. Grouping as `OutputOptions`, `MaskOptions`, and
+  `DebugOptions` would shrink call signatures and make `parseOptions()` less
+  visually flat.
+
+P2 - Extract helpers from `ditherPass()`.
+
+  File: dither.cpp:440
+
+  The math is subtle and should stay documented, but the function would read
+  better as:
+
+    make_temporal_goals()
+    convert_goals_to_conserved_units()
+    render_one_frame()
+
+  That preserves the explanation while making the control flow shorter.
+
+P2 - Share a `find_ladder_interval()` helper in `Space`.
+
+  File: dither.cpp:304
+
+  `to_conserved()` and `to_display()` both locate a level interval and then
+  interpolate. Extracting the interval lookup would reduce boundary logic in the
+  two conversion functions.
+
+P2 - Extract generator dispatch from `obtain_mask()`.
+
+  File: dither.cpp:993
+
+  `obtain_mask()` combines loading a mask, reading a sample, printing build
+  messages, constructing generator params, dispatching four generators, handling
+  inpaint-specific failure messages, timing, rate calculation, and cache writes.
+  Good split points:
+
+    load_mask()
+    read_sample()
+    build_mask_for_method()
+    inpaint_params_from(P, opt)
+    measure_and_cache_rate()
+
+P2 - Extract the Markov calibration block from `run()`.
+
+  File: dither.cpp:1172
+
+  The fixed `P.user_set(markov::keys::Temp)` behavior is good. The block is now
+  long enough to deserve `maybe_calibrate_markov_temp(opt, P, cfg)`, especially
+  because it reads the sample independently of `obtain_mask()`.
+
+P2 - Avoid reading the Markov sample twice during calibrated runs.
+
+  Files: dither.cpp:1187, dither.cpp:1022
+
+  A calibrated Markov run reads `opt.maskSample` once for calibration and again
+  for the actual build. Passing a prepared sample through the generator path, or
+  letting `obtain_mask()` own calibration after it has read the sample, would be
+  both cleaner and cheaper.
+
+P2 - Make run setup helpers explicit.
+
+  File: dither.cpp:1100
+
+  `run()` would be easier to scan with:
+
+    register_all_params(P)
+    scan_config_path(argc, argv)
+    print_run_summary(opt)
+    make_dither_fn(opt, P, image, cfg)
+    prepare_target(image, ladder, opt)
+    encode_and_downsample_frames(frames, ladder, opt)
+    write_saved_frames(frames, opt.outPath)
+
+P3 - Keep CLI help in sync with supported methods.
+
+  File: dither.cpp:878
+
+  The help text says `--mask-method <m>` is `blue, dft or markov`, but the
+  program also accepts `inpaint`. This is documentation, not implementation, but
+  keeping help generated from method constants would avoid this drift.
+
+P3 - `config_path()` can use `std::filesystem::path` joins.
+
+  File: dither.cpp:932
+
+  Current string concatenation is fine. `std::filesystem::path(base) /
+  "dither/cache.conf"` would be cleaner and less path-separator-specific.
+
+P3 - `write_image()` might include the OpenCV exception text.
+
+  File: dither.cpp:528
+
+  The function intentionally hides OpenCV exceptions. If debugging bad output
+  extensions matters, printing `e.what()` after the friendly path message would
+  preserve friendliness while reducing diagnosis time.
+
+
+inpaint.cpp
+-----------
+
+P2 - Reuse shared rank/high-pass helpers.
+
+  Files: inpaint.cpp:41, inpaint.cpp:55
+
+  `rank_flat()` and `prepare_sample()` duplicate Markov/spectral machinery. Move
+  the common behavior out so the inpaint file only contains the inpaint-specific
+  database/search algorithm.
+
+P2 - Replace manual block averaging with `cv::resize(..., INTER_AREA)`.
+
+  File: inpaint.cpp:75
+
+  `downsample()` manually averages `f x f` blocks, then rank-flattens. OpenCV's
+  area resize expresses the same operation more directly for this use and cuts
+  four nested loops down to one call plus `rank_flat(out, order)`.
+
+P2 - Split `build_inpaint_mask()` into phases.
+
+  File: inpaint.cpp:109
+
+  The function has a clear sequence but is too much in one block:
+
+    make_ring_offsets(radius)
+    sample_database(src, ring, p.db, rng)
+    build_pca_index(feat, dims)
+    init_or_upscale_field()
+    fill_query_batch()
+    run_inpaint_sweeps()
+    threshold_mask_from_order()
+
+  These helpers would also make the coarse-to-fine loop easier to test.
+
+P2 - Encapsulate FLANN/PCA state for each level.
+
+  File: inpaint.cpp:149
+
+  PCA projection, cloned projected matrix, FLANN index, and centre vector are one
+  conceptual database. A small `PatchDatabase` struct with `query()` would hide
+  the `q.clone()` and matrix bookkeeping from the sweep loop.
+
+P3 - Make invalid-size failures reportable inside the builder.
+
+  File: inpaint.cpp:132
+
+  `build_inpaint_mask()` silently returns `{}` for both sample-too-small and
+  mask-size-not-divisible; `dither.cpp` reconstructs a generic explanation. Since
+  the builder already accepts `log`, it could log the exact failing level before
+  returning empty.
+
+P3 - Use the constant-rule helper in `register_inpaint_params()`.
+
+  File: inpaint.cpp:211
+
+  Most of the register function is repeated constant-rule boilerplate. A helper
+  would make the two interesting comments stand out.
+
+
+markov.cpp
+----------
+
+P2 - Reuse shared rank/high-pass/wrap helpers.
+
+  Files: markov.cpp:96, markov.cpp:113, markov.cpp:428, markov.cpp:814
+
+  Markov has local versions of ranking, high-pass sample preparation, wrapping,
+  and rank-to-mask conversion. Moving common mechanics out would substantially
+  shorten this file.
+
+P2 - Use `to_logp()` inside `fit_markov_model()`.
+
+  Files: markov.cpp:323, markov.cpp:903
+
+  `to_logp()` already implements the blur/prior/log-probability recipe, but
+  `fit_markov_model()` repeats the same steps manually. Reuse the helper and, if
+  needed, compute `e.mi` from the smoothed table before calling it.
+
+P2 - Split expert accumulation into one helper.
+
+  Files: markov.cpp:344, markov.cpp:375, markov.cpp:650
+
+  `pooled_logloss()`, `fit_weights_ml()`, and `gibbs_field()` all do the same
+  conceptual operation: read neighbour bins, add weighted expert log-probs, and
+  softmax or score. A helper such as `accumulate_expert_logits(...)` would remove
+  duplicated indexing code and reduce the chance of one path drifting.
+
+P2 - Return a selection result struct from `select_pairs()`.
+
+  File: markov.cpp:449
+
+  `select_pairs()` returns pairs and also writes `shortlistUsed` through an out
+  pointer. Return:
+
+    struct PairSelection { vector<pair<Offset, Offset>> pairs; size_t shortlist_used; };
+
+  This is clearer and scales if more diagnostics are added.
+
+P2 - Break down `pick_pairs()`.
+
+  File: markov.cpp:284
+
+  This is one of the densest blocks in the project. Extract:
+
+    candidate_score()
+    best_unused_candidate()
+    add_symmetry_orbit()
+
+  That would make the greedy policy easier to review separately from the
+  shortlist/index bookkeeping.
+
+P2 - Split `report_fit()` into three report sections.
+
+  File: markov.cpp:509
+
+  The output already has three natural sections:
+
+    occupancy/data sufficiency
+    held-out overfitting check
+    fitted-vs-flat weights check
+
+  Separate helpers would reduce the 130-line block and make it easier to update
+  one diagnostic without risking the others. Also fix the over-indented
+  `centres` declaration at markov.cpp:513.
+
+P2 - Make `sample_markov_mask()` const with local weights.
+
+  File: markov.cpp:936
+
+  The function mutates `m.experts` just to set weights for the current
+  temperature/weighting mode. During calibration this is repeated many times.
+  Returning or building a local weighted view would make the model immutable
+  after fitting, which is easier to reason about.
+
+P2 - Suppress or route per-probe calibration logging.
+
+  Files: markov.cpp:966, markov.cpp:1027
+
+  `sample_markov_mask()` always writes the pair/bin/sample-step line to
+  `std::cerr`, so calibration emits it repeatedly for internal probe masks. Make
+  logging caller-controlled.
+
+P2 - Consider `std::unique_ptr` or `std::optional` for `fit_markov_model()`.
+
+  File: markov.cpp:838
+
+  The fitted model has no shared ownership. Returning `std::optional<MarkovModel>`
+  or `std::unique_ptr<MarkovModel>` would communicate ownership more accurately
+  than `std::shared_ptr`.
+
+P3 - `mutual_information()` can precompute row marginals.
+
+  File: markov.cpp:136
+
+  It currently recomputes `pb` inside the outer loop after computing `pv`.
+  Computing both marginals in one pass would be slightly shorter and avoids
+  repeated summing.
+
+P3 - `reference_mask()` should use the shared threshold conversion helper.
+
+  File: markov.cpp:806
+
+  This is currently another local copy of "stable rank then map to 0..254".
+  Sharing it also keeps calibration aligned with the generators.
+
+P3 - The default registration block is mostly data.
+
+  File: markov.cpp:1068
+
+  As with the other generators, constant-rule boilerplate obscures the derived
+  rules for `Shortlist`, `Pairs`, and `Temp`. A helper would improve scanability.
+
+
+spectralmask.cpp
+----------------
+
+P2 - Reuse shared frequency, high-pass, wrap, and rank helpers.
+
+  Files: spectralmask.cpp:30, spectralmask.cpp:56, spectralmask.cpp:79,
+  spectralmask.cpp:125
+
+  These are not spectral-specific concepts anymore; Markov calibration and other
+  generators use the same pieces. Centralizing them would shorten this file and
+  make tests cover one implementation.
+
+P2 - Extract bilinear amplitude sampling.
+
+  File: spectralmask.cpp:87
+
+  `amplitude_grid()` mixes frequency remapping, out-of-band suppression, bilinear
+  interpolation, and DC handling. A helper like
+  `sample_amplitude_at(sample_amp, fy, fx)` would make the nested loop much
+  easier to read.
+
+P2 - Extract amplitude projection in `build_spectral_mask()`.
+
+  File: spectralmask.cpp:137
+
+  The loop body does:
+
+    field -> DFT
+    replace magnitude
+    inverse DFT
+    rank projection
+
+  Moving "replace magnitude while preserving phase" into `impose_amplitude()`
+  would make the alternating-projection algorithm read directly.
+
+P2 - Use the shared threshold conversion helper.
+
+  File: spectralmask.cpp:171
+
+  Same duplicated rank-order-to-0..254 conversion as the other generators.
+
+P3 - `smooth_power()` could state padded blur as a helper.
+
+  File: spectralmask.cpp:40
+
+  This pattern also appears in Markov's field high-pass. A shared
+  `blur_toroidal()` helper would make the border policy explicit in one place.
+
+
+srgb.cpp
+--------
+
+P2 - Add decode/encode transform helpers for grayscale mats.
+
+  Files: srgb.cpp:23, srgb.cpp:79, srgb.cpp:94
+
+  `decode_gray()`, `downsample_gray()`, and `average_gray()` all loop over
+  grayscale pixels, decode to linear, then sometimes encode back. Helpers like
+  `decode_gray8_to_linear()` and `encode_linear_to_gray()` would remove repeated
+  `forEach` bodies.
+
+P2 - Prefer pointer loops or LUTs over `forEach()` plus `at()`.
+
+  Files: srgb.cpp:26, srgb.cpp:82, srgb.cpp:97, srgb.cpp:103
+
+  `forEach()` already gives each pixel, but the lambdas then use `out.at(pos)`.
+  Pointer row loops would be clearer and avoid repeated bounds/index lookup. For
+  8-bit decode, a 256-entry float LUT is even simpler and faster.
+
+P2 - Share encode/decode helpers in `downsample_gray()` and `average_gray()`.
+
+  Files: srgb.cpp:79, srgb.cpp:94
+
+  These functions should read as:
+
+    auto lin = decode_gray(img, srgb)
+    resize/accumulate in linear
+    return encode_linear_gray(lin, srgb)
+
+  That is exactly the domain rule and avoids repeating pixel conversion code.
+
+P3 - Generalize or rename the 3-channel converters.
+
+  Files: srgb.cpp:109, srgb.cpp:121
+
+  `srgb_to_linear(const cv::Mat&)` and `linear_to_srgb(const cv::Mat&)` assume
+  3-channel data. That is fine for `srgbtest`, but the names sound generic.
+  Either assert the channel shape or rename them to make the assumption explicit.
+
+P3 - `make_levels()` can reserve vector capacity.
+
+  File: srgb.cpp:32
+
+  `out.lin.reserve(levels)` and `out.px.reserve(levels)` avoids reallocations and
+  signals the fixed size.
+
+
+srgbtest.cpp
+------------
+
+P2 - Decide whether this is a diagnostic or a test.
+
+  File: srgbtest.cpp:8
+
+  The program prints useful tables but does not assert much. If it is a test,
+  add explicit checks and non-zero failures. If it is a diagnostic, rename the
+  target/file accordingly and let it accept an optional image path.
+
+P2 - Remove unused `argc`/`argv` or use them.
+
+  File: srgbtest.cpp:8
+
+  The parameters are currently unused. Either declare `int main()` or use
+  `argv[1]` as the ramp path.
+
+P2 - Extract small print helpers.
+
+  Files: srgbtest.cpp:14, srgbtest.cpp:34, srgbtest.cpp:56
+
+  The three output sections can become:
+
+    print_ramp_samples(image, linear)
+    print_column_mixes(linear)
+    print_mid_gray()
+
+  That would make the intent clearer than a sequence of local calculations in
+  `main()`.
+
+P3 - Avoid `using namespace cv` in this file.
+
+  File: srgbtest.cpp:6
+
+  The rest of the project mostly qualifies OpenCV types. Matching that style
+  would reduce namespace ambiguity.
+
+
+temporaldither.cpp
+------------------
+
+P2 - Modernize the small demo-style program.
+
+  Files: temporaldither.cpp:2, temporaldither.cpp:7, temporaldither.cpp:10
+
+  This file uses C headers, a macro, a C enum, `atoi`, and `rand`. Cleaner C++17:
+
+    constexpr unsigned bitmax(unsigned depth)
+    enum class DitherStrategy
+    std::from_chars` or checked `std::strtoul`
+    std::mt19937` plus `std::uniform_real_distribution`
+
+P2 - Split the two dithering demonstrations.
+
+  File: temporaldither.cpp:32
+
+  `dither()` prints both an accumulator method and an average-display method in
+  one loop. A small `Row` struct plus helpers to update each method would make
+  the table-generation code easier to read.
+
+P2 - Add switch default/error handling.
+
+  File: temporaldither.cpp:87
+
+  Invalid strategy values currently do nothing after printing the header. Add a
+  default case that prints usage and returns non-zero.
+
+P3 - Make frame count an argument or constant.
+
+  File: temporaldither.cpp:88
+
+  `40` is repeated in every switch arm. A named constant or optional CLI argument
+  would make the demo easier to adjust.
+
+
+Recommended cleanup order
+-------------------------
+
+1. Fix the P1 issues 
+
+2. Add shared mask utilities for ranking, threshold conversion, wrapping, and
+   sample high-pass/scaling. This removes the largest amount of duplicated code
+   across `spectralmask.cpp`, `markov.cpp`, and `inpaint.cpp`.
+
+3. Refactor `dither.cpp` around generator dispatch and CLI parsing. That file is
+   the main coordination point, and smaller helpers would make future generator
+   additions less error-prone.
+
+4. Split the longest algorithm/report blocks:
+
+     markov.cpp: `pick_pairs()`, `report_fit()`, `sample_markov_mask()`
+     inpaint.cpp: `build_inpaint_mask()`
+     spectralmask.cpp: `amplitude_grid()` and the projection loop
+
+5. Clean up the diagnostic executables (`srgbtest.cpp`, `temporaldither.cpp`) if
+   they are meant to stay in the build. If they are only experiments, consider
+   moving them under `tools/` or `experiments/`.

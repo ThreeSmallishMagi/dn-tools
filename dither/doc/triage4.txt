@@ -1,0 +1,118 @@
+Triage of doc/improvements4.txt. One line per finding, keyed by its label.
+Status is Accepted / Rejected / Ask / Done.
+
+(The review itself arrived as improvements4.txt, which is the name the previous
+three rounds used for *this* file. The review is left untouched and the triage
+is here instead; the numbering still matches.)
+
+This round is the best evidenced of the four. Every reproduction quoted below
+was re-run here before the finding was accepted, and all of them held. Nineteen
+of twenty are accepted, which is not a statement about the standard applied --
+it is that the reviewer reproduced through the real entry points rather than
+reasoning from the source.
+
+Most of what it finds is mine, from the last two weeks: the calibration caches,
+the sample library, maketexture, and the ridging metric are all work from this
+interval. Several findings are defects in fixes I made earlier in the same
+interval, which is the shape to expect when a feature lands fast.
+
+F01:Done: Markov calibration cache hits overwrite pinned settings. Confirmed by
+reading the hit branch: it calls P.set on Weights and Radius whenever the cached
+entries exist, with no reference to weightsPinned/radiusPinned, and the key does
+not record which axes were free. P1 and fixed first.
+F02:Done: inpaint calibration key omits inpaint.cap. Confirmed -- calibration_key
+mixes radius, db, dims, checks, groups, scales, scale, highpass and seed, and cap
+is absent although sweep_level reads it and it changes every probe mask.
+F03:Done: calibration caches survive incompatible algorithm changes. The same
+root as F01/F02 seen from the version side; the answer is one semantic version
+per calibration, bumped whenever the objective, the search or the synthesis
+changes, plus refusing a partial result.
+F04:Done: an invalid cached calibration stops the run. P.set throws on a value
+outside the registered range and the hit branches do not validate, so a corrupt
+cache entry aborts a run that the cache is documented as unable to affect.
+F05:Done: dft calibration has an invalid frequency domain and wrong scale units.
+Confirmed: lowCut is 1/highpass, so --mask-highpass 2 gives lo == hi == 0.5,
+log(hi/lo) is zero, and the NaN reaches a cast to int. The scale point is
+separate and also right -- the cutoff stays in sample pixels while everything it
+is compared against is in mask pixels.
+F06:Done: the calibration ridging score measures global orientation. calib's
+ridge_profile accumulates the structure tensor over the whole field before
+taking coherence, where patchfit takes it per block and then aggregates. I wrote
+that comparison into the header; it is wrong and the fixture in the finding
+shows how wrong. The cap's whole-field measure is a different quantity and is
+deliberately staying global.
+F07:Done: one broken symlink hides later scans. images_in reuses one error_code
+across entries, so the first failure poisons every later test.
+F08:Done: stacking raw scans manufactures structure at exposure boundaries. The
+reproduction is decisive and the limitation is one I stated myself -- my seam
+measurement used two crops of one film at one exposure, which is exactly the
+case where no tone step exists. Fixing the reproduced defect does not need the
+whole boundary-preserving design; see the note under Architecture.
+F09:Done: the multi-file mask hash does not encode file boundaries. Count plus
+concatenated bytes cannot separate [A, B+C] from [A+B, C]. An encoding
+ambiguity, not a collision-probability argument, and it is the wrong-hit class
+the cache exists to prevent.
+F10:Done: maketexture accepts malformed numeric arguments. atof and strtoull
+without checked consumption.
+F11:Done: maketexture's generic options disagree with dither's. --mask-highpass
+is overwritten by the separate --highpass default, switches are not recognised
+as switches, and markov_validate never runs.
+F12:Done: maketexture aborts on ordinary user errors. No process-level exception
+boundary, and cv::imwrite is called directly rather than through write_image.
+F13:Done: maketexture geometry parsing wraps oversized integers. sscanf %d is
+not a checked conversion, and the frontend reaches generator code that computes
+areas in int.
+F14:Done: pasting a smaller texture restores tone from the wrong coordinates.
+F15:Done: InpaintParams{} still means 6 sweeps and 128 checks where the registry
+says 3 and 64. Mine, from the parameter-study commit. MarkovParams has the same
+shape and is older; both get one definition.
+F16:Done: the integer tolerance admits user fractions. The tolerance is relative,
+so at 1e9 it permits a deviation of 1 and any fraction passes -- and the comment
+beside it claims the opposite. Pre-existing, and the repair that introduced the
+comment is incomplete rather than regressive.
+F17:Done: a pinned Markov temperature reports a search that never happens. The
+message I wrote promises to choose the weighting and then returns.
+F18:Done: completion offers invalid choices and omits valid ones. Several
+separate defects; the "source aliases does this for you" line is simply false.
+F19:Done: install helpers mask failures and can report success as failure.
+F20:Done: foreach removes literal -- arguments. Reproduced here exactly as
+written. Graham's function rather than mine, but it is a one-line fix and
+leaving a known token-eating bug in a helper that builds command lines is worse
+than touching someone else's code.
+
+All twenty are implemented, in seven commits. Two further fixes the review
+pointed at but did not isolate:
+
+  maketexture accepted --mask-in and --mask-calibrate and silently ignored both.
+  F11 names that shape ("accepted without performing the requested operation")
+  but the finding's fix is about generator applicability, which does not cover
+  it. The tool now takes only a generator's parameters plus mask.scale and
+  mask.highpass, and --list-options answers from the same predicate.
+
+  The whole-number error message printed its value through format(), which is
+  %.6g, so the F16 case reported "seed is used as a whole number, but is 1e+09"
+  -- a number that looks whole, in the message saying it is not.
+
+Block-level and architecture
+----------------------------
+The block-by-block section is largely sound and is being taken as a worklist
+rather than triaged line by line. Three items from it are being done with the
+findings because they are the same defect: the kProbe comment that says 128
+where the constant is 256, the help text that says two generators can calibrate
+when three can, and computing field coherence on levels where the cap cannot
+fire.
+
+Architecture 1 (typed CalibrationRequest/Result) is the right shape and is what
+F01-F04 are each a symptom of; it is being done in the narrow form those four
+need rather than as a framework.
+
+Architecture 3 (resolve samples once, preserve boundaries) is accepted as the
+direction but not done whole. The reproduced defect in F08 is a tone step at the
+join, and matching each scan's mean before stacking removes it -- which turns
+the varying-exposure case into the equal-exposure case that was measured safe.
+Per-scan preprocessing and pooled spectra are better and are a larger change
+than this round should carry.
+
+Architecture 5 is a standing instruction now, not a recommendation: long score
+narratives are moving out of the comments, which several of these findings would
+have been easier to see without.

@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""The properties every mask generator has to have, whatever it looks like.
+
+  masktest [dither-binary]
+
+CLAUDE.md states four, and only the first was checked anywhere:
+
+  usable     flat value histogram, endpoints spanning 0..254. maskstats says so.
+  toroidal   the mask tiles, because MaskDither indexes it modulo its size. A
+             seam would show as a grid over any image larger than the mask.
+  any shape  --mask-size takes WxH and nothing forced W == H. Every size used in
+             the suite was square, which is where a row/column transposition
+             hides.
+  reloadable --mask-out then --mask-in reproduces the run byte for byte. The
+             builders each seed their own rng and none touches the global one,
+             which is what makes that true; it is easy to break by accident and
+             nothing noticed.
+  oriented   a mask built from a sample lights the sample's bright grain first,
+             so the dither shows the grain as it is rather than its negative.
+             Every sample-based mask was inverted until this was checked, and
+             no other check could see it: the scoring tools rank the sample the
+             same way the generators did, so the inversion cancelled.
+
+Orientation is measured on a sample built to make it visible -- a flat patch
+whose dark values come from horizontally smeared noise and whose bright values
+from vertically smeared noise -- and on the *dithered image*, not the mask, so
+the renderer's half of the convention is held as well as the generators'. A
+flat 10% grey must come out as vertical white streaks, the sample's bright
+grain, and a flat 90% grey as horizontal dark ones, its dark grain; inverted,
+they swap. One criterion for every generator that takes a sample, `direct` at
+its defaults included, and no film needed. dft is not tested: it randomises phase,
+so its field is symmetric and has no orientation to get wrong.
+
+Toroidality needs care to measure, and two attempts did not work. Comparing the
+wrapping pair against the spread of adjacent pairs sounds right and has no
+teeth. Scoring where the wrapping pair falls between two references -- the
+adjacent pairs and the same columns permuted -- has teeth but almost no power:
+it compares *means*, so a 96x48 mask gives it 48 samples, and across seeds a
+sound markov mask scored anywhere from -0.37 to +0.53 while a deliberately
+broken blue mask scored 0.46. It passed on the luck of one seed.
+
+What works is a rank-sum: take the per-row absolute differences across the
+wrapping column pair, and ask whether they look like a draw from the pooled
+per-row differences of every interior pair. That uses all H*(W-1) interior
+samples instead of their mean, and the statistic is |z| of the Mann-Whitney U --
+near 0 when the mask joins, large when it does not. It needs no assumption about
+the sign of the correlation, which matters because blue noise's adjacent columns
+are *less* alike than unrelated ones while every other generator's are more.
+
+Every run re-scores a deliberately broken copy and requires it to fail, because
+a toroidality test that cannot see a seam is worse than none. That check is
+skipped for blue noise alone, and the reason is not a fudge: breaking the join
+of a blue-noise mask is genuinely almost undetectable from local statistics,
+because blue noise has next to no column-to-column correlation to break. That is
+the same property that makes a seam in it invisible, which is why blue tiles
+well in the first place. The check is kept where toroidality can actually fail
+visibly, and honest about having no power where it cannot.
+"""
+import concurrent.futures, os, subprocess, sys, tempfile
+import cv2
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.abspath(sys.argv[1] if len(sys.argv) > 1
+                         else os.path.join(ROOT, 'build', 'dither'))
+IMAGE  = os.path.join(ROOT, 'examples', 'm039crop.png')
+# The tracked copy. Older comments here and in test/patchfit call this sample
+# 4Xcrop, which was an untracked file at the repository root holding byte for
+# byte the same image -- so every measurement quoted against that name still
+# stands. Naming the tracked one is what lets the suite run from a clean clone.
+SAMPLE = os.path.join(ROOT, 'examples', 'Kodak-4X-1.png')
+
+# Generator name -> the options that select it.
+GENERATORS = {
+    'blue':    [],
+    'dft':     ['--mask-method', 'dft',     '--mask-sample', SAMPLE],
+    # Held at the old, more coupled temperature. The default of 0.50 makes a
+    # finer grain, adjacent columns correlating 0.42 against 0.66, and on so
+    # little texture a deliberately broken row join scores 0.85: the self-check
+    # below loses its power, as it has none for blue. The field is toroidal by
+    # construction at any temperature, which is the property under test.
+    'markov':  ['--mask-method', 'markov',  '--mask-sample', SAMPLE,
+                '--markov-temp', '0.25'],
+    # A small database keeps this within a second; the property under test does
+    # not depend on how good the match is.
+    'inpaint': ['--mask-method', 'inpaint', '--mask-sample', SAMPLE,
+                '--set', 'inpaint.db=20000'],
+    'direct':  ['--mask-method', 'direct',  '--mask-sample', SAMPLE],
+}
+# Square and deliberately not. Both are large enough for the join test below to
+# see a seam: at 64x64 it cannot, because a single column pair over 64 rows is
+# too noisy an estimate, and the self-check says so rather than passing quietly.
+# 96x48 was the non-square size and is too small for the seam test: at 48 rows
+# the statistic cannot separate a sound mask from a broken one for any
+# generator. 160x96 is the smallest non-square shape where all four separate.
+SIZES = ['128x128', '160x96']
+SEAM = 3.0                       # |z| of the rank sum; ~0 joins, large does not
+# Blue noise is exempt from the broken-copy self-check only -- see above.
+NO_SELFCHECK = {'blue'}
+
+# `direct` used to be exempt from the absolute line, and is not any more.
+#
+# The other four synthesise a field and can make it periodic by construction.
+# `direct` cuts its tile out of a real photograph, whose left edge has never met
+# its right, so it has to make a join that was never there. Under Moisan's
+# periodic + smooth decomposition it could not quite: that repair leaves the
+# join slightly *smoother* than the interior, and on film whose grain
+# decorrelates faster vertically than horizontally (adjacent rows of the sample
+# differ by 41, adjacent columns by 30, and the trend with separation is smooth,
+# so this is real texture rather than scanner row noise) the two axes could not
+# both land on the line at once. It was therefore held to improving on its own
+# uncorrected tile by 1.5x, measured at 1.7x to 2.3x.
+#
+# The minimum error boundary cut that replaced it lands both axes comfortably:
+# 0.31/0.86 and 0.09/0.50 against a line of 3.0, and 12.5x and 17.9x better than
+# uncorrected. So the exemption is gone and `direct` is held to exactly what the
+# other four are -- including the broken-copy self-check below, which it has
+# never faced before, and which has real teeth here: a tile of film grain has
+# strong column-to-column structure, so destroying its join is loudly visible in
+# a way it is not for blue noise.
+
+
+def build(gen, size, work, extra=(), tag=''):
+    """Build one mask; returns (mask, dithered output path) or (None, None)."""
+    mask = os.path.join(work, f'{gen}_{size}{tag}.png')
+    out  = os.path.join(work, f'{gen}_{size}{tag}_d.png')
+    args = [DITHER, IMAGE, '--threshold', 'mask'] + GENERATORS[gen] + [
+            '--mask-size', size, '--no-config', '--mask-out', mask, '--out', out] + list(extra)
+    if subprocess.run(args, capture_output=True).returncode != 0:
+        return None, None
+    return cv2.imread(mask, cv2.IMREAD_GRAYSCALE), out
+
+
+def joins(a, _rng=None):
+    """|z| of a rank sum: do the wrapping column pair's per-row differences look
+       like a draw from every interior pair's? ~0 if the mask joins."""
+    a = a.astype(float)
+    inter = np.concatenate([np.abs(a[:, i] - a[:, i + 1])
+                            for i in range(a.shape[1] - 1)])
+    wrap = np.abs(a[:, -1] - a[:, 0])
+    n1, n2 = len(wrap), len(inter)
+    both = np.concatenate([wrap, inter])
+    order = both.argsort(kind='stable')
+    rank = np.empty(len(both))
+    rank[order] = np.arange(1, len(both) + 1)
+    # average the ranks over ties, which a 255-value mask has plenty of
+    _, inv, cnt = np.unique(both, return_inverse=True, return_counts=True)
+    rank = (np.bincount(inv, weights=rank) / cnt)[inv]
+    U = rank[:n1].sum() - n1 * (n1 + 1) / 2.0
+    return abs((U - n1 * n2 / 2.0) /
+               np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12.0))
+
+
+def break_wrap(a, rng):
+    """The same mask with its first column shuffled: every local statistic
+       survives and only the join is destroyed."""
+    b = a.copy()
+    b[:, 0] = rng.permutation(a[:, 0])
+    return b
+
+
+def streaks(on):
+    """log10 of a level set's power across rows over its power across columns:
+    positive for horizontal streaks, negative for vertical, 0 for neither."""
+    f = on.astype(np.float64) - on.mean()
+    P = np.abs(np.fft.fft2(f)) ** 2
+    fy = np.abs(np.fft.fftfreq(on.shape[0]))[:, None]
+    fx = np.abs(np.fft.fftfreq(on.shape[1]))[None, :]
+    band = (np.hypot(fy, fx) > 0.01) & (np.hypot(fy, fx) < 0.2)
+    return np.log10(P[band & (fy > fx)].sum() / P[band & (fx > fy)].sum())
+
+
+def oriented(work):
+    """The fifth property; returns the number of generators that fail it."""
+    rng = np.random.default_rng(11)
+    def smear(sx, sy):
+        f = cv2.GaussianBlur(rng.normal(0, 1, (1024, 1024)), (0, 0),
+                             sigmaX=sx, sigmaY=sy, borderType=cv2.BORDER_REFLECT)
+        return f / f.std()
+    s = np.minimum(smear(6, 1.2), 0) + np.maximum(smear(1.2, 6), 0)
+    sample = os.path.join(work, 'streaks.png')
+    cv2.imwrite(sample, np.clip(128 + 40 * s, 0, 255).astype(np.uint8))
+
+    # Flat tones whose *linear* value is 10% and 90%, so that is the share lit.
+    tones = {}
+    for share in (0.1, 0.9):
+        v = 1.055 * share ** (1 / 2.4) - 0.055
+        tones[share] = os.path.join(work, f'flat{int(share * 100)}.png')
+        cv2.imwrite(tones[share], np.full((256, 256), round(255 * v), np.uint8))
+
+    fails = 0
+    for gen, extra in (('direct', []), ('markov', []),
+                       ('inpaint', ['--set', 'inpaint.db=60000'])):
+        mask = os.path.join(work, f'orient_{gen}.png')
+        shown = {}
+        for share, image in tones.items():
+            out = os.path.join(work, f'orient_{gen}_{int(share * 100)}.png')
+            # Built once, then loaded: the second tone goes through --mask-in.
+            how = (['--mask-method', gen, '--mask-sample', sample, '--mask-size', '256x256',
+                    '--mask-out', mask] + extra) if share == 0.1 else ['--mask-in', mask]
+            subprocess.run([DITHER, image, '--no-config', '--threshold', 'mask',
+                            '--spatial', '0', '--out', out] + how, capture_output=True)
+            shown[share] = cv2.imread(out, cv2.IMREAD_GRAYSCALE)
+        if any(v is None for v in shown.values()):
+            first, last = 1.0, -1.0
+        else:
+            first, last = streaks(shown[0.1] > 127), streaks(shown[0.9] < 128)
+        ok = first < 0 < last
+        fails += not ok
+        print(f"{gen:<9} oriented: white at 10% {first:+.2f} (vertical, like the "
+              f"bright grain), black at 90% {last:+.2f} (horizontal, like the dark)  "
+              f"{'PASS' if ok else 'FAIL'}")
+    return fails
+
+
+def main():
+    for path in (DITHER, IMAGE, SAMPLE):
+        if not os.path.exists(path):
+            sys.exit(f"not found: {path}")
+    print(f"dither={DITHER}\n")
+    print(f"{'generator':<9} {'size':>7} {'shape':>8} {'flat/ends':>10} "
+          f"{'joins: cols':>12} {'rows':>7} {'reloads':>9}  result")
+    fails = 0
+    with tempfile.TemporaryDirectory(prefix='masktest.') as work:
+        # Ten independent builds, each with --no-config so it is a real build
+        # rather than a cache hit -- which is the point of this check and is
+        # also why it is the slowest part of it. They share nothing but the
+        # sample, so they run at once; `build` already takes its own directory.
+        combos = [(gen, size) for gen in GENERATORS for size in SIZES]
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(16, os.cpu_count() or 4)) as pool:
+            built = dict(zip(combos, pool.map(
+                lambda c: build(c[0], c[1], work), combos)))
+        for gen, size in combos:
+                mask, out = built[(gen, size)]
+                if mask is None:
+                    print(f"{gen:<9} {size:>7}  BUILD FAILED")
+                    fails += 1
+                    continue
+                w, h = (int(v) for v in size.split('x'))
+                shape_ok = mask.shape == (h, w)
+
+                stats = subprocess.run([os.path.join(HERE, 'maskstats'),
+                                        os.path.join(work, f'{gen}_{size}.png')],
+                                       capture_output=True, text=True).stdout
+                usable = 'usable as a threshold mask' in stats
+
+                rng = np.random.default_rng(0)
+                zc, zr = joins(mask), joins(mask.T)
+                note = ''
+                toroidal = zc < SEAM and zr < SEAM
+                # And the detector has to be able to fail: a copy with the join
+                # destroyed must score the other side of the line. Blue noise is
+                # the documented exception.
+                if gen not in NO_SELFCHECK:
+                    toroidal = toroidal and (joins(break_wrap(mask, rng)) > SEAM and
+                                             joins(break_wrap(mask.T, rng)) > SEAM)
+
+                # Loading the mask back must reproduce the same dither. The
+                # per-frame offsets come from the global rng, which no builder
+                # touches, so building and loading have to agree exactly.
+                again = os.path.join(work, f'{gen}_{size}_r.png')
+                subprocess.run([DITHER, IMAGE, '--mask-in',
+                                os.path.join(work, f'{gen}_{size}.png'),
+                                '--no-config', '--out', again], capture_output=True)
+                reloads = (os.path.exists(again) and
+                           open(out, 'rb').read() == open(again, 'rb').read())
+
+                ok = shape_ok and usable and toroidal and reloads
+                fails += not ok
+                print(f"{gen:<9} {size:>7} {'ok' if shape_ok else 'WRONG':>8} "
+                      f"{'ok' if usable else 'NO':>10} {zc:12.2f} {zr:7.2f} "
+                      f"{'ok' if reloads else 'NO':>9}  {'PASS' if ok else 'FAIL'}"
+                      f"{'  ' + note if note else ''}")
+
+        print()
+        fails += oriented(work)
+
+    print(f"\n{'OVERALL PASS' if not fails else f'OVERALL FAIL ({fails})'}"
+          f"   every generator's seam must score |z| < {SEAM}, and a broken copy"
+          f" of it over — except {'/'.join(NO_SELFCHECK)}, whose join is"
+          f" genuinely undetectable from local statistics, which is the same"
+          f" property that makes it tile well")
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == '__main__':
+    main()

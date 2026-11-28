@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Do the things a person actually does with this program work, from a fresh install?
+
+Every other check here asks a question about one mechanism, and most of them
+pin `--mask-size` or pass `--no-config` to keep that question cheap and exact.
+That is right for them and is also how a default can break with every check
+passing: the one test that would have caught `--mask-sample` dropping the
+tone was the one that ran with the defaults, and it was commented out.
+
+So this runs the commands from the README as a user would type them -- no
+size pinned, the sample library installed by `install_samples` into an empty
+config, the cache left on -- and asks of each the question the user would:
+did it finish, is the file the size I asked for, does it hold the tones I
+asked for, and is it the same picture on average as the one I gave it.
+
+The films are the shipped ones. Ilford-Delta3200 is one scan, which keeps the
+three generators that pool every scan of a film to seconds rather than the
+minute Kodak-TriX's three take; the default film is Kodak-4X, whatever that
+costs, because that is what a run with no sample gets.
+"""
+import concurrent.futures
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+import cv2
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DITHER = os.path.join(ROOT, 'build', 'dither')
+IMG = os.path.join(ROOT, 'examples', 'm039crop.png')
+FILM = 'Ilford-Delta3200'
+
+fails = []
+VERBOSE = '-v' in sys.argv[1:]
+
+
+def check(name, ok, detail=''):
+    if ok:
+        print(f"  ok   {name}" + (f": {detail}" if VERBOSE and detail else ''))
+    else:
+        fails.append(name)
+        print(f"  FAIL {name}" + (f": {detail}" if detail else ''))
+
+
+def linear_mean(path):
+    im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    v = im.astype(np.float64) / 255.0
+    lin = np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+    return float(lin.mean()), im
+
+
+def main():
+    if not os.path.exists(DITHER):
+        print("workflowcheck: build/dither is missing; run `build` first")
+        return 1
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, XDG_CONFIG_HOME=tmp)
+        out = lambda name: os.path.join(tmp, name)
+
+        def run(args, timeout=600):
+            t = time.time()
+            r = subprocess.run([DITHER] + args, capture_output=True, text=True,
+                               env=env, timeout=timeout)
+            return r, time.time() - t
+
+        # --- install, the way the README says to
+        # Sourced for its functions only: its last line activates the venv
+        # through an alias, which a non-interactive shell does not expand, so
+        # its status says nothing about install_samples.
+        # Without the calibration it ends with, which is fifteen minutes for
+        # the shipped films; one film's dft calibration stands in for it below.
+        r = subprocess.run(['bash', '-c',
+                            'source ./aliases >/dev/null 2>&1; install_samples --no-calibrate'],
+                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+        check("install_samples into an empty config", r.returncode == 0,
+              (r.stderr or r.stdout).strip()[-300:])
+        films = subprocess.run([DITHER, '--list-samples'], capture_output=True, text=True,
+                               env=env).stdout.split()
+        shipped = sorted({l.split('\t')[0] for l in open(os.path.join(ROOT, 'examples', 'films.tsv'))
+                          if l.strip() and not l.startswith('#')})
+        check("every shipped film is offered", films == shipped, f"{films} against {shipped}")
+        crops = os.path.join(tmp, 'dither', 'crops')
+        check("every shipped film has a crop for direct",
+              all(os.path.exists(os.path.join(crops, f + '.png')) for f in shipped))
+
+        want, src = linear_mean(IMG)
+        H, W = src.shape
+
+        # Each workflow: a name, the arguments, the size the output should be,
+        # how many grey levels it may hold, and how far its mean may sit from
+        # the input's, in linear light. Two levels supersampled 4x average 16
+        # pixels, so 17 tones, and 2x over a 2048 grid averages 4, so 5. Every
+        # flow measured within 0.0006 of the input when this was written, so
+        # 0.002 is a margin of three.
+        TOL = 0.002
+        flows = [
+            ("a plain dither",                      [], (W, H), 2, TOL),
+            ("blue noise",                          ['--threshold', 'mask'], (W, H), 2, TOL),
+            ("4 levels",                            ['--levels', '4'], (W, H), 4, TOL),
+        ] + [
+            (f"{m} grain from {FILM}, supersampled", ['--mask-method', m, '--mask-sample', FILM,
+                                                      '--supersample', '4'], (W, H), 17, TOL)
+            for m in ('dft', 'markov', 'inpaint', 'direct')
+        ] + [
+            ("direct with no sample takes the default film",
+             ['--mask-method', 'direct', '--supersample', '4'], (W, H), 17, TOL),
+            ("--out-size fits the result in a square",
+             ['--mask-sample', FILM, '--mask-method', 'direct', '--supersample', '4',
+              '--out-size', '1024'], (1024, 1024), 5, TOL),
+            ("supersampled without reducing",
+             ['--supersample', '2', '--out-size', str(2 * max(W, H))], (2 * W, 2 * H), 2, TOL),
+        ]
+
+        def flow(f):
+            name, args, size, levels, tol = f
+            path = out(name.replace(' ', '_').replace('/', '_') + '.png')
+            r, secs = run([IMG] + args + ['--out', path])
+            if r.returncode != 0 or not os.path.exists(path):
+                return name, False, f"exit {r.returncode}: {r.stderr.strip()[-200:]}", r
+            got, im = linear_mean(path)
+            tones = len(np.unique(im))
+            ok = (im.shape[1], im.shape[0]) == size and tones <= levels and abs(got - want) <= tol
+            return name, ok, (f"{im.shape[1]}x{im.shape[0]} against {size[0]}x{size[1]}, "
+                              f"{tones} tones, mean {got:.4f} against {want:.4f}, "
+                              f"{secs:.0f} s"), r
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(flow, flows))
+        for name, ok, detail, r in results:
+            check(name, ok, detail)
+        said = {name: r.stderr for name, _, _, r in results}
+        check("the default film is named, so the run says what it used",
+              'mask.sample=Kodak-4X' in said["direct with no sample takes the default film"])
+
+        # --- the cache: the second identical run is served, and is the same picture
+        args = [IMG, '--mask-method', 'markov', '--mask-sample', FILM, '--supersample', '4']
+        r1, _ = run(args + ['--out', out('again.png')])
+        same = (r1.returncode == 0 and
+                open(out('again.png'), 'rb').read() ==
+                open(out(f"markov_grain_from_{FILM},_supersampled.png"), 'rb').read())
+        check("a repeat run is served from the mask cache",
+              'Reusing cached' in r1.stderr, r1.stderr.strip()[-200:])
+        check("and is byte-identical to the first", same)
+
+        # --- frames for a display that shows them in sequence
+        r, _ = run([IMG, '--levels', '4', '--frames', '4', '--save-frames', '--out', out('seq.png')])
+        frames = [out(f'seq-{k}.png') for k in range(4)]
+        ok = r.returncode == 0 and all(os.path.exists(p) for p in frames)
+        check("--save-frames writes every frame", ok, r.stderr.strip()[-200:])
+        if ok:
+            levels = max(len(np.unique(cv2.imread(p, cv2.IMREAD_GRAYSCALE))) for p in frames)
+            mean = np.mean([linear_mean(p)[0] for p in frames])
+            check("each frame holds the ladder's tones and together they hold the picture's",
+                  levels <= 4 and abs(mean - want) <= TOL,
+                  f"{levels} tones, mean {mean:.4f} against {want:.4f}")
+        r, _ = run([IMG, '--levels', '4', '--frames', '4', '--out', out('avg.png')])
+        check("without --save-frames, the run says the file is a preview",
+              r.returncode == 0 and 'preview' in r.stderr, r.stderr.strip()[-200:])
+
+        # --- a time budget: honoured roughly, and it learns this machine's speed
+        r, secs = run([IMG, '--mask-method', 'markov', '--mask-sample', FILM,
+                       '--seed', '7', '--budget', '5', '--out', out('budget.png')])
+        conf = os.path.join(tmp, 'dither', 'cache.conf')
+        rates = open(conf).read() if os.path.exists(conf) else ''
+        check("--budget 5 finishes in about that", r.returncode == 0 and secs < 30,
+              f"exit {r.returncode}, {secs:.0f} s")
+        check("and records a measured rate for the next run", 'markov.rate' in rates)
+
+        # --- a film calibrated at install is calibrated for every later run,
+        # without paying for it again; --no-config is how to get the rules
+        r = subprocess.run(['bash', '-c', 'source ./aliases >/dev/null 2>&1; '
+                            f'calibrate_samples {FILM} -- dft'],
+                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+        check("calibrate_samples measures a film", r.returncode == 0 and FILM in r.stdout,
+              (r.stdout + r.stderr).strip()[-200:])
+        r, _ = run([IMG, '--mask-method', 'dft', '--mask-sample', FILM, '--out', out('cal.png')])
+        check("a later plain run takes the calibration from the config",
+              r.returncode == 0 and 'from a previous calibration' in r.stderr,
+              r.stderr.strip()[-200:])
+        r, _ = run(['--explain', '--mask-method', 'dft', '--mask-sample', FILM])
+        check("and --explain reports it as measured",
+              any(l.split()[:1] == ['dft.smooth_cells'] and 'measured' in l
+                  for l in r.stdout.splitlines()), r.stdout.strip()[-200:])
+
+        # --- asking before doing
+        r, _ = run(['--explain'])
+        check("--explain answers without an image", r.returncode == 0 and 'threshold' in r.stdout,
+              r.stderr.strip()[-200:])
+        r, _ = run(['--help'])
+        check("--help", r.returncode == 0 and '--mask-sample' in r.stdout)
+
+    print(f"  {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

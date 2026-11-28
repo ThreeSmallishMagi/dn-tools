@@ -1,3 +1,5 @@
+alias activate='. */bin/activate'
+
 install_deps() #   Install apt-packages.txt and requirements.txt
 {
     command -v apt-get >/dev/null || { echo "not Debian — see the README for the brew line" >&2; return 1; }
@@ -31,17 +33,130 @@ deploy() #         Copy the git-tracked files to the public repo
     echo "deployed $(git -C "$src" ls-files | wc -l) tracked files to $publicrepo"
 }
 
+# Install the bash completion for dither and maketexture
+install_completion() 
+{
+    local src="$PWD/completion/dither"
+    [ -f "$src" ] || { echo "no $src — run this from the project root" >&2; return 1; }
+    local dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+    mkdir -p "$dir" || return 1
+    cp "$src" "$dir/dither" || return 1
+    # bash-completion loads lazily by command name, so maketexture needs its own
+    # entry or it would only complete once dither had been completed first.
+    ln -sf dither "$dir/maketexture" || return 1
+    echo "installed $dir/dither (and maketexture -> dither)"
+    echo "  active in new shells; 'source $src' for this one"
+}
+
+# Seed ~/.config/dither/samples with the shipped scans and dither/crops with their
+# crops, then calibrate them (--no-calibrate to skip that part)
+install_samples() 
+{
+    local map="$PWD/examples/films.tsv"
+    [ -f "$map" ] || { echo "no $map — run this from the project root" >&2; return 1; }
+    local py="$PWD/dither_env/bin/python"
+    [ -x "$py" ] || { echo "no $py — run install_deps first; the crops are cut with its cv2" >&2; return 1; }
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/dither"
+    local root="$cfg/samples"
+    local added=0 kept=0 differ=0 missing=0 film scan rest f
+    # Never overwrites. The library is the user's own, and may already hold
+    # their scans under these names; adding to it is a convenience, replacing
+    # what is in it is not this function's business.
+    while IFS=$'\t' read -r film scan rest; do
+        case "$film" in ''|\#*) continue ;; esac
+        if [ ! -f "examples/$scan" ]; then
+            echo "  missing examples/$scan" >&2
+            missing=$((missing + 1)); continue
+        fi
+        mkdir -p "$root/$film" || return 1
+        if [ ! -e "$root/$film/$scan" ]; then
+            cp "examples/$scan" "$root/$film/$scan" || return 1
+            added=$((added + 1))
+        elif cmp -s "examples/$scan" "$root/$film/$scan"; then
+            kept=$((kept + 1))
+        else
+            echo "  kept $root/$film/$scan, which differs from examples/$scan;" \
+                 "if it is an old crop, delete it and run this again"
+            differ=$((differ + 1))
+        fi
+        # The library once held crops rather than scans, under the scan's stem.
+        # Left beside the scan, a crop is pooled with it and its pixels counted
+        # twice, so say so; deleting it is the user's call.
+        for f in "$root/$film/${scan%.*}".*; do
+            [ -e "$f" ] && [ "$f" != "$root/$film/$scan" ] &&
+                echo "  $f looks like an old crop of $scan; delete it, or the generators pool both"
+        done
+    done < "$map"
+    local extra=""
+    [ "$differ" -gt 0 ] && extra+=", $differ differ"
+    [ "$missing" -gt 0 ] && extra+=", $missing missing"
+    echo "sample library $root: $added added, $kept already there$extra"
+    # The venv's bin first rather than "$py" in front: the script stays the
+    # thing that runs, and it still gets the python the check above found.
+    PATH="$PWD/dither_env/bin:$PATH" test/findcrops --install "$cfg/crops" || return 1
+    # Informational only: a successful install with nothing built to list from
+    # is still a successful install.
+    local exe="$PWD/build/dither"
+    [ -x "$exe" ] && echo "  films: $("$exe" --list-samples | tr '\n' ' ')"
+    # After the crops, which are what a calibration is scored against.
+    [ "${1:-}" = --no-calibrate ] || calibrate_samples || return 1
+    [ "$missing" -eq 0 ]
+}
+
+# Calibrate films in the library at the default settings, so a later run takes
+# the measurement from the config instead of paying for it. Every film and
+# every generator that can calibrate, unless some are named:
+#   calibrate_samples [film...] [-- method...]
+# One run at a time, since each writes the same config file. A film already
+# calibrated is read back rather than measured, so this is safe to repeat; it
+# takes about two minutes a film the first time, almost all of it markov.
+calibrate_samples()
+{
+    local exe="$PWD/build/dither"
+    [ -x "$exe" ] || { echo "no $exe -- run build first" >&2; return 1; }
+    local -a films=() methods=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do films+=("$1"); shift; done
+    [ "${1:-}" = -- ] && shift
+    methods=("$@")
+    [ ${#films[@]} -gt 0 ] || mapfile -t films < <("$exe" --list-samples)
+    [ ${#methods[@]} -gt 0 ] || methods=(dft inpaint markov)
+    local out film m said
+    out="$(mktemp --suffix=.png)"
+    echo "calibrating ${#films[@]} film(s) for ${methods[*]}"
+    for film in "${films[@]}"; do
+        for m in "${methods[@]}"; do
+            # The mask size is not in any calibration's key, so the build that
+            # follows the calibration is kept small; the image is never used.
+            said="$("$exe" "$PWD/examples/ramp_256x256.png" --threshold mask \
+                    --mask-method "$m" --mask-sample "$film" --mask-calibrate \
+                    --mask-size 64x64 --out "$out" 2>&1 >/dev/null)" ||
+                { echo "  $film $m: failed"; echo "$said" | tail -3; rm -f "$out"; return 1; }
+            printf '  %-18s %-8s %s\n' "$film" "$m" "$(echo "$said" |
+                grep -E 'measured for this|stays at|calibrated markov|keeping the derived|previous calibration' |
+                tail -1 | sed -e 's/^ *//' -e 's/ (.*//')"
+        done
+    done
+    rm -f "$out"
+}
+
+install_dither() #  Install the completion, seed the sample library and calibrate it
+{
+    install_completion && install_samples
+}
+
+
 md() #             Read a markdown file
 { 
-    pandoc -s -t man $* | man -l -
+    pandoc -s -f gfm -t man $* | man -l -
 }
 
 icat() #           Display an image in the terminal
 { 
     for f in $*;
     do
+        echo == $f ==
         #convert  $f -resize 1000x\> png:- |img2sixel -I
-        convert  $f -filter point -resize 1000x1000 sixel:-
+        convert  $f -filter point -resize 1000 sixel:-
     done
 }
 
@@ -61,14 +176,13 @@ imagefmt () #      Show properties of an image
 
 icrop() 
 {
-    if [ $# -lt 3 ]; then
-        echo "Usage: icrop <image> <x> <y>" >&2
-        return 1
-    fi
-    convert $1 -filter point -resize 1000x1000 sixel:-;
-    convert "$1" -crop 500x500+$2+$3 +repage -filter point -resize 1000x1000 sixel:-;
-    convert "$1" -crop 100x100+$(($2 +128))+$(($3 + 128)) +repage -interpolate nearest -filter point -resize 1000x1000 sixel:-;
-}
+    local img=${1:-dither.png}
+    local ox=${2:-128}
+    local oy=${3:-128}
+    convert \
+        \( "$img" -crop 768x768+$ox+$oy +repage -filter point -resize 1024x1024 \) \
+        \( "$img" -crop 256x256+$(($ox+192))+$(($oy+192)) +repage -interpolate nearest -filter point -resize 1024x1024 \) \
+        +append sixel:-;}
 
 isquash() 
 {
@@ -113,6 +227,43 @@ histo()
     convert $img -colorspace gray histogram:$res
 }
 
+# convert AutoRex-4X-449b.jpg -colorspace Gray -noise 5 -strip denoise.png && icat denoise.png
+# convert denoise.png -colorspace Gray  \( +clone -blur 72x72 \)  -compose Difference -composite -strip -normalize highpass.png &&icrop highpass.png 1400 1800
+# convert highpass.png  -blur 15x15  -normalize -threshold "30%" highpass2.png &&icrop highpass2.png 1400 1800
+# convert highpass2.png -blur 30x30 -threshold "20%" -negate detailmask.png &&icrop detailmask.png 1400 1800
+
+flat_regions() #    White where locally flat, black where there is detail
+{
+    local img=${1}
+    local res=${2}
+    local threshold=${3:-20}
+    local noise=${4:-5}
+    if [ -z "$img" ] || [ -z "$res" ]; then
+        echo "Usage: flat_regions <image> <result> [threshold%] [noise]
+                 default 20%. lower excludes more detail" >&2
+        return 1
+    fi
+
+ convert "$img" -colorspace Gray -noise $noise -strip denoise.png && icat denoise.png
+ convert denoise.png \( +clone -blur 72x72 \)  -compose Difference -composite -normalize highpass.png &&icat highpass.png 
+ convert highpass.png  -blur 15x15  -normalize -threshold "$threshold%" highpass2.png &&icat highpass2.png  #30% for autorex
+ convert highpass2.png -blur 30x30 -threshold "$threshold%" -negate detailmask.png &&icat detailmask.png 
+ convert "$img" detailmask.png  -compose Multiply -composite "$res" &&icat  "$res" 
+ rm denoise.png highpass.png highpass2.png detailmask.png
+
+#   convert "$img" -colorspace Gray  \( +clone -blur 32x32 \)  -compose Difference -composite -strip -normalize "$res"
+#    convert "$img" -colorspace Gray \
+#        \( +clone -blur 32x32 \) \
+#        -compose Difference -composite \
+#        -strip -normalize "$res"
+#        -blur 3x3 -normalize -threshold "50%" -strip "$res"
+#    convert "$img" -colorspace Gray \
+#        \( +clone -blur 22x22 \) \
+#        -compose Difference -composite \
+#        -blur 3x3 -normalize -threshold "50%" -strip "$res"
+#-blur 20x20 -threshold "${threshold}%" -negate -strip "$res"
+}
+
 rampdiff() #       Usage: rampdiff [image [result [reference [scale ]]]]
 { 
     local img=${1:-dither.png}
@@ -135,94 +286,114 @@ rampdiff() #       Usage: rampdiff [image [result [reference [scale ]]]]
 analyse() 
 {
     img=${1:-dither.png}
-    res=${2:-sixel:-}
-    ref=${3:-examples/ramp_256x256.png}
+    lin=${2:-}
+    grp=${3:-1}
+    ref=${4:-examples/ramp_256x256.png}
+    res=${5:-sixel:-}
 
-    colstats --csv dither.csv $img  $ref |grep RESULT | grep -e 'RESULT\|FAIL'
-    convert $img <(rampdiff $img - $ref) <(gnuplot -e 'png="-"' colplot) \
+    test/colstats --csv dither.csv --group $grp $lin $img  $ref |grep RESULT | grep -e 'RESULT\|FAIL'
+    convert $img <(rampdiff $img - $ref) <(gnuplot -e 'png="-"' test/colplot) \
     -resize x1000 +append -filter point -resize 2000x $res
+}
+
+add_caption() #    Add a text caption to the bottom of an image
+{
+    local img=$1
+    local caption=$2
+    local out=${3:-$img}
+    local width
+    width=$(identify -format "%w" "$img")
+    convert "$img" \
+        \( -size "${width}x30" -background white -pointsize 10 caption:"$caption" \) \
+        -gravity South -append \
+        "$out"
 }
 
 dither_with_caption()
 {
-    local input=$1
-    local output=$2
+    local input=$1 output=$2
     shift 2
-    local args="$@"
-    
     dither "$input" "$@" --out "$output"
-    
-    local caption="dither ${args}"
-    convert "$output" \
-        -gravity South -background white -splice 0x25 \
-        -pointsize 14 -annotate +0+2 "$caption" \
-        "$output"
+    add_caption "$output" "$*"
 }
 
 examples()
 {
     convert examples/ramp_256x256.png <(convert examples/m039crop.png -resize 256 -)  +append ex.png
-    
-    dither_with_caption ex.png ex_round.png --threshold round
-    dither_with_caption ex.png ex_random.png --threshold random
-    dither_with_caption ex.png ex_blue.png --threshold blue
-    convert ex_round.png ex_random.png ex_blue.png -append -filter point -resize 1000x examples.png
-    rm ex_round.png ex_random.png ex_blue.png
 
-    dither_with_caption ex.png ex_roundfs.png --threshold round --spatial 1
-    dither_with_caption ex.png ex_randomfs.png --threshold random --spatial 1
-    dither_with_caption ex.png ex_bluefs.png --threshold blue --spatial 1
-    convert ex_roundfs.png ex_randomfs.png ex_bluefs.png -append -filter point -resize 1000x examples_spatial.png
-    rm ex_roundfs.png ex_randomfs.png ex_bluefs.png
+    local -A groups=(
+        [examples]=""
+        [examples_spatial]="--spatial 1"
+        [examples_levels]="--levels 8"
+        [examples_frames]="--frames 8"
+    )
 
-    dither_with_caption ex.png ex_roundfs8.png --threshold round  --levels 8
-    dither_with_caption ex.png ex_randomfs8.png --threshold random  --levels 8
-    dither_with_caption ex.png ex_bluefs8.png --threshold blue  --levels 8
-    convert ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png -append -filter point -resize 1000x examples_levels.png
-    rm ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png
+    local order=(examples examples_spatial examples_levels examples_frames)
 
-    dither_with_caption ex.png ex_roundfsl8.png --threshold round  --frames 8
-    dither_with_caption ex.png ex_randomfsl8.png --threshold random  --frames 8
-    dither_with_caption ex.png ex_bluefsl8.png --threshold blue  --frames 8
-    convert ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png -append -filter point -resize 1000x examples_frames.png
-    rm ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png
+    for key in "${order[@]}"; do
+        local extra="${groups[$key]}"
+        local files=()
+        for thresh in round random mask; do
+            local out="ex_${thresh}_${key}.png"
+            dither_with_caption ex.png "$out" --threshold "$thresh" $extra
+            files+=("$out")
+        done
+        convert "${files[@]}" -append -filter point -resize 1000x "${key}.png"
+        rm "${files[@]}"
+    done
 
     rm ex.png
 }
 
-examples0()
+generators()
 {
-    convert examples/ramp_256x256.png <(convert examples/m039crop.png -resize 256 -)  +append ex.png
-    dither ex.png --threshold round  --out ex_round.png
-    dither ex.png --threshold random --out ex_random.png
-    dither ex.png --threshold blue   --out ex_blue.png
-    convert ex_round.png ex_random.png ex_blue.png -append  -filter point -resize 1000x  examples.png
-    rm ex_round.png ex_random.png ex_blue.png
+    local sample=${1:-Kodak-4X}
+    local img=${2:-examples/m039crop.png}
+    local res=${3:-generators.png}
+    convert $img -resize 256  ex.png
 
-    dither ex.png --threshold round  --spatial 1 --out ex_roundfs.png
-    dither ex.png --threshold random --spatial 1 --out ex_randomfs.png
-    dither ex.png --threshold blue   --spatial 1 --out ex_bluefs.png
-    convert ex_roundfs.png ex_randomfs.png ex_bluefs.png -append -filter point -resize 1000x   examples_spatial.png
-    rm ex_roundfs.png ex_randomfs.png ex_bluefs.png
+    local -A groups=(
+        [examples]=""
+        [examples_spatial]="--supersample 4"
+        [examples_levels]="--supersample 8"
+        [examples_frames]="--supersample 12 --mask-scale 2"
+    )
 
-    dither ex.png --threshold round  --spatial 1 --levels 8 --out ex_roundfs8.png
-    dither ex.png --threshold random --spatial 1 --levels 8 --out ex_randomfs8.png
-    dither ex.png --threshold blue   --spatial 1 --levels 8 --out ex_bluefs8.png
-    convert ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png -append  -filter point -resize 1000x  examples_spatial_levels.png
-    rm ex_roundfs8.png ex_randomfs8.png ex_bluefs8.png
+    local order=(examples examples_spatial examples_levels examples_frames)
+    local col_images=()
 
-    dither ex.png --threshold round  --spatial 1 --frames 8 --out ex_roundfsl8.png
-    dither ex.png --threshold random --spatial 1 --frames 8 --out ex_randomfsl8.png
-    dither ex.png --threshold blue   --spatial 1 --frames 8 --out ex_bluefsl8.png
-    convert ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png -append  -filter point -resize 1000x  examples_spatial_average.png
-    rm ex_roundfsl8.png ex_randomfsl8.png ex_bluefsl8.png
+    for key in "${order[@]}"; do
+        local extra="${groups[$key]}"
+        local files=()
+        for gen in dft markov inpaint direct; do
+            local out="ex_${gen}_${key}.png"
+            dither_with_caption ex.png "$out" --mask-sample ${sample} --mask-method  "$gen" $extra
+            files+=("$out")
+        done
+        convert "${files[@]}" -append -filter point -resize 1000x "${key}.png"
+        rm "${files[@]}"
+        col_images+=("${key}.png")
+    done
 
+    convert "${col_images[@]}" +append -filter point "${res}"
+    rm "${col_images[@]}"
     rm ex.png
 }
+
+gen()
+{
+    generators Kodak-4X examples/m039crop.png generators-4X.png
+    generators Kodak-2484 examples/m039crop.png generators-2484.png
+    generators Ilford-Delta3200 examples/m039crop.png generators-Delta3200.png
+    generators Kodak-TriX examples/m039crop.png generators-TriX.png
+}
+````
 
 test_dither() 
 {
     local args="$@"
+    echo
+    echo  $args
     dither examples/ramp_256x256.png $args && analyse
 }
 
@@ -232,18 +403,78 @@ run_suite()
     test_dither $extra_args
     test_dither --threshold random $extra_args
     test_dither --threshold random --spatial 1 $extra_args
-    test_dither --threshold blue $extra_args
-    test_dither --threshold blue --spatial 0.5 $extra_args
-    test_dither --threshold blue --spatial 1 $extra_args
+    test_dither --threshold mask $extra_args
+    test_dither --threshold mask --spatial 0.5 $extra_args
+    test_dither --threshold mask --spatial 1 $extra_args
+    test_dither --threshold mask --mask-method dft --mask-sample examples/Kodak-4X-1.png $extra_args
+    test_dither --threshold mask --mask-method markov --mask-sample examples/Kodak-4X-1.png $extra_args
+    test_dither --threshold mask --mask-method inpaint --mask-sample examples/Kodak-4X-1.png --supersample 6 $extra_args
+    test_dither --threshold mask --mask-method direct --mask-sample examples/Kodak-4X-1.png --supersample 6 $extra_args
 }
 
 gallery() #        Show what various combinations of options do
 {
     run_suite
-    echo "-- multi frame average --"
+    echo "\n-- multi frame average --"
     run_suite --frames 16
-    echo "-- bit depth 3 --"
+    echo "\n-- bit depth 3 --"
     run_suite --levels 8
+}
+
+colordither()
+{
+    if [ $# -lt 3 ]; then
+        echo "Usage: colordither <input> <output> <channel_script> [options]" >&2
+        return 1
+    fi
+
+    local input="$1" output="$2" script="$3" tmp
+    shift 3
+    tmp=$(mktemp -d) || return 1
+
+# Split into R, G, B channels
+    convert "$input" -channel R -separate -strip "$tmp/r.png"
+    convert "$input" -channel G -separate -strip "$tmp/g.png"
+    convert "$input" -channel B -separate -strip "$tmp/b.png"
+
+# Process each channel
+    "$script" "$tmp/r.png" --out "$tmp/r_out.png" "$@"
+    "$script" "$tmp/g.png" --out "$tmp/g_out.png" "$@"
+    "$script" "$tmp/b.png" --out "$tmp/b_out.png" "$@"
+
+# Combine back into color image
+    convert "$tmp/r_out.png" "$tmp/g_out.png" "$tmp/b_out.png" \
+    -combine -colorspace sRGB "$output"
+    local status=$?
+    rm -rf "$tmp"
+    return $status
+}
+
+foreach() #        Run a command template for each argument: foreach a b c -- cmd {} --flag
+{
+    local args=() cmd=() arg
+    local in_cmd=0
+    for arg in "$@"; do
+        # Only the first -- separates; later ones belong to the command, which
+        # may need its own end-of-options marker to pass a filename beginning
+        # with a dash.
+        if [ $in_cmd -eq 0 ] && [ "$arg" = "--" ]; then in_cmd=1; continue; fi
+        if [ $in_cmd -eq 0 ]; then args+=("$arg"); else cmd+=("$arg"); fi
+    done
+    [ ${#cmd[@]} -gt 0 ] || { echo "foreach: no command after --" >&2; return 2; }
+    local rc=0
+    for arg in "${args[@]}"; do
+        "${cmd[@]//\{\}/$arg}" || rc=$?
+    done
+    return $rc
+}
+
+compare()
+{
+    tmp=$(mktemp -d tmp.XXX)
+    trap "rm -rf $tmp" EXIT
+    foreach "$@" --out "$tmp/{}.png" 
+    montage $tmp/*.png -tile 3x1 -geometry 512x512 -filter point -size 2500x1500 sixel:-
 }
 
 help() 
@@ -256,6 +487,6 @@ help()
     fi
 }
 
-
 export PATH=$PATH:$(pwd)/build
 grep -e '() #' "${BASH_SOURCE[0]}" |grep -v grep
+activate

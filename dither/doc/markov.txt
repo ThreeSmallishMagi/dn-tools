@@ -1,0 +1,26 @@
+I would like to try another way of finding a noise mask that matches a given sample.
+Add a new option --mask-method [dft|markov] to allow the new method to be chosen and 
+add new files markov.cpp and markov.h.
+I would like to use a markov model to generate a matching texture ( perhaps it is a markov
+random field, not sure) The idea is  that the neighbourhood of a pixel constrains what
+values that pixel is likely to take ( it's distribution )  
+
+We will consider a small
+neighbourhood of perhaps +-5 pixels. Perhaps a larger neighbourhood is needed but
+the closest neighbors are likely to be most influential. In addition we will consider pairs
+of neighbours instead of single pixels. Some pairs that are likely to be more influential
+than others  are  ((x-2,y),(x-1,y)) and ((x-1,y),(x+1,y)) and their symmetries or
+((x-1,y-1),(x+1,y+1)).  Far neighbours are likely needed because the +-2 neighbourhood
+is likely too small to fully reproduce grain structure.
+
+For each pair e.g. ((x-2,y),(x-1,y), we iterate over the texture sample, and build tables
+of the quantised neighbours img[x-2,y]/10,img[x-1,y]/10 of the set img[x,y]
+  (e.g. table_{img[x-2,y]}_{img[x-1,y]}.add( += img[x,y])  
+
+With a neighborhood of +-5 you can about 11^4 tables, so you need some way to eliminate 
+uninteresting pairs. A pair is uninteresting if its values are not correlated with
+the central pixel, iow  the distribution it collects is about the overall pixel value
+distribution.
+
+Perhaps the attention mechanism can be used to eliminate uninteresting pairs, and 
+to combine pairs that are interesting.

@@ -1,0 +1,196 @@
+Triage of doc/TestCoverageReview.md. One line per finding, keyed by its label.
+Status is Accepted / Rejected / Done.
+
+Every one of the eleven reproduced here before being accepted. That is unusual
+and worth saying: this reviewer read the implementations rather than the
+comments, and three of the findings are defects in work from the last fortnight
+that the suite passes cleanly over.
+
+F01:Done: Set::read loads samples with IMREAD_GRAYSCALE, so a 16-bit scan is
+8 bits before any generator sees it, while dither.cpp and maketexture.cpp both
+pass IMREAD_ANYDEPTH. Confirmed by reading the three call sites. The review is
+also right that ANYDEPTH alone is not the fix: direct.quantise is "input codes"
+and would mean 1/257 of one on a 16-bit sample.
+
+F02:Done: inpaint's coarse levels re-rank each scan independently, undoing the
+pooled rank that exists to keep the scans' relative contrast. Confirmed by
+reading `downsample`, which block-averages *and* calls rank_uniform_unit, and
+`downsample_set`, which calls it per scan. Mine, from the samples::Set work.
+
+F03:Done: flag_for("mask.size.w") emits --mask-size-w and key_for_flag maps it
+back to mask.size_w, which no rule has. Reproduced: the flag is listed by
+--list-options and rejected by the parser.
+
+F04:Done: --mask-out is stored outside the registry, so it neither implies a
+mask nor conflicts with one being refused. Reproduced: exit 0, image written,
+no mask file. This is the silently-dropped-option shape that Params::conflicts
+exists to make impossible, in the one option that escaped the registry.
+
+F05:Done: set_typed types a value by its spelling rather than by the
+parameter's declared type, so --mask-sample 0001 stores 1. Reproduced through
+--explain.
+
+F06:Done: the budget search prices a halving sequence from the grid, then rounds
+the winner *up* to the cache ladder without re-pricing. Reproduced: a 512 grid
+at rate 1e8 and --budget 1 selects 1024, which the same formula prices at 4.19s.
+
+F07:Done: quantize_scan narrows the goal to float, and above 2^24 display units
+a float cannot separate adjacent integer budgets. Reachable: --frames accepts
+100000, so 256 levels is enough. It contradicts the exact-close invariant this
+file states and unittest checks at smaller counts.
+
+F08:Done: the 3-channel linear_to_srgb adds 0.5 and then saturate_cast, which
+rounds again. The gray path uses lround once. Unused by the pipeline, so P3 is
+right, but it is two lines.
+
+F09:Done: markov.h declares calibrate_markov taking a cv::Mat; the definition
+takes a samples::Set. A dead declaration that only links because the CLI caller
+shares a translation unit.
+
+F10:Done: temporaldither parses depths with atoi and shifts by them unvalidated.
+`temporaldither 32 2 128 0` shifts a 32-bit value by 32. A demo rather than the
+dither pipeline, which is why it is P3, but it is undefined behaviour on input
+a user can type.
+
+F11:Done: experiments/markov-20260927/draw.cpp still passes a Mat to
+fit_markov_model. Not a CMake target, so the build is unaffected.
+
+Nothing rejected, which is not a statement about the standard applied. Each was
+checked against the source and run where it could be run; the two I expected to
+argue with -- F07, whose cost is one unit in 16.7 million, and F10, which is a
+demo -- survived because the first contradicts a stated invariant and the second
+is UB rather than a wrong answer.
+
+Notes on the fixes
+------------------
+F01's scale convention: samples are now stored as CV_32F on the 0..255 code
+scale, so one "input code" means the same thing whatever the file's depth and
+direct.quantise keeps its documented meaning. 8-bit input is unchanged to the
+bit, since the values are the same numbers in a wider type.
+
+F07 was fixed rather than guarded, and it is the one fix that moves output.
+Carrying the goal in double means DitherFn::operator() takes a double, and the
+arithmetic then differs in the last bits: 3 of the 76 hash-matrix runs change
+(round sp=0.5 lv=8, frames=16, supersample4). Measured on the ramp, the two
+that can be scored move by less than a thousandth of a level -- column-mean rms
+5.5761 against 5.5689, whole-image bias -0.0249 against -0.0314 -- so this buys
+the stated invariant back at no measurable cost. No mask row moved, so F01-F06
+are byte-neutral.
+
+F01 needed a second half the review named: ANYDEPTH alone was not enough.
+direct.quantise is documented in input codes, and on the common 0..255 scale
+0.9 of an 8-bit code still quantised away everything a 16-bit scan has that an
+8-bit one does not -- a low-contrast 16-bit fixture was refused for having 32%
+of its ordering decided at random. The step now follows the source's own depth,
+and that fixture builds a full 255-level mask.
+
+Two things the fixes exposed that were not in the review:
+
+  test/flagcheck read --help to decide which flags exist, and --help describes
+  the generator ceilings as prose -- so it could not see --mask-size-w at all
+  and called F03's two flags nonexistent once the review document named them.
+  It reads --list-options now, which is the enumeration the completion script
+  already trusts.
+
+  scratchpad/bi/check.sh passed --mask-out on all 76 runs, including the
+  round and random ones. That is F04's defect in the harness that guards
+  against defects: it was relying on the option being silently dropped, and
+  31 rows turned into refusals until it stopped.
+
+F06 prices the ladder rungs themselves instead of a halving sequence, so the
+size that is chosen is the size that was priced. The floors still override the
+budget, which is the documented policy and not what was wrong.
+
+
+Tests added from doc/TestCoverage.md
+------------------------------------
+That document is a review of all 565 functions, with a "unit tests should
+exist" line under every one. Most of those would be writing a second
+implementation and calling it a check. What was taken instead is the list of
+invariants this project *states* and does not verify, and the defect classes
+that have actually shipped -- which the document's own "important gaps" section
+names first, and which is where the four review rounds' findings cluster.
+
+apicheck   Compiles each public header alone and links a reference to every
+           function it declares. Two defects had drifted here (F09, F11) and no
+           other check could see them, because everything else links the whole
+           library and calls through the CLI. Both verified to fail it.
+
+           Two things it had to learn. A line-based scan sees only one-line
+           declarations, and nearly every declaration here spans several, so
+           the first version found two of markov.h's five and neither was F09's
+           -- it parses statements now. And `(void)&f;` emits no relocation, so
+           it linked happily against a declaration with no definition; the
+           addresses go in a namespace-scope array, which cannot be folded away.
+
+errorcheck Eleven ways a run cannot proceed, each asserted three ways: non-zero
+           status, the program's own sentence naming what was wrong, and no
+           output file. The third is the one that regresses quietly -- a partial
+           artifact is indistinguishable from a real one until something reads
+           it -- and it is what the teeth check breaks.
+
+cachecheck The config is documented as unable to affect a run, and was not: an
+           out-of-range cached calibration reached P.set, which throws. Nine
+           hostile entries -- out of range, negative, not a number, off the
+           ladder, truncated, untyped -- must all give back the mask an honest
+           calibration produced. Each run gets its own mask cache, or the mask
+           is served from it and the calibration never runs, which is how the
+           first version passed while testing nothing.
+
+unittest   "A mask is a pure function of its inputs": built for all five
+           generators, each twice with an unrelated build in between. This is
+           the property the whole mask cache rests on, it held only by accident
+           until cvflann was seeded from the generator, and removing that
+           seeding fails it.
+
+           "MaskDither: a negative value thresholds, and a rectangular mask is
+           not transposed": both defects this class has had. The negative half
+           needed a second look -- a fraction *above* the cell decides the same
+           way whether the code floors or truncates, so only the non-firing
+           fraction separates them.
+
+Not added, and why. Per-function unit tests for the arithmetic helpers: a test
+that recomputes makeSparseGaussian's taps from the same formula asserts that
+addition works. Filesystem-full and concurrent-access fixtures: they need
+injected failures the program has no seam for, and the cost of adding one is
+larger than the defect class. Perceptual quality: test/patchfit, levelfit,
+maskfit and grainfit already answer that, and none of it belongs in a pass/fail
+suite.
+
+
+A test per defect, added afterwards
+-----------------------------------
+Five of the eleven were already covered by the checks above -- F03 and F05 by
+the registry round-trip and typing cases, F04 by requestcheck, F09 and F11 by
+apicheck. The other six now have one each, written as the general property
+rather than as the instance, and each verified to fail on the code it replaces.
+
+F01  "a scan keeps what its file holds, at any depth, on one scale". Writes the
+     same content at 8 and 16 bits, reads both back and requires the deeper
+     file to keep more values, the two to agree on where the picture sits, and
+     a code step that follows the file. Nothing in it mentions 257.
+F02  "a set-valued transformation keeps the scans' relative contrast". Two
+     scans a tenfold apart must stay distinguishable through every step that
+     returns a Set -- the shared preparation, the pooled ranking, and the
+     coarse reduction that was wrong. `downsample_set` is declared in the
+     header for this; its internal linkage was hiding the half of it that
+     failed.
+F06  "the size chosen is a size that was priced as affordable". 320
+     combinations of generator, grid, rate and budget. Where it exceeds the
+     budget it must equal what the policy builds when nothing is affordable --
+     asked of the policy with an impossible budget rather than assumed, so the
+     test knows neither the ladder nor the floors.
+F07  "it closes exactly at the edge of the domain, not only in the middle". The
+     existing matrix runs to 128 frames, where a float is exact; the parser
+     accepts 100000. One pixel, so the edge is reachable in four seconds.
+F08  "the Mat helpers agree with the scalar ones on every code". All 256, all
+     three channels. The double round moved 288 of 768.
+F10  temporaldither's six invalid command lines, in errorcheck, since it is a
+     separate binary with no library surface.
+
+Two notes on the writing of them. The F06 case first asserted that a 128 tile
+would have fit, which is not a size the ladder has -- it was failing a sound
+policy, and the fix was to stop assuming what the alternatives are and ask.
+And shellcheck refused the F01 case for handing a path to std::system: the rule
+is broader than the one call that broke it, and a test is not an exception to
+it.

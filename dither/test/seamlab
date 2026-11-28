@@ -1,0 +1,1195 @@
+#!/usr/bin/env python3
+"""How well does a mask tile, and what does each way of building one cost?
+
+  seamlab <sample>...              build a direct mask several ways, compare
+  seamlab --score <mask>...        score finished masks instead
+  seamlab --check <sample>         confirm the Python model matches build/dither
+
+This is the bench the `direct` generator's seam handling was settled on. It
+exists because that question has a lot of plausible answers and only
+measurement separates them -- see the rejected list in CLAUDE.md's `direct`
+section, every entry of which was killed here.
+
+Everything is measured on the FIELD, before any ranking. That is deliberate.
+Rank-flattening is scale-free: it maps whatever ordering exists onto 0..254
+regardless of amplitude, so a low-frequency component of *any* size becomes a
+full-scale density modulation in the mask. Looking at the mask therefore tells
+you that something is wrong without telling you how much was added or by what.
+The field tells you both, and `plain` -- the untouched crop -- is the reference
+every row is read against.
+
+  work         edge mismatch over interior difference, before any repair. How
+               much there is to repair. Only meaningful on a texture: the
+               denominator collapses on an image that is constant along one
+               axis, and n/a is printed rather than a number from a zero
+               divisor.
+
+  seam c/r     rank-sum z of the wrapping column and row pairs against the
+               interior pairs. ~0 is a field that joins. Positive is a hard
+               seam -- the wrapping pair differs more than the texture does.
+               Negative is a repair that overshot into a soft seam, the
+               wrapping pair differing less, which is equally visible and which
+               reading these as magnitudes concealed. A one-pixel measure, so
+               it sees a discontinuity either way and is blind to a broad band
+               of altered texture.
+
+  >64px        where the field's power sits, as percentages. A field fit to be
+  16-64        ranked into a threshold mask has nearly all of it in the fine
+  <16px        band; anything a treatment adds to the two coarse bands ends up
+               as density modulation.
+
+  swing        spread of the field's local mean, in the sample's own grey
+  vs plain     levels, and the same relative to `plain`. This is the low
+               frequency a treatment leaves behind. Above 1x means it put some
+               in; below means it took some out.
+
+Constructions (--variants, comma separated, default all):
+
+  plain     high-pass the whole sample, crop. No repair. test/refmask itself.
+  direct    what `dither --mask-method direct --direct-equalise 0` builds:
+            high-pass, then the minimum error boundary cut of `quilt` below.
+            Nothing filters after the cut.
+
+            It used to be Moisan's periodic + smooth decomposition followed by a
+            wrapped high-pass to take the smooth component back out, and that
+            last step was not optional -- see `swing`. Both are still here, as
+            `moisan` and `hpafter`, because the comparison is the argument.
+
+  equalise  **what `dither --mask-method direct` builds by default**, and what
+            --check compares against: each pixel of the *raw* sample replaced
+            by its quantile within a Gaussian neighbourhood of four times the
+            high-pass's sigma (--equalise), ties shuffled, then the cut. Not quantised, since
+            it is already a continuous quantile. Raw rather than high-passed is
+            the point: a clipped sample's zeros are one tie group, and any
+            subtraction first orders them by the surface -- the shadow voids
+            `--rank local` gave on Kodak-4X-1. See maskutil::local_quantile and
+            CLAUDE.md's `direct` section. Exact here; the program counts on a
+            sigma/3 grid, which reads a few per cent wider.
+  moisan    the decomposition alone, without that last step. Kept because it is
+            the bare method and because it is what carried the density defect,
+            so it is what the shipped construction had to beat on `swing`.
+  wraphp    crop first, then high-pass the tile wrap-padded, then Moisan. The
+            "let the filter see a torus" idea. Also ends in a bare
+            periodisation, so it carries the same density defect as `moisan`. On film the two are
+            indistinguishable by every measure tried. On images that are not
+            textures the comparison is unsettled and the metrics disagree with
+            each other, so look at the tiling rather than the numbers.
+
+            One thing is definite: wrap-padding a sample with a *gradient* leaves
+            the gradient behind. It puts the dark end next to the bright end, so
+            the blur errs in opposite directions at the two edges and a residual
+            tilt survives across the tile -- on linesr.png the column mean runs
+            -23.8 to +23.8 where the reflecting high-pass leaves 0.0 to 0.0.
+            Film has no gradient, which is why this never shows there.
+  hpafter   crop, Moisan, then a wrap-padded high-pass. Filtering after the
+            repair, which a reflecting filter would undo.
+  mirror    mirror the tile to 2x and take that. Exactly periodic, and the eye
+            finds the symmetry instantly -- included so that is visible as a
+            number rather than an assertion.
+  damped    Moisan with the two axes' boundary data scaled independently, each
+            bisected to land the wrap difference on that axis's interior
+            difference. Helps some samples, breaks others.
+  blend     histogram-preserving blending (Heitz & Neyret 2018) of the tile with
+            its own half-shifts, one pass per axis. No global solve, so nothing
+            can be injected into the interior -- which is the defect that rules
+            out `moisan` and `wraphp` however well they close the seam. `blend`
+            high-passes afterwards as `direct` does; `blendraw` is the bare
+            blend; `blendpre` high-passes the sample *first*, which is the
+            production order and much the best of the three -- nothing may
+            filter after the blend, or the sub-level ordering --quantise exists
+            to remove comes straight back.
+  poly      `direct` with the high-pass replaced by fitting and removing a
+            low-order surface. The premise is that a sample for `direct` is
+            grain and nothing else, so its only low-frequency content is a
+            gradient or vignetting, which six coefficients can describe and
+            which no convolution is needed to remove.
+
+            It is safe and it is measurably unnecessary. On a grain crop the
+            tone never dominates the grain -- imposing a 0.35-1.41x wedge only
+            reaches tone/overall 0.16, because the grain's own sd is 65 against
+            the tone's 10 -- so `plain` is already immune and reads void 1.96
+            flat or wedged, with `poly` reading the same. Where filtering *is*
+            needed, a full frame, the low-frequency content is picture detail
+            rather than a surface and no low order fits it: on DemiEE17 `poly`
+            manages 12.3 where the high-pass gets 3.0. It works where nothing
+            was wrong and not where something is.
+
+            Kept because it cannot do harm, because the regime it is for --
+            strong gradient over weak grain -- is reachable in principle, and
+            because the negative result is worth being able to reproduce.
+
+            Divided rather than subtracted it was briefly dither's default,
+            and is refuted: dividing by the mean assumes grain amplitude is
+            proportional to it, and PanatomicX's amplitude is flat while its
+            mean falls 47 to 27, so dividing manufactured a 3.1-to-5.2 amplitude
+            gradient and a line at every tile seam. `equalise` replaced it.
+
+  quilt     Efros & Freeman's minimum error boundary cut (2001): overlap the
+            tile with its own continuation and cut the lowest-cost path through
+            the overlap, per axis. Every output pixel comes from exactly one
+            place in the sample and nothing is ever mixed, so unlike `blend` it
+            keeps `direct`'s whole claim -- that everything true of the grain is
+            true of the mask. It measures like it: patchfit 2.6 and 2.3 on the
+            two films, both *below* the real-patch floor, where blend costs
+            0.3-1.0 sigma for the averaging it does in the band.
+
+            What it needs is somewhere to cut. The path is invisible only where
+            the two candidates agree, which stochastic grain offers constantly
+            and structured content does not: on linesr, whose lines sit on a
+            gradient so the two edges never agree anywhere, it reads 16.2 where
+            the blend reads -5.5. It also needs --overlap more sample than the
+            tile, which is a real new constraint and not just a bigger number.
+"""
+import argparse, os, subprocess, sys, tempfile
+from statistics import NormalDist
+import cv2
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+ap = argparse.ArgumentParser(description=__doc__,
+                             formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument('paths', nargs='*', metavar='IMAGE')
+ap.add_argument('--size', default='256x256', help="tile size WxH (default 256x256)")
+ap.add_argument('--highpass', type=float, default=32.0,
+                help="drop sample structure coarser than this, in px (default 32)")
+ap.add_argument('--variants', default='plain,moisan,direct,equalise,wraphp,hpafter,mirror,damped,blendpre,quilt')
+ap.add_argument('--overlap', type=int, default=0, metavar='PX',
+                help="overlap the `quilt` variant cuts through, in px (default "
+                     "0, meaning 2 sigma). Too narrow and the DP has no "
+                     "independent choices, since candidate columns closer than "
+                     "the field's correlation length agree or differ together; "
+                     "too wide and the tile is cut from a smaller sample for "
+                     "nothing")
+ap.add_argument('--band', type=float, default=0.0, metavar='PX',
+                help="blend band half-width for the `blend` variant, in px "
+                     "(default 0, meaning --highpass). Wide enough that the "
+                     "weights vary slowly against the field's correlation "
+                     "length, or the autocovariance is not preserved; narrow "
+                     "against the tile, or most of the tile is a mixture")
+ap.add_argument('--equalise', type=float, default=None, metavar='SIGMA',
+                help="neighbourhood sigma of the `equalise` variant, in px "
+                     "(default: direct.equalise's rule, four times the "
+                     "high-pass's sigma). --check hands the same value to "
+                     "build/dither, so the two always model one treatment")
+ap.add_argument('--params', action='store_true',
+                help="check that this file's parameter rules match build/dither's "
+                     "registry over several --highpass values, and exit")
+ap.add_argument('--score', action='store_true',
+                help="arguments are finished masks; just report their seam")
+ap.add_argument('--rank', choices=('global', 'local'), default='global',
+                help="how the field becomes a mask: one ranking over the whole "
+                     "tile, or the share of each pixel's own neighbourhood "
+                     "below it (default: global)")
+ap.add_argument('--rank-sigma', type=float, default=8.0, metavar='PX',
+                help='neighbourhood sigma for the local rank (default: 8)')
+ap.add_argument('--poly-blur', type=float, default=0.0, metavar='PX',
+                help='smooth the field before fitting the surface, reflecting '
+                     '(default: 0, fit it directly -- see poly_flatten)')
+ap.add_argument('--poly-degree', type=int, default=2, metavar='N',
+                help='order of the surface `poly` removes (default: 2)')
+ap.add_argument('--poly-grid', type=int, default=0, metavar='N',
+                help='fit on an NxN grid of sample patches rather than on the '
+                     'whole blurred field (default: 0, the whole field)')
+ap.add_argument('--poly-rounds', type=int, default=1, metavar='N',
+                help='repeat the fit-and-remove this many times (default: 1)')
+ap.add_argument('--poly-robust', type=int, default=0, metavar='N',
+                help='rounds of dropping the worst-fitting points before '
+                     'refitting -- the "n best points" variant (default: 0)')
+ap.add_argument('--poly-subtract', action='store_true',
+                help='subtract the surface instead of dividing by it')
+ap.add_argument('--rank-mix', type=float, default=1.0, metavar='FRAC',
+                help='how much of the local rank to use, 0 global to 1 local '
+                     '(default: 1)')
+ap.add_argument('--quantise', type=float, default=0.9, metavar='STEP',
+                help="round the field to this grid before ranking, in the "
+                     "sample's own grey levels (default 0.9, 0 disables). Just "
+                     "below one level: keeps every difference the sample could "
+                     "record and collapses everything finer into ties")
+ap.add_argument('--write', metavar='DIR', default=None,
+                help="write each variant's mask to DIR as <stem>_<variant>.png, and "
+                     "a 2x2 tiling as <stem>_<variant>_tiled.png. The tiling is the "
+                     "point: a seam is a thing you see when tiles meet, so look at "
+                     "the middle of that one. Note these are the *ranked masks* -- "
+                     "writing the intermediate float field instead gives an image "
+                     "that is ~50%% clipped to black and tells you nothing about "
+                     "the mask.")
+ap.add_argument('--dither', metavar='PATH', default=None,
+                help="the dither binary --check and --params run (default "
+                     "build/dither); a test points it somewhere broken to prove "
+                     "a failed build is reported as one")
+ap.add_argument('--check', action='store_true',
+                help="also build the same mask with build/dither and print its "
+                     "seam beside the `direct` row, to confirm the Python model "
+                     "here still tracks the program. The two are not the same "
+                     "quantity -- every Python row measures the field and this "
+                     "one measures the finished ranked mask -- so what it "
+                     "establishes is that both join, not that they agree to a "
+                     "digit. Ranking is monotone but the rank sum is taken over "
+                     "difference magnitudes, which ranking does not preserve")
+args = ap.parse_args()
+DITHER = args.dither or os.path.join(ROOT, 'build', 'dither')
+
+SIGMA_PER_PX = 0.1874          # maskutil::kHighpassSigmaPerPixel
+SIG = SIGMA_PER_PX * args.highpass
+# direct.equalise's rule in directmask.cpp. It moved from 2 to 4 once, and this
+# file kept modelling 2 while --check compared it with the program, which is
+# why --params exists: parameter identity is the claim that can be checked,
+# since the exact and coarse-grid computations are not meant to agree by pixel.
+EQUALISE_PER_SIGMA = 4.0
+EQ = args.equalise if args.equalise is not None else EQUALISE_PER_SIGMA * SIG
+W, H = (int(v) for v in args.size.split('x'))
+
+
+# --- the two measurements --------------------------------------------------
+
+def seam_z(a):
+    """Rank-sum z of the wrapping column pair against every interior pair.
+
+    Uses all H*(W-1) interior samples rather than their mean, and needs no
+    assumption about the sign of the correlation -- which matters because blue
+    noise's adjacent columns are less alike than unrelated ones while every
+    other field's are more.
+
+    Signed, and the sign is the whole finding. Positive is the seam everyone
+    expects: the wrapping pair differs more than an interior pair, which is a
+    hard line. Negative is a repair that went too far -- the wrapping pair
+    differs *less*, so the join is smoother than the texture around it, which is
+    a soft line and just as visible. This used to return abs(), and under it
+    `direct` read 1.34/4.84 on Kodak-4X-1 while its wrapping pairs were only
+    0.84x and 0.51x as different as its interior ones: not a residual seam at
+    all, but the Moisan solve and the toroidal high-pass together flattening the
+    join. 0 is neither, and is what a field that simply continues reads."""
+    a = np.asarray(a, dtype=np.float64)
+    inter = np.concatenate([np.abs(a[:, i] - a[:, i + 1]) for i in range(a.shape[1] - 1)])
+    wrap = np.abs(a[:, -1] - a[:, 0])
+    n1, n2 = len(wrap), len(inter)
+    both = np.concatenate([wrap, inter])
+    order = both.argsort(kind='stable')
+    rank = np.empty(len(both)); rank[order] = np.arange(1, len(both) + 1)
+    _, inv, cnt = np.unique(both, return_inverse=True, return_counts=True)
+    rank = (np.bincount(inv, weights=rank) / cnt)[inv]
+    U = rank[:n1].sum() - n1 * (n1 + 1) / 2.0
+    return (U - n1 * n2 / 2.0) / np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12.0)
+
+
+def swing(f):
+    """Spread of the FIELD's local mean, in the sample's own grey levels.
+
+    This is the low frequency a treatment leaves behind, measured before any
+    ranking. Ranking is deliberately kept out of it: rank-flattening is
+    scale-free, so it converts a low-frequency component of *any* amplitude
+    into a full-scale density modulation, and looking at the mask therefore
+    tells you that something is wrong without telling you how much was added
+    or by what. The field says both.
+
+    Read against `plain`, which has had nothing done to it. Above 1x means the
+    treatment put low frequency in; below means it took some out."""
+    return cv2.GaussianBlur(np.asarray(f, np.float64), (0, 0), 16, 16,
+                            borderType=cv2.BORDER_REFLECT).std()
+
+
+def tiebreak(before, after):
+    """How loudly does the treatment's added field speak, in the sample's own
+       quantisation steps?
+
+    Every 8-bit sample is 100% tied -- 65536 pixels over at most 256 values --
+    so the sample never determines the ordering of 65536 ranks on its own.
+    Something has to break those ties, and a treatment that adds a field breaks
+    them with it. Above 1 the added field is real structure the sample carried
+    (subject, grain) and breaking ties by it is meaningful. Below 1 it is
+    smaller than anything the sample could record, so it is noise -- and because
+    it is a *smooth* field, tie-breaking by it paints a spatial correlation onto
+    the mask that has no basis in the data.
+
+    This is invisible to every other column: on greyd the deciding field is
+    0.039 grey levels, which is nothing in power terms and everything in
+    ordering terms."""
+    # `mirror` builds its tile from a half-size crop, so there is no pixel-wise
+    # "before" to difference against and the question does not arise.
+    if np.shape(before) != np.shape(after): return float('nan')
+    add = np.asarray(after, np.float64) - np.asarray(before, np.float64)
+    if not np.any(add): return 0.0
+    return cv2.GaussianBlur(add, (0, 0), 16, 16, borderType=cv2.BORDER_REFLECT).std()
+
+
+def quantise(f, step):
+    """Round the field to a grid just below the sample's information floor.
+
+    The sample holds integers, so a difference below one grey level is not
+    something it recorded -- it is whatever the high-pass left behind. On a
+    sample with little tonal range that residue is all there is, and it decides
+    the entire fine ordering: greyd's high-passed field sorts into two clusters
+    of spread 0.0094, within which the order correlates with the blur at
+    +1.00000. Ranking then draws that blur at full contrast, which is the
+    mottling.
+
+    Rounding to a grid just under one level keeps every difference the sample
+    could represent and collapses everything finer back into ties -- which the
+    ranking below then breaks at random rather than by the blur. Rounds to
+    nearest and keeps the sign: truncating would quantise either side of zero on
+    a different grid, and an unsigned cast would wrap the negatives above the
+    positives and invert the mask."""
+    if step <= 0:
+        return f
+    return np.rint(np.asarray(f, np.float64) / step) * step
+
+
+def wrap_blur(x, sigma):
+    """Gaussian blur of a field that is already a torus."""
+    p = int(np.ceil(3 * sigma))
+    big = cv2.copyMakeBorder(np.asarray(x, np.float64), p, p, p, p, cv2.BORDER_WRAP)
+    return cv2.GaussianBlur(big, (0, 0), sigma, sigma,
+                            borderType=cv2.BORDER_REFLECT)[p:p + x.shape[0], p:p + x.shape[1]]
+
+
+def local_quantile(f, sigma, seed=0, levels=256):
+    """maskutil::local_quantile, computed exactly: each pixel's quantile within
+       a Gaussian neighbourhood truncated at the sample's edge, ties shuffled.
+       One normalised weighted count per grey level -- each distinct value its
+       own, or `levels` equal-count groups of the same strict order past that."""
+    f = np.asarray(f, np.float64)
+    n = f.size
+    key = np.random.default_rng(seed).random(n)
+    order = np.lexsort((key, f.ravel()))
+    v = f.ravel()[order]
+    start = np.flatnonzero(np.r_[True, v[1:] != v[:-1]])
+    if start.size > levels:
+        start = (np.arange(levels) * n) // levels
+    start = np.r_[start, n]
+    blur = lambda m: cv2.GaussianBlur(m, (0, 0), sigma, sigma, borderType=cv2.BORDER_CONSTANT)
+    norm = blur(np.ones(f.shape))
+    below = np.zeros(f.shape); u = np.empty(n)
+    for lo, hi in zip(start[:-1], start[1:]):
+        idx = order[lo:hi]
+        lvl = np.zeros(n); lvl[idx] = 1.0
+        share = blur(lvl.reshape(f.shape)) / norm
+        frac = (np.arange(hi - lo) + 0.5) / (hi - lo)
+        u[idx] = below.ravel()[idx] + frac * share.ravel()[idx]
+        below += share
+    return u.reshape(f.shape)
+
+
+def local_rank(f, sigma, levels=48, seed=0):
+    """Each pixel replaced by the share of its *neighbourhood* below it,
+       Gaussian-weighted, on a torus.
+
+    A global rank makes the whole tile's histogram flat and says nothing about
+    any part of it. That is enough for a stationary field and not enough for a
+    high-passed photograph: MaskDither reads the mask a window at a time, and a
+    window whose values are not uniform dithers that region to the wrong
+    density. Ranking locally asks for the property that is actually needed.
+
+    Computed as a soft CDF -- the locally-weighted fraction below each of a
+    ladder of thresholds, interpolated at each pixel's own value -- so it costs
+    a blur per rung rather than a sort per window, and has no block grid in it.
+    Monotone inside any neighbourhood, so the sample's local ordering is kept;
+    only the comparison between distant regions changes, which is what was
+    wrong.
+
+    **Ties are spread at random, and the first version of this got it wrong.**
+    A pixel's value usually repeats somewhere in its neighbourhood -- after
+    quantise(0.9) a dithered sample has six distinct values in the whole tile --
+    and a plain CDF gives every member of a tie group the same local fraction,
+    so the global rank that follows orders them by position. That is exactly the
+    raster-gradient failure rank_order_random exists to prevent, reintroduced
+    one neighbourhood at a time: it took greyd's window flatness from 0.022 to
+    0.178, eight times *worse* than doing nothing. Each pixel is therefore
+    placed uniformly at random between the share strictly below its value and
+    the share at or below it, which is what a random tie-break means locally."""
+    f = np.asarray(f, np.float64)
+    vals = np.unique(f)
+    # The ladder is the values themselves when there are few -- the discrete
+    # case must be exact, since that is where the tie mass is -- and quantiles
+    # of them when there are many.
+    ts = vals if vals.size <= levels else np.unique(np.quantile(f, np.linspace(0.0, 1.0, levels)))
+    if ts.size < 2:
+        return np.zeros_like(f)
+
+    below = np.stack([wrap_blur(f < t, sigma) for t in ts])       # share  <  t
+    at    = np.stack([wrap_blur(f <= t, sigma) for t in ts])      # share <=  t
+
+    i = np.clip(np.searchsorted(ts, f, side='left'), 0, ts.size - 1)
+    lo = np.take_along_axis(below, i[None], 0)[0]
+    hi = np.take_along_axis(at,    i[None], 0)[0]
+
+    # Between rungs (only possible when the ladder was subsampled) interpolate
+    # from the rung below; on a rung, spread the tie group across its own share.
+    on_rung = np.isclose(f, ts[i])
+    j = np.clip(i - 1, 0, ts.size - 1)
+    lo = np.where(on_rung, lo, np.take_along_axis(at, j[None], 0)[0])
+    hi = np.where(on_rung, hi, np.take_along_axis(below, i[None], 0)[0])
+
+    u = np.random.default_rng(seed).random(f.shape)
+    return lo + u * np.maximum(hi - lo, 0.0)
+
+
+def ndtri(p):
+    """Inverse normal CDF, Acklam's rational approximation (~1e-9), so this
+       needs no scipy."""
+    a=[-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,
+       1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00]
+    b=[-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,
+       6.680131188771972e+01,-1.328068155288572e+01]
+    c=[-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,
+       -2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00]
+    d=[7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,
+       3.754408661907416e+00]
+    out = np.empty_like(p)
+    lo, hi = p < 0.02425, p > 1-0.02425
+    mid = ~(lo | hi)
+    q = np.sqrt(-2*np.log(p[lo]))
+    out[lo] = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = np.sqrt(-2*np.log(1-p[hi]))
+    out[hi] = -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p[mid]-0.5; r = q*q
+    out[mid] = (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+    return out
+
+
+def poly_basis(shape, deg):
+    """Polynomial terms in coordinates normalised to [-1, 1], as columns."""
+    h, w = shape
+    y, x = np.mgrid[0:h, 0:w]
+    x = (2.0*x/max(w-1, 1) - 1.0).ravel()
+    y = (2.0*y/max(h-1, 1) - 1.0).ravel()
+    cols = [np.ones_like(x)]
+    for d in range(1, deg+1):
+        for k in range(d+1):
+            cols.append((x**(d-k)) * (y**k))
+    return np.stack(cols, 1)
+
+
+def poly_grid_mask(shape, n):
+    """An n x n grid of small patches, for fitting on sample points rather than
+       on the whole field."""
+    h, w = shape
+    m = np.zeros(shape, bool)
+    r = max(2, min(h, w)//(4*n))
+    for gy in np.linspace(r, h-r-1, n).astype(int):
+        for gx in np.linspace(r, w-r-1, n).astype(int):
+            m[gy-r:gy+r+1, gx-r:gx+r+1] = True
+    return m
+
+
+def poly_flatten(field, deg, blur=0.0, grid=0, robust=0, rounds=1, divide=True):
+    """Remove a smooth surface instead of high-passing.
+
+    For `direct` the sample is meant to be grain and nothing else, so its only
+    low-frequency content is a gradient or vignetting -- a handful of degrees
+    of freedom. Fitting and removing those is a different thing from a
+    high-pass, and the difference is what a polynomial *cannot* do: a degree-2
+    surface has six coefficients for the whole tile, so it cannot put structure
+    into any neighbourhood. A high-pass removes a local mean at every scale
+    down to its cutoff, which is what breaks the coupling between local mean
+    and local grain amplitude and leaves the amplitude bare for the ranking to
+    turn into density error.
+
+    Divide rather than subtract, because grain is multiplicative in density --
+    a denser region is both darker and grainier, measured r = +0.57 -- so
+    dividing flattens the amplitude as well as the mean.
+
+    **The divisor is floored**, and that is not caution. Fitting an
+    unconstrained surface to a field that approaches zero gives a divisor that
+    crosses it, and the quotient then runs to 1e7; it reads as the method
+    failing when it is the fit being asked for something impossible.
+
+    **No blur before the fit, and never a toroidal one.** Least squares over
+    fifty thousand pixels already averages the grain out, so smoothing first
+    buys nothing and costs the borders. With a *wrap* it costs everything: on a
+    96-to-128 ramp a sigma-32 toroidal blur puts the bright end beside the dark
+    one and hands the fit a field spanning 106 to 119 instead of 98 to 127, so
+    the surface comes out half the size it should be and dividing leaves a
+    residual of 4.60 where fitting the field directly leaves 0.29. That is the
+    hazard CLAUDE.md records for wrap-padding anything with a gradient, met
+    head-on by a method whose entire purpose is gradients. `blur` is kept as an
+    option, reflecting rather than wrapping, because --poly-robust selects on
+    residuals and those are grain unless something has smoothed it.
+
+    **`rounds` does nothing, and that is the point.** Least squares with a
+    fixed basis is an orthogonal projection: the residual is orthogonal to
+    everything the basis can express, so a second fit finds exactly 0.0000.
+    Divide is not a linear projection and so is not quite idempotent, but it
+    converges in one pass -- 0.094 against the first round's 5.649. Iteration
+    buys something only when something changes between passes, which means
+    raising the degree or changing which points are fitted. It is kept because
+    an inert `rounds` is a *check*: while the fit was still being taken from a
+    toroidal blur, rounds moved the answer, because each pass was chipping at a
+    differently wrong one.
+
+    **`robust` diverges on grain and should not be used on it.** Trimming to
+    the best-fitting points assumes the discarded ones are foreign -- picture
+    detail over a smooth background, the case it was proposed for. A grain
+    field has no outliers: the residuals *are* the signal, so each pass keeps
+    the pixels that already agree with the current surface and the fit chases
+    its own tail. Over four passes on Kodak-4X-1 the surface range runs 5.6,
+    24.8, 36.8, 41.1 -- eight times the real gradient, invented out of grain."""
+    f = np.asarray(field, np.float64).copy()
+    for _ in range(max(1, rounds)):
+        lo = (cv2.GaussianBlur(f, (0, 0), blur, blur, borderType=cv2.BORDER_REFLECT)
+              if blur > 0 else f)
+        A = poly_basis(f.shape, deg)
+        b = lo.ravel()
+        sel = poly_grid_mask(f.shape, grid).ravel() if grid else np.ones(b.size, bool)
+        for _ in range(robust + 1):
+            c, *_ = np.linalg.lstsq(A[sel], b[sel], rcond=None)
+            if robust:
+                res = np.abs(A @ c - b)
+                keep = res <= np.quantile(res[sel], 0.6)
+                if (sel & keep).sum() > A.shape[1]*4:
+                    sel = sel & keep
+        surf = (A @ c).reshape(f.shape)
+        if divide:
+            floor = max(abs(surf.mean()) * 0.05, 1e-3)
+            f = f / np.maximum(surf, floor) * surf.mean()
+        else:
+            f = f - surf + surf.mean()
+    return f
+
+
+def parametric(f, sigma=12.0):
+    """Symmetrise the field globally, then flatten each neighbourhood's mean
+       and spread.
+
+    Both halves are needed and neither alone is enough. A global rank maps
+    value to rank with one function, so a region whose distribution differs
+    from the rest gets a different *mean* rank -- which is a density error. It
+    differs in two ways: scale, because grain amplitude scales with density,
+    and shape, because the high-passed field is skewed (+1.47 on Kodak-4X-1).
+    Scale alone is harmless on a symmetric field -- measured, 0.74 against 2.51
+    -- so the symmetrising comes first and the normalising second.
+
+    Monotone globally, so it reorders nothing by itself; what it changes is how
+    one region compares with another, which is exactly what was wrong."""
+    n = f.size
+    r = np.empty(n)
+    r[np.argsort(np.asarray(f, np.float64).ravel(), kind='stable')] = (np.arange(n)+0.5)/n
+    g = ndtri(r).reshape(f.shape)
+    amp = np.sqrt(np.maximum(wrap_blur(g*g, sigma) - wrap_blur(g, sigma)**2, 1e-12))
+    return (g - wrap_blur(g, sigma))/amp
+
+
+# Set by a variant that has already produced a ranking. Quantising such a
+# field again re-creates ties in the one thing it exists to get right -- the
+# fine local ordering -- and the global rank then breaks them at random:
+# measured 27.8 on the ramp against 12.5 without.
+ALREADY_RANKED = [False]
+
+
+def to_mask(f):
+    """The field as a finished threshold mask, by whichever ranking --rank asks
+       for. The final global rank is kept either way: it costs nothing on an
+       already-uniform field and it is what guarantees the exact flat histogram
+       and the random tie-break."""
+    q = f if ALREADY_RANKED[0] else quantise(f, args.quantise)
+    if args.rank == 'local':
+        # Mixed rather than switched: the local rank fixes the density and
+        # costs grain, so the useful setting may be part of the way. Both sides
+        # are rankings of the same field, so a convex mix of them is monotone
+        # wherever they agree and interpolates where they do not.
+        loc = local_rank(q, args.rank_sigma)
+        a = args.rank_mix
+        q = loc if a >= 1.0 else (1.0 - a) * rank_flat_rnd(q) / 254.0 + a * loc
+    return rank_flat_rnd(q)
+
+
+def window_flatness(m, win=32):
+    """How far each window's value histogram is from the uniform one a threshold
+       mask needs: mean KS distance over non-overlapping `win` squares.
+
+    This is the measure `swing` should have been. Ranking *pins* the local mean
+    -- a flat mask sits at ~127 everywhere by construction -- so the local-mean
+    spread cannot see a window that is uniform in the wrong proportions. On the
+    repro that motivated this, the two masks' local-mean spread is identical at
+    every scale while this reads 0.048 against 0.107."""
+    m = np.asarray(m, np.float64)
+    out = []
+    for y in range(0, m.shape[0] - win + 1, win):
+        for x in range(0, m.shape[1] - win + 1, win):
+            v = np.sort(m[y:y + win, x:x + win].ravel()) / 254.0
+            u = (np.arange(v.size) + 0.5) / v.size
+            out.append(np.abs(v - u).max())
+    return float(np.mean(out)) if out else float('nan')
+
+
+def rank_rnd_swing(f):
+    """Swing of the ranked mask, quantised first and with ties broken at random.
+
+    Random rather than stable, because stable breaks ties by pixel index and a
+    tie group then becomes a raster ramp -- an artefact of the sort, not of the
+    field. Random is the neutral choice and so the fair one to judge a field by."""
+    return swing(to_mask(f))
+
+
+def bands(f):
+    """Where the field's power sits: coarser than 64 px, 16-64 px, finer than
+       16 px, as percentages. A field fit to be ranked into a threshold mask has
+       almost all of it in the fine band."""
+    f = np.asarray(f, np.float64)
+    P = np.abs(np.fft.fft2(f - f.mean())) ** 2
+    H, W = P.shape
+    fy = np.fft.fftfreq(H)[:, None]; fx = np.fft.fftfreq(W)[None, :]
+    r = np.sqrt(fy ** 2 + fx ** 2)
+    tot = max(P.sum() - P[0, 0], 1e-30)
+    return (P[(r > 0) & (r < 1 / 64)].sum() / tot * 100,
+            P[(r >= 1 / 64) & (r < 1 / 16)].sum() / tot * 100,
+            P[r >= 1 / 16].sum() / tot * 100)
+
+
+def work(t):
+    """Edge mismatch over interior difference, per axis, averaged. How much
+       there is to repair.
+
+    Undefined when an axis has no interior variation to divide by, which is not
+    exotic: any image that is constant along one axis does it, a plain gradient
+    included. Returns nan then rather than dividing, because a number computed
+    from a zero denominator is worse than an admission."""
+    t = np.asarray(t, dtype=np.float64)
+    hi = np.abs(np.diff(t, axis=1)).mean()
+    vi = np.abs(np.diff(t, axis=0)).mean()
+    scale = max(np.abs(t).mean(), 1e-12)
+    if hi < 1e-9 * scale or vi < 1e-9 * scale:
+        return float('nan')
+    return (np.abs(t[:, -1] - t[:, 0]).mean() / hi +
+            np.abs(t[-1, :] - t[0, :]).mean() / vi) / 2
+
+
+# --- the pieces ------------------------------------------------------------
+
+def rank_flat(c):
+    """Flat 0..254 by rank -- what makes a field a threshold mask."""
+    m = np.empty(c.size, np.uint8)
+    m[np.argsort(c.ravel(), kind='stable')] = np.round(np.arange(c.size) * 254 / (c.size - 1))
+    return m.reshape(c.shape)
+
+def rank_flat_rnd(c, seed=None):
+    """Flat 0..254 by rank with equal values randomised."""
+    rng = np.random.default_rng(seed)
+    noise = rng.random(c.size)
+    order = np.lexsort((noise, c.ravel()))
+    m = np.empty(c.size, np.uint8)
+    m[order] = np.round(np.arange(c.size) * 254 / (c.size - 1))
+    return m.reshape(c.shape)
+
+
+def hp_reflect(x):
+    blur = cv2.GaussianBlur(x, (0, 0), SIG, SIG, borderType=cv2.BORDER_REFLECT)
+    #cv2.imwrite("blurr.png",blur);
+    return x - blur
+
+
+def hp_wrap(x, r=SIG):
+    """High-pass as if the tile were a torus. Padding by 3 sigma is the cheap
+       equivalent of tiling 3x3 -- beyond that the Gaussian is under 1% of peak
+       -- and OpenCV will not take BORDER_WRAP for a blur directly."""
+    p = int(np.ceil(3 * r))
+    h, w = x.shape
+    big = cv2.copyMakeBorder(x, p, p, p, p, cv2.BORDER_WRAP)
+    blur = cv2.GaussianBlur(big, (0, 0), r, r, borderType=cv2.BORDER_REFLECT)
+    crop = blur[p:p + h, p:p + w]
+    #cv2.imwrite("blur.png",crop);
+    #cv2.imwrite("big.png",big);
+    return x - crop
+
+def lp_wrap(x,sig=SIG):
+    """Low-pass as if the tile were a torus. Padding by 3 sigma is the cheap
+       equivalent of tiling 3x3 -- beyond that the Gaussian is under 1% of peak
+       -- and OpenCV will not take BORDER_WRAP for a blur directly."""
+    p = int(np.ceil(3 * sig))
+    h, w = x.shape
+    big = cv2.copyMakeBorder(x, p, p, p, p, cv2.BORDER_WRAP)
+    blur= cv2.GaussianBlur(big, (0, 0),sig, sig,
+                                borderType=cv2.BORDER_REFLECT)[p:p + h, p:p + w]
+    cv2.imwrite("blur.png",blur);
+    cv2.imwrite("big.png",big);
+    return  blur
+
+
+def hp_toroidal(f):
+    """High-pass a field that is already a torus, keeping it one -- the Python
+       twin of maskutil::highpass_toroidal. Modifies in place."""
+    p = min(int(np.ceil(3 * SIG)), f.shape[0], f.shape[1])
+    big = cv2.copyMakeBorder(f, p, p, p, p, cv2.BORDER_WRAP)
+    f -= cv2.GaussianBlur(big, (0,0), SIG, SIG,
+                          borderType=cv2.BORDER_REFLECT)[p:p+f.shape[0], p:p+f.shape[1]]
+
+
+def periodic(u, kr=1.0, kc=1.0, sm=1.0):
+    """Moisan's periodic + smooth decomposition (2011).
+
+    u = p + s with s smooth and carrying the whole boundary jump, so p tiles.
+    kr and kc scale the row and column boundary data; the solve is linear, so
+    they scale that axis's correction. Both 1.0 is the standard decomposition
+    and what the C++ does."""
+    u = np.asarray(u, dtype=np.float64)
+    M, N = u.shape
+    v = np.zeros_like(u)
+    dr = kr * (u[-1, :] - u[0, :]); v[0, :] += dr; v[-1, :] -= dr
+    dc = kc * (u[:, -1] - u[:, 0]);  v[:, 0] += dc; v[:, -1] -= dc
+    q = np.arange(M)[:, None]; r = np.arange(N)[None, :]
+    den = 2 * np.cos(2 * np.pi * q / M) + 2 * np.cos(2 * np.pi * r / N) - 4
+    den[0, 0] = 1
+    S = np.fft.fft2(v) / den
+    S[0, 0] = 0
+    return u - np.real(np.fft.ifft2(S))
+
+
+def fit_damped(tile, iters=24):
+    """Per-axis correction strength that lands the wrap difference on that
+       axis's interior difference. Monotone in k, so bisect."""
+    hi = np.abs(np.diff(tile, axis=1)).mean()
+    vi = np.abs(np.diff(tile, axis=0)).mean()
+    ks = [1.0, 1.0]
+    for axis, target in ((0, vi), (1, hi)):
+        lo, high = 0.0, 2.0
+        for _ in range(iters):
+            mid = (lo + high) / 2
+            k = list(ks); k[axis] = mid
+            t = periodic(tile, k[0], k[1])
+            got = (np.abs(t[-1, :] - t[0, :]).mean() if axis == 0
+                   else np.abs(t[:, -1] - t[:, 0]).mean())
+            if got > target: lo = mid
+            else: high = mid
+        ks[axis] = (lo + high) / 2
+    return ks
+
+
+def mincut_path(d):
+    """Lowest-cost connected path down a cost band, closed at the wrap.
+
+    d is L x k: L steps, k places the cut may sit at each step. Returns p, with
+    |p[i+1] - p[i]| <= 1 so the cut is connected, and p[L-1] == p[0] so it
+    closes -- without which the cut itself is a seam on the other axis.
+
+    Both ends are pinned rather than merely brought within 1 of each other. The
+    two are not the same: a step of 1 at the wrap does not cost a near-miss, it
+    splices in a pixel from a whole tile away, which is an arbitrary value and
+    not a bounded error. Pinning is free here because the DP is already run once
+    per starting column.
+
+    Efros & Freeman's minimum error boundary cut (SIGGRAPH 2001), with the
+    single-source DP replaced by k of them run at once -- cost[s, i] is the best
+    path so far that started at s and is now at i."""
+    L, k = d.shape
+    cost = np.full((k, k), np.inf)
+    cost[np.arange(k), np.arange(k)] = d[0]
+    back = np.zeros((L, k, k), np.int8)
+    for y in range(1, L):
+        left  = np.full((k, k), np.inf); left[:, 1:]   = cost[:, :-1]
+        right = np.full((k, k), np.inf); right[:, :-1] = cost[:, 1:]
+        stack = np.stack([left, cost, right])
+        j = stack.argmin(axis=0)
+        back[y] = j - 1
+        cost = d[y] + np.take_along_axis(stack, j[None], 0)[0]
+    s = int(np.argmin(cost[np.arange(k), np.arange(k)]))
+    p = np.empty(L, np.int32); p[L - 1] = s
+    for y in range(L - 1, 0, -1):
+        p[y - 1] = p[y] + back[y, s, p[y]]
+    return p
+
+
+def quilt_axis(c, keep, ov, axis):
+    """Cut `c` down to `keep` along `axis` so that what remains wraps.
+
+    `c` is `keep + ov` long on this axis, so its first `ov` entries and its last
+    `ov` are two candidates for the same band: the crop's own start, and the
+    continuation of what will become the tile's far edge. Every output pixel is
+    taken from one or the other and never mixed, which is the whole reason to
+    prefer this to a blend -- nothing is averaged, so nothing about the grain is
+    altered anywhere, and the tile is still literally made of sample.
+
+    The cut is placed where the two candidates agree, so the switch is where the
+    discontinuity is smallest. d[.., i] prices it exactly: switching at i means
+    leaving the continuation at i-1 and taking the original at i, and the jump
+    that creates is how far apart the two fields are there."""
+    c = np.moveaxis(np.asarray(c, np.float64), axis, 1)
+    n = c.shape[1]
+    if n != keep + ov:
+        sys.exit(f"quilt_axis: got {n} where {keep}+{ov} expected")
+    head, tail = c[:, :ov], c[:, keep:keep + ov]
+    p = mincut_path(((head - tail) ** 2))
+    out = c[:, :keep].copy()
+    take = np.arange(ov)[None, :] < p[:, None]      # from the continuation
+    out[:, :ov] = np.where(take, tail, head)
+    return np.moveaxis(out, 1, axis)
+
+
+_NORMAL_Q = {}
+
+def normal_quantiles(n):
+    """The n evenly spaced standard-normal quantiles, cached by n."""
+    q = _NORMAL_Q.get(n)
+    if q is None:
+        inv = NormalDist().inv_cdf
+        q = np.array([inv((i + 0.5) / n) for i in range(n)])
+        _NORMAL_Q[n] = q
+    return q
+
+
+def gaussianise(f, seed=0):
+    """Rank-map the field onto a standard normal -- Heitz & Neyret's T.
+
+    The blending below happens in this space and nowhere else, because the
+    Gaussian is the family closed under the weighted sums it takes: a*X + b*Y of
+    two independent N(0,1) is N(0, a^2+b^2), so weights with a^2+b^2 = 1 leave
+    the distribution exactly as it was. Blending the raw field instead preserves
+    the variance but not the shape -- two independent draws average toward a
+    Gaussian whatever they started as -- and after a global rank that shows up
+    as the band holding systematically different values from the interior.
+
+    Ties break at random for the same reason rank_flat_rnd does: pixel order
+    would turn a tie group into a raster ramp."""
+    rng = np.random.default_rng(seed)
+    flat = np.asarray(f, np.float64).ravel()
+    order = np.lexsort((rng.random(flat.size), flat))
+    g = np.empty(flat.size)
+    g[order] = normal_quantiles(flat.size)
+    return g.reshape(f.shape)
+
+
+def match_to(g, ref):
+    """T^-1: put g's ranks back onto ref's own values.
+
+    Global and monotone, so it cannot disturb a join. It is a no-op as far as
+    the finished mask goes -- rank_flat would undo it -- and it is here so the
+    field columns read in the sample's grey levels, comparable with every other
+    row, rather than in sigma."""
+    out = np.empty(g.size)
+    out[np.argsort(g.ravel(), kind='stable')] = np.sort(np.asarray(ref, np.float64).ravel())
+    return out.reshape(g.shape)
+
+
+def blend_axis(g, axis, band):
+    """Blend g with its half-shift along `axis`, preserving the variance.
+
+    g breaks where it wraps on this axis; its half-shift breaks half a tile away
+    instead. Weighting g to zero at its own wrap and the shift to zero at the
+    shift's therefore leaves every point covered by a copy that is smooth there.
+    The weights depend on this axis alone, so one pass per axis composes: the
+    second pass rolls and mixes along the other axis, which a field already
+    joined along this one survives unchanged.
+
+    Two copies suffice *per axis*, and only per axis. A single two-copy blend in
+    2D is impossible: the tile breaks on the whole cross {x=0} u {y=0} and its
+    half-shift on {x=W/2} u {y=H/2}, and those crosses intersect -- at (0, H/2)
+    one weight would have to be 0 and 1 at once.
+
+    a^2 + b^2 = 1 rather than a + b = 1 is the substance of the method. Linear
+    weights average two independent fields and so halve the variance mid-band,
+    which is the washed-out cross that made blending look unusable and is why
+    directmask.cpp rejects it; these leave the variance alone. Slowly varying
+    weights also leave the autocovariance alone, since a(x)a(x+h) + b(x)b(x+h)
+    is ~1 for h inside the correlation length -- hence --band.
+
+    g is zero-mean, which is load-bearing and not incidental: a + b runs up to
+    sqrt(2) across the band, so any offset would come back as a low-frequency
+    swing exactly where the seam was -- the defect being escaped, by a new
+    route."""
+    n = g.shape[axis]
+    x = np.arange(n, dtype=np.float64)
+    d = np.minimum(x, n - 1 - x)                # distance to this axis's wrap
+    u = np.clip(d / max(band, 1e-9), 0.0, 1.0)
+    u = u * u * (3 - 2 * u)                     # smoothstep: C1 weights
+    norm = np.sqrt(u * u + (1 - u) ** 2)
+    shape = (-1, 1) if axis == 0 else (1, -1)
+    a = (u / norm).reshape(shape)
+    b = ((1 - u) / norm).reshape(shape)
+    return a * g + b * np.roll(g, n // 2, axis=axis)
+
+
+def half_shift_rho(t):
+    """Correlation of the tile with its half-shift, per axis.
+
+    The blend assumes the two copies it mixes are independent; where they are
+    not, Var(aX+bY) = a^2 + b^2 + 2ab*rho and a^2+b^2 = 1 normalises to the
+    wrong thing. Grain reads ~0 at half a tile. A sample with structure at that
+    period does not, and this says so rather than letting the rest of the table
+    imply the method worked."""
+    t = np.asarray(t, np.float64); t = t - t.mean()
+    v = max((t * t).mean(), 1e-30)
+    return ((t * np.roll(t, t.shape[1] // 2, axis=1)).mean() / v,
+            (t * np.roll(t, t.shape[0] // 2, axis=0)).mean() / v)
+
+
+def centre_crop(f, w, h):
+    y0, x0 = (f.shape[0] - h) // 2, (f.shape[1] - w) // 2
+    if y0 < 0 or x0 < 0:
+        sys.exit(f"sample is {f.shape[1]}x{f.shape[0]}, too small for a {w}x{h} tile")
+    return f[y0:y0 + h, x0:x0 + w]
+
+
+def build(raw, name):
+    """Returns (field before any repair, field after) so `work` can be read off
+       the first and `seam` off the second."""
+    ALREADY_RANKED[0] = False
+    if name == 'plain':
+        t = centre_crop(raw, W, H);      return t, t
+    if name == 'equalise':
+        # What `dither --mask-method direct` builds by default, and what --check
+        # compares against: the raw sample equalised locally, then the cut.
+        # Already a continuous quantile, so it is not quantised again.
+        if EQ <= 0:
+            return build(raw, 'direct')     # what the program does at 0
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        eq = local_quantile(raw, EQ)
+        ALREADY_RANKED[0] = True
+        a = quilt_axis(centre_crop(eq, W + ov, H + ov), W, ov, axis=1)
+        return centre_crop(eq, W, H), quilt_axis(a, H, ov, axis=0)
+    if name == 'direct':
+        # What `dither --mask-method direct --direct-equalise 0` builds:
+        # high-pass the whole sample reflecting, cut the tile out of a
+        # crop `overlap` larger on each axis, close the join along the
+        # lowest-cost path through that band. Nothing filters afterwards.
+        #
+        # `before` is the plain crop of the same high-passed sample, so `work`
+        # reads how much join there was to make rather than including the
+        # high-pass as though it were part of the repair.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        hp = hp_reflect(raw)
+        c = centre_crop(hp, W + ov, H + ov)
+        a = quilt_axis(c, W, ov, axis=1)
+        return centre_crop(hp, W, H), quilt_axis(a, H, ov, axis=0)
+    if name == 'sharp':
+        # The same construction as `direct`, with a *sharper* high-pass: apply
+        # (1 - G) twice. The complaint this answers is that a single
+        # (1 - G) at 32 px is only the half-power point, so a natural image's
+        # subject survives in the 32-64 px band at full amplitude, and ranking
+        # draws that at full contrast. Squaring the transfer function leaves the
+        # grain band alone -- G is already ~0 there, so (1-G)^2 ~ 1 -- while
+        # cutting what is left below the knee quadratically.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        hp = hp_reflect(hp_reflect(raw))
+        c = centre_crop(hp, W + ov, H + ov)
+        a = quilt_axis(c, W, ov, axis=1)
+        return centre_crop(hp, W, H), quilt_axis(a, H, ov, axis=0)
+    if name == 'flatten':
+        # `direct`, then flatten the finished tile's local mean toroidally. The
+        # tile is a torus by then, so hp_wrap is the right filter, and it runs
+        # *before* the quantise that exists to take filter residue back out.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        hp = hp_reflect(raw)
+        c = centre_crop(hp, W + ov, H + ov)
+        a = quilt_axis(c, W, ov, axis=1)
+        t = quilt_axis(a, H, ov, axis=0)
+        return centre_crop(hp, W, H), hp_wrap(t)
+    if name == 'divhp':
+        # A *multiplicative* high-pass: divide by the blur instead of
+        # subtracting it. Film grain is multiplicative in density -- its
+        # amplitude scales with how much silver is there -- so subtracting the
+        # local mean removes the mean and leaves the amplitude varying with it,
+        # which is what a global rank cannot then represent. Dividing removes
+        # both in one step and leaves a field whose local distribution is the
+        # same everywhere.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        blur = cv2.GaussianBlur(raw, (0, 0), SIG, SIG, borderType=cv2.BORDER_REFLECT)
+        hp = raw / np.maximum(blur, 1.0)
+        c = centre_crop(hp, W + ov, H + ov)
+        a = quilt_axis(c, W, ov, axis=1)
+        return centre_crop(hp, W, H), quilt_axis(a, H, ov, axis=0)
+    if name in ('param', 'localrank', 'paramlocal'):
+        # direct's construction, then one of the two corrections for the
+        # density defect a high-passed natural image leaves behind, or both.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        hp = hp_reflect(raw)
+        c = centre_crop(hp, W + ov, H + ov)
+        a = quilt_axis(c, W, ov, axis=1)
+        t = quilt_axis(a, H, ov, axis=0)
+        before = centre_crop(hp, W, H)
+        # Both corrections return a field on their own scale -- parametric is
+        # unit-variance, local_rank is [0,1] -- and to_mask quantises at
+        # --quantise, which means "0.9 of an input code". So put them back on
+        # the tile's own scale first, or that step collapses the field to a
+        # handful of levels: measured, grainfit 1.9 against 23.3.
+        def like(x):
+            return x * (t.std() / max(np.asarray(x, np.float64).std(), 1e-12))
+        if name == 'param':
+            return before, like(parametric(t))
+        f = like(parametric(t)) if name == 'paramlocal' else t
+        # **Quantise before the local rank, not after.** The tie handling in
+        # local_rank is what spreads a tie group across its own share of the
+        # neighbourhood; quantising afterwards instead puts coarse steps back
+        # into an already-uniform field, which measured 27.7 against 12.5 on
+        # the ramp. to_mask quantises again, but by then the field is on the
+        # tile's scale where 0.9 of an input code is a fine step.
+        ALREADY_RANKED[0] = True
+        return before, local_rank(quantise(f, args.quantise), args.rank_sigma)
+    if name == 'poly':
+        # `direct` with the high-pass replaced by a polynomial flattening.
+        # Fitted on the crop rather than on the whole sample: the point is to
+        # make *this tile* flat, and a surface fitted over a 3877px scan is
+        # near enough constant across a 256px tile to do nothing at all.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        c = centre_crop(raw, W + ov, H + ov)
+        c = poly_flatten(c, args.poly_degree, args.poly_blur, args.poly_grid,
+                         args.poly_robust, args.poly_rounds, not args.poly_subtract)
+        a = quilt_axis(c, W, ov, axis=1)
+        return centre_crop(raw, W, H), quilt_axis(a, H, ov, axis=0)
+    if name == 'moisan':
+        t = centre_crop(raw, W, H);      return t, periodic(t)
+    if name == 'wraphp':
+        t = centre_crop(raw, W, H);      return t, hp_wrap(t)
+    if name == 'hpafter':
+        t = centre_crop(raw, W, H);      return t, hp_wrap(periodic(t))
+    if name == 'mirror':
+        q = hp_wrap(centre_crop(raw, W // 2, H // 2))
+        top = np.hstack([q, np.fliplr(q)])
+        return q, np.vstack([top, np.flipud(top)])
+    if name == 'quilt':
+        # Efros & Freeman's minimum error boundary cut. Production order, same
+        # as blendpre: high-pass the whole sample, then cut. Columns first on
+        # the full taller crop, so the bottom `ov` rows -- which the row pass is
+        # about to splice in -- have had their column join made too.
+        ov = int(args.overlap or max(8, round(2 * SIG)))
+        c = centre_crop((raw), W + ov, H + ov)
+        a = quilt_axis(c, W, ov, axis=1)
+        return centre_crop(c, W, H), quilt_axis(a, H, ov, axis=0)
+    if name == 'blendpre':
+        # The production order: high-pass the whole sample, cut the tile out of
+        # the middle of it, then blend. No filter runs after the blend, which
+        # matters more than it looks -- see `blend` below.
+        t = centre_crop(hp_reflect(raw), W, H)
+        g = gaussianise(quantise(t, args.quantise))
+        g = blend_axis(g, 1, args.band or args.highpass)
+        g = blend_axis(g, 0, args.band or args.highpass)
+        return t, match_to(g, t)
+    if name in ('blendraw', 'blend'):
+        # The one construction here with no global solve in it. Everything the
+        # blend changes is inside --band of a wrap, so there is no mechanism by
+        # which the interior can acquire a smooth field -- which is what rules
+        # out `moisan` and `wraphp` whatever they do to the seam.
+        #
+        # `blend` then high-passes exactly as `direct` does, so the two differ
+        # in the seam construction and in nothing else; `blendraw` is the bare
+        # blend, and stands to `blend` as `moisan` stands to `direct`.
+        t = centre_crop(raw, W, H)
+        g = gaussianise(quantise(t, args.quantise))
+        g = blend_axis(g, 1, args.band or args.highpass)
+        g = blend_axis(g, 0, args.band or args.highpass)
+        out = match_to(g, t)
+        if name == 'blend':
+            hp_toroidal(out)
+        return t, out
+    if name == 'damped':
+        t = hp_wrap(centre_crop(raw, W, H))
+        kr, kc = fit_damped(t)
+        print(f' kr{kr} kc{kc}\n')
+        return t, periodic(t, kr/4, kc/4)
+    sys.exit(f"unknown variant {name}")
+
+
+# --- reporting -------------------------------------------------------------
+
+def registry(highpass, key):
+    r = subprocess.run([DITHER, '--explain', '--no-config',
+                        '--mask-method', 'direct', '--mask-highpass', str(highpass),
+                        '--mask-sample', os.path.join(ROOT, 'examples', 'Kodak-4X-1-crop.png')],
+                       capture_output=True, text=True)
+    for line in (r.stdout + r.stderr).splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[0] == key and f[2] in ('derived', 'default', 'user'):
+            return float(f[1])
+    sys.exit(f"build/dither --explain did not report {key}")
+
+if args.params:
+    bad = 0
+    for hp in (0.0, 8.0, 32.0, 64.0):
+        sig = SIGMA_PER_PX * hp
+        for key, mine in (('direct.equalise', EQUALISE_PER_SIGMA * sig),
+                          ('direct.overlap', max(8, round(2 * sig)))):
+            theirs = registry(hp, key)
+            ok = abs(theirs - mine) < 5e-3      # --explain prints three decimals
+            bad += not ok
+            print(f"  {'ok  ' if ok else 'FAIL'} highpass {hp:g}: {key} "
+                  f"bench {mine:.3f}, program {theirs:.3f}")
+    sys.exit(1 if bad else 0)
+if not args.paths:
+    ap.error('name at least one IMAGE')
+
+if args.score:
+    print(f"{'mask':<34}{'seam cols':>11}{'seam rows':>11}")
+    for p in args.paths:
+        m = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        if m is None: sys.exit(f"cannot read {p}")
+        print(f"  {os.path.basename(p)[:31]:<32}{seam_z(m):>11.2f}{seam_z(m.T):>11.2f}")
+    sys.exit(0)
+
+variants = [v.strip() for v in args.variants.split(',') if v.strip()]
+check_failed = False
+print(f"tile {W}x{H}, highpass {args.highpass:g}px (sigma {SIG:.2f}), "
+      f"equalise sigma {EQ:.2f}\n")
+print(f"{'sample':<20}{'variant':<9}{'work':>6}{'seam c':>8}{'seam r':>8}"
+      f"{'>64px':>7}{'16-64':>7}{'swing':>8}{'vs plain':>9}{'tiebrk':>8}{'mask':>7}"
+      f"{'flat':>8}")
+print('-' * 105)
+for p in args.paths:
+    raw = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+    if raw is None: sys.exit(f"cannot read {p}")
+    raw = raw.astype(np.float64)
+    base = None
+    for i, v in enumerate(variants):
+        before, after = build(raw, v)
+        lo, mid, hi = bands(after)
+        sw = swing(after)
+        if base is None: base = sw          # `plain` is the reference row
+        w = work(before)
+        tb = tiebreak(before, after)
+        print(f"{os.path.basename(p)[:18] if i == 0 else '':<20}{v:<9}"
+              f"{'   n/a' if np.isnan(w) else format(w, '>6.2f')}"
+              f"{seam_z(after):>8.2f}{seam_z(after.T):>8.2f}"
+              f"{lo:>7.2f}{mid:>7.2f}{sw:>8.3f}"
+              f"{sw / base if base else float('nan'):>8.2f}x"
+              f"{('     own' if tb == 0 else '     n/a' if np.isnan(tb) else format(tb, '>8.3f'))}"
+              f"{rank_rnd_swing(after):>7.2f}"
+              f"{window_flatness(to_mask(after)):>8.4f}")
+        m = to_mask(after)
+        if args.write:
+            os.makedirs(args.write, exist_ok=True)
+            stem = os.path.splitext(os.path.basename(p))[0]
+            cv2.imwrite(os.path.join(args.write, f"{stem}_{v}_before.png"), np.tile(before, (2, 2)))
+            cv2.imwrite(os.path.join(args.write, f"{stem}_{v}_after.png"),  np.tile(after, (2, 2)))
+            cv2.imwrite(os.path.join(args.write, f"{stem}_{v}_flat.png"),   np.tile(m, (2, 2)))
+            cv2.imwrite(os.path.join(args.write, f"{stem}_{v}.png"),   m)
+    if {'blend', 'blendraw'} & set(variants):
+        # A property of the tile, not of any variant, so it is reported once
+        # rather than as a column that would be blank on every other row.
+        rc, rr = half_shift_rho(centre_crop(raw, W, H))
+        print(f"{'':<20}half-shift correlation {rc:+.3f} cols {rr:+.3f} rows"
+              f"{'   -- blend assumes ~0' if max(abs(rc), abs(rr)) > 0.05 else ''}")
+    if args.check:
+        # The same mask from the program, to confirm this file models it. Into
+        # a directory of its own with real PNG names: a fixed /tmp path could
+        # hand back a mask an earlier run left there, and the program refuses
+        # an output it cannot encode -- /dev/null -- before building anything.
+        # A build that fails is a failed check, said with the program's own
+        # error, not an empty line and a zero exit.
+        with tempfile.TemporaryDirectory(prefix='seamlab.') as work:
+            out = os.path.join(work, 'mask.png')
+            try:
+                r = subprocess.run([DITHER,
+                                    os.path.join(ROOT, 'examples', 'm039crop.png'),
+                                    '--threshold', 'mask', '--mask-method', 'direct',
+                                    '--mask-sample', os.path.abspath(p),
+                                    '--mask-size', args.size,
+                                    '--mask-highpass', str(args.highpass),
+                                    '--direct-equalise', repr(EQ),
+                                    '--no-config', '--mask-out', out,
+                                    '--out', os.path.join(work, 'out.png')],
+                                   capture_output=True, text=True)
+            except OSError as e:
+                r = subprocess.CompletedProcess([DITHER], 127, '', str(e))
+            m = cv2.imread(out, cv2.IMREAD_GRAYSCALE) if r.returncode == 0 else None
+        if m is None:
+            why = (r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}").splitlines()
+            print(f"{'':<22}{'(dither)':<9}  build failed (exit {r.returncode}): {why[-1]}")
+            check_failed = True
+        else:
+            # The program returns a ranked mask, so this row is the one place
+            # ranking is unavoidable; the field columns are left blank rather
+            # than filled with numbers that are not comparable to the rows above.
+            print(f"{'':<22}{'(dither)':<9}{'':>6}{seam_z(m):>8.2f}{seam_z(m.T):>8.2f}"
+                  f"{'':>7}{'':>7}{'':>7}{'':>8}{'':>9}   <- ranked; seam only")
+    print()
+
+if check_failed:
+    sys.exit(1)

@@ -1,0 +1,58 @@
+Triage of the follow-up review in doc/improvements5.txt (lines 638 onward; the
+first 637 are review 4, already triaged in triage4.txt).
+
+All eight accepted, and five of them are regressions I introduced while fixing
+review 4. Each was reproduced here before being accepted.
+
+R01:Done: maketexture lost its default highpass of 0. The rewrite dropped the
+local variable and reads mask.highpass's registry default of 32 instead, while
+--help still promises 0. Confirmed: a plain run announces "highpass 32".
+R02:Done: the completion returns one invalid candidate for every enumeration.
+_dither_words sets IFS to newline and its callers pass space-separated lists, so
+compgen -W sees one word. Confirmed: --mask-method offers a single candidate
+"blue dft markov inpaint direct", and the prefix "ma" offers none. Introduced by
+the quoting fix for F18.
+R03:Done: mean matching measures pixels it then discards. The offset comes from
+the whole scan and is applied to a centre crop whose mean may differ, so unequal
+widths can acquire a step that was not there before.
+R04:Done: mean matching clips and rounds. convertTo keeps CV_8U, so the shift
+saturates at 0 and 255 -- not the pure translation the comment claims, and it
+changes the texture statistics before any model sees them.
+R05:Done: the cached-result validation uses bounds of its own rather than the
+registry's, and rounds integers before checking them. A markov temperature of
+0.001 passes a (0,10] test and then throws against the registry's [0.01,100];
+a cached inpaint 2.6 is reported as a calibration of 3.
+R06:Done: maketexture still accepts options it never reads. The accepted()
+predicate admits a whole generator namespace, including max_size and
+max_repeats, which belong to dither's size policy. --dft-max-size garbage is
+taken, unvalidated and unused.
+R07:Done: --list-options omits --mask-out, maketexture lists blue and direct
+parameters although neither method can be chosen, and the filename branches
+still split a path containing a space.
+R08:Done: the F19 installer fixes are not in the tree at all, and the triage
+said they were. Two string replacements silently matched nothing -- Graham had
+edited those functions between my reading the file and writing it -- and the
+same commit reverted his `build/dither` back to `dither`. Marking F19 done
+without re-reading the result is the actual defect here; the missing error
+handling is only its symptom.
+
+Lower-impact items, all done
+--------------------------------
+* The absolute 1e-6 tolerance still rounds a user's fraction: --set
+  seed=1.0000005 passes where --seed rejects it. The comment claiming every
+  integer parameter sits below 1e6 is false for seed.
+* The struct-default test does not cover markov.temp, which is derived and does
+  not match MarkovParams{}. The claim should be narrowed to what is asserted.
+* maketexture duplicates set_typed and the inpaint parameter factory.
+* samplecheck's new assertions check spelling, not acceptance -- they passed
+  through R02, R06 and R07.
+* The 10% selection margin was measured under the old global-coherence
+  objective. The figure is no longer evidence for the current one.
+
+Process note
+------------
+Five of eight are regressions, and three of those (R01, R02, R08) came from
+edits applied by blind string substitution without re-reading the result. The
+suite did not catch them because it asserts spelling rather than behaviour,
+which is the same observation the review makes about samplecheck. Fixes below
+are verified by running the thing, not by inspecting the patch.

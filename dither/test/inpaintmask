@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Prototype mask generator: fill each pixel from the whole neighbourhood.
+
+  inpaintmask <sample> <out.png> [--size N] [--radius R] [--iters N]
+              [--levels 2,1] [--groups N] [--db N] [--dims K]
+              [--highpass PX] [--seed N]
+
+Not a test. It writes a mask, and `dither --mask-in <out.png>` uses it, so it is
+a fourth generator living outside the C++ program while it is decided whether it
+earns a place inside it.
+
+Why it exists: markov pools *pairwise* conditionals, and CLAUDE.md records what
+that costs — a white-noise floor, because a pool of pairwise conditionals is
+broader than the true joint, and worming, because sweeping the pooled field
+below its ordering temperature phase-separates it. This conditions on the joint
+neighbourhood instead, and non-parametrically: to decide a pixel, find the
+neighbourhoods in the sample that most resemble its own and copy what they had
+in the middle. Efros-Leung, coarse to fine.
+
+Measured on 4Xcrop at 256x256 (patchfit distance, real patch = 2.8; levelfit
+clump and its shadow-to-highlight slope, film = 6.63; maskfit spectrum):
+
+                       patchfit   clump  slope   spectrum
+    this                   10.7   0.185   3.44      0.671
+    dft                    14.0   0.419   1.06      0.012
+    markov                 30.8   0.202   2.43      0.724
+
+It wins everywhere except the spectrum, which dft matches by construction and
+nothing else will beat. It also passes `colstats --group 16` on the ramp, which
+a markov mask does not, and no 5x5 tile of its output appears anywhere in the
+sample, so it synthesises rather than copies.
+
+Two things carried it, and both were wrong in the first version:
+
+  --groups   Updating in place. Deciding every pixel from the *previous* sweep
+             leaves each one individually plausible and neighbouring pairs
+             inconsistent, which showed up as the envelope-correlation column
+             Cfm sitting at -8 in every variant. Splitting the sweep into 16
+             in-place passes took the total from 19.6 to 15.6 at no cost, which
+             is what the C++ Gibbs sampler had been doing all along.
+  --db       Candidate neighbourhoods, and the binding constraint by a distance:
+             40k/100k/250k measure 15.6/12.9/10.7, with Cfm going -5.8/-2.8/-2.6.
+             A closer match is one whose centre is more consistent with the
+             neighbourhood that asked for it. This is also the reason to move it
+             into C++, where an approximate-nearest-neighbour index turns the
+             brute-force scan below into something sub-linear in the database.
+
+Six variants measure worse and are not worth trying again:
+
+  2x2 holes, filled disjointly   39.9   neighbouring blocks come from unrelated
+                                        places and leave a seam every 2 px
+  overlapping patches, averaged  22.2   removes the per-pixel noise and the real
+                                        fine detail with it: Efine -25, Cfm +13
+  sampling among the 8 best      28.8   the queries already differ enough; this
+                                        only adds noise
+  24 PCA dims instead of 12      28.3   matches too precisely and over-commits
+  radius 4 instead of 3          31.8   the database thins out in a bigger space
+  radius 5                       50.9   likewise, worse
+
+What is left is Cmc, the envelope correlation between the mid and coarse
+octaves, at about -5, and a slight over-clumping at the midpoint. Neither
+responds to any of the knobs here.
+"""
+import argparse, sys
+import numpy as np
+import cv2
+
+ap = argparse.ArgumentParser()
+ap.add_argument('sample')
+ap.add_argument('out')
+ap.add_argument('--size', type=int, default=256, help="mask side (default 256)")
+ap.add_argument('--radius', type=int, default=3,
+                help="neighbourhood half-width (default 3; 4 and 5 measure worse)")
+ap.add_argument('--iters', type=int, default=6, help="sweeps per level (default 6)")
+ap.add_argument('--levels', default='2,1',
+                help="downsample factors, coarse first (default 2,1). A radius-3 "
+                     "window sees 3 px and can say nothing about structure at 20; "
+                     "at a 2x downsample it reaches twice as far")
+ap.add_argument('--groups', type=int, default=16,
+                help="split each sweep into this many in-place passes (default 16). "
+                     "1 is Jacobi -- every pixel decided from the previous sweep, so "
+                     "no pixel ever sees a neighbour's new value")
+ap.add_argument('--db', type=int, default=250000,
+                help="sample neighbourhoods to match against (default 250000). The "
+                     "binding constraint: 40k/100k/250k measure 15.6/12.9/10.7")
+ap.add_argument('--dims', type=int, default=12, help="PCA dimensions kept (default 12)")
+ap.add_argument('--highpass', type=float, default=32.0,
+                help="as dither's --mask-highpass (default 32, as the prototype was "
+                     "measured; dither's inpaint now defaults to 0)")
+ap.add_argument('--seed', type=int, default=1)
+args = ap.parse_args()
+
+
+def blur(f, sigma):
+    H, W = f.shape
+    fy = np.fft.fftfreq(H)[:, None]; fx = np.fft.fftfreq(W)[None, :]
+    return np.real(np.fft.ifft2(np.fft.fft2(f) * np.exp(-2*np.pi**2*sigma**2*(fy**2+fx**2))))
+
+
+def rank_flat(a):
+    """Values replaced by their rank. Both the sample and the field are held
+       flat throughout, which is what the mask must be anyway and what makes a
+       neighbourhood from one comparable to a neighbourhood from the other."""
+    o = np.argsort(a.ravel(), kind='stable')
+    out = np.empty(a.size); out[o] = (np.arange(a.size) + 0.5) / a.size
+    return out.reshape(a.shape)
+
+
+def downsample(S, f):
+    if f == 1: return S
+    H, W = S.shape[0]//f*f, S.shape[1]//f*f
+    return rank_flat(S[:H, :W].reshape(H//f, f, W//f, f).mean((1, 3)))
+
+
+def project(X, k, basis=None):
+    if basis is None:
+        mu = X.mean(0)
+        _, _, Vt = np.linalg.svd(X[:4000] - mu, full_matrices=False)
+        basis = (mu, Vt[:k].T.astype(np.float32))
+    mu, V = basis
+    return np.ascontiguousarray(((X - mu) @ V).astype(np.float32)), basis
+
+
+def nearest(Q, D, chunk=4096):
+    """Nearest row of D for each row of Q. One matmul per chunk; the full
+       distance matrix would be tens of gigabytes."""
+    d2 = (D * D).sum(1)
+    out = np.empty(len(Q), np.int64)
+    for i in range(0, len(Q), chunk):
+        out[i:i+chunk] = np.argmin(d2[None, :] - 2.0 * (Q[i:i+chunk] @ D.T), 1)
+    return out
+
+
+img = cv2.imread(args.sample, cv2.IMREAD_GRAYSCALE)
+if img is None:
+    sys.exit(f"cannot read {args.sample}")
+S = img.astype(np.float64)
+if args.highpass:
+    S = S - blur(S, 0.1874 * args.highpass)
+S = rank_flat(S)
+
+r = args.radius
+ring = [(dy, dx) for dy in range(-r, r+1) for dx in range(-r, r+1) if (dy, dx) != (0, 0)]
+rng = np.random.default_rng(args.seed)
+levels = [int(v) for v in args.levels.split(',')]
+if any(args.size % f for f in levels):
+    sys.exit(f"--size {args.size} is not divisible by every level in {args.levels}")
+
+F = None
+for f in levels:
+    Sl = downsample(S, f)
+    if min(Sl.shape) < 2*r + 4:
+        sys.exit(f"sample downsampled by {f} is {Sl.shape[1]}x{Sl.shape[0]}, too small "
+                 f"for a radius-{r} neighbourhood")
+    H = W = args.size // f
+    ys = rng.integers(r, Sl.shape[0]-r-1, args.db)
+    xs = rng.integers(r, Sl.shape[1]-r-1, args.db)
+    N = np.stack([Sl[ys+dy, xs+dx] for dy, dx in ring], 1).astype(np.float32)
+    C = Sl[ys, xs].astype(np.float32)
+    D, basis = project(N, args.dims)
+
+    if F is None:
+        F = rank_flat(rng.random((H, W))).astype(np.float32)
+    else:
+        up = H // F.shape[0]
+        F = rank_flat(np.repeat(np.repeat(F, up, 0), up, 1)).astype(np.float32)
+    qy, qx = (a.ravel() for a in np.meshgrid(np.arange(H), np.arange(W), indexing='ij'))
+    for _ in range(args.iters):
+        # In place, in a random order, a fraction of the pixels at a time, so
+        # that later pixels condition on the values earlier ones just took.
+        # Deciding every pixel from the previous sweep instead leaves each one
+        # individually plausible and the pairs inconsistent.
+        perm = rng.permutation(len(qy))
+        for gi in range(args.groups):
+            sel = perm[gi::args.groups]
+            sy, sx = qy[sel], qx[sel]
+            # Toroidal, so the mask tiles: an edge pixel's neighbourhood wraps.
+            Q = np.stack([F[(sy+dy) % H, (sx+dx) % W] for dy, dx in ring], 1).astype(np.float32)
+            F[sy, sx] = C[nearest(project(Q, args.dims, basis)[0], D)]
+        F = rank_flat(F).astype(np.float32)
+    print(f"  level 1/{f}: {H}x{W}, {args.iters} sweeps over {args.db} neighbourhoods")
+
+# 0..254, never 255, so pure white always passes -- dither's own convention.
+# And in threshold order, as dither writes a sample-based mask: lowest where the
+# field is brightest, since MaskDither lights the lowest cells first.
+out = np.empty(F.size, np.uint8)
+out[np.argsort(-F.ravel(), kind='stable')] = np.round(np.arange(F.size) * 254 / (F.size - 1))
+if not cv2.imwrite(args.out, out.reshape(F.shape)):
+    sys.exit(f"cannot write {args.out}")
+print(f"wrote {args.out} ({args.size}x{args.size}); score it with "
+      f"patchfit {args.sample} {args.out}")

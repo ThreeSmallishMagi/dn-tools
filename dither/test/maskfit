@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Spectral fit between synthesised masks and the sample they imitate.
+
+  maskfit <sample> <mask> [<mask> …] --method M | --highpass PX [--scale S] [--bins n] [--csv FILE]
+
+Runs `maskstats --field` on the sample (high-passed, so its subject is not what
+gets compared) and on each mask (as-is — a mask is already the field), then
+reports the RMS difference in log10 power over the shared radial bins. 0 is a
+perfect match; 1 means an average factor of 10 out at every frequency.
+
+Bins below 1/highpass are excluded. The sample has been deliberately emptied
+there, so a ratio against it would measure the high-pass rather than the mask —
+including them roughly doubles every figure, which is why these numbers are not
+comparable to a fit quoted without the exclusion.
+
+--scale S scores a mask built with `dither --mask-scale S`, whose grain is S
+times coarser than the sample's on purpose: mask frequency f is compared against
+the sample at f*S. Without it such a mask is scored against the wrong part of
+the spectrum entirely and the number means nothing.
+
+Above 0.5/S cycles/px the sample says nothing at all, so no fit is possible
+there and the `alias` column reports what the mask put there anyway, as a
+percentage of its own peak power. That is the column to watch: it is where a
+frequency remap goes wrong, by folding the spectrum back on itself instead of
+stopping. A mask-scale bug read 15.8% there against 0.02% once fixed.
+
+Two cautions on reading the result. A mask must be histogram-flat, and ranking
+an image flat is a nonlinear transform that moves its spectrum: a real 128x128
+crop of the sample, ranked, scores about 0.30 here rather than 0. And a spectrum
+is second-order only — two masks with identical spectra can differ completely in
+how their level sets clump, which is what `levelfit` measures.
+"""
+import argparse, csv, os, subprocess, sys, tempfile
+import numpy as np
+import maskref
+
+MASKSTATS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'maskstats')
+
+ap = argparse.ArgumentParser()
+ap.add_argument('sample', help="the image the masks are imitating")
+ap.add_argument('mask', nargs='+', help="mask(s) to score")
+maskref.add_arguments(ap, "the sample's spectrum")
+ap.add_argument('--scale', type=float, default=1.0, metavar='S',
+                help="the --mask-scale the mask was built with: compare mask "
+                     "frequency f against the sample at f*S (default 1)")
+ap.add_argument('--bins', type=int, default=64, help="radial bins (default 64)")
+ap.add_argument('--csv', metavar='FILE', help="write per-mask per-bin ratios here")
+args = ap.parse_args()
+maskref.resolve(args, ap)
+
+
+def spectrum(path, highpass=None):
+    """Radial power spectrum via maskstats --field; returns (freq, power, summary)."""
+    fd, csv_path = tempfile.mkstemp(suffix='.csv')
+    os.close(fd)
+    cmd = [MASKSTATS, path, '--field', '--bins', str(args.bins), '--csv', csv_path]
+    if highpass:
+        cmd += ['--highpass', str(highpass)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr.strip() or r.stdout.strip() or f"maskstats failed on {path}")
+    with open(csv_path) as fh:
+        rows = [(float(x['freq']), float(x['power'])) for x in csv.DictReader(fh)]
+    os.unlink(csv_path)
+    summary = next(l for l in r.stdout.splitlines() if l.startswith('RESULT'))
+    return np.array([f for f, _ in rows]), np.array([p for _, p in rows]), summary
+
+
+sf, sp, summary = spectrum(args.sample, args.highpass)
+cut = 1.0 / args.highpass if args.highpass else 0.0
+print(f"sample {os.path.basename(args.sample)}: {summary[len('RESULT '):]}")
+# The sample's spectrum lives on a square in frequency, so scaling shrinks that
+# square: the largest radius entirely inside it is 0.5/scale, and that is where a
+# radial comparison can still be made fairly. Between there and sqrt(2)x further
+# the annulus is only partly defined -- a mask that correctly zeroes the corners
+# reads as attenuated -- and past that nothing is defined at all, which is what
+# `alias` measures.
+edge  = sf.max() if args.scale == 1 else 0.5 / args.scale
+outer = sf.max() / args.scale
+print(f"comparing {sf[sf >= cut].size} radial bins from {cut:.3f} cycles/px up"
+      + (f", scale={args.scale:g} (band edge {edge:.3f})" if args.scale != 1 else "") + "\n")
+print(f"{'':<28} {'fit':>6}  {'lo':>6} {'mid':>6} {'hi':>6}"
+      + (f" {'alias':>7}" if args.scale != 1 else ""))
+
+csv_rows, results = [], []
+for path in args.mask:
+    mf, mp, _ = spectrum(path)
+    # Both grids come from the same linspace over [0, sqrt(0.5)], so equal bin
+    # indices mean equal frequencies; a bin maskstats dropped for having too few
+    # cells simply drops out of the comparison.
+    if args.scale == 1:
+        keep = np.intersect1d(sf.round(6), mf.round(6))
+        a = sp[np.searchsorted(sf.round(6), keep)]
+        b = mp[np.searchsorted(mf.round(6), keep)]
+    else:
+        # The sample's own bins are the wrong frequencies now, so interpolate it
+        # onto f*scale. Bins past the sample's top are dropped by `ok` below.
+        keep = mf
+        a = np.interp(keep * args.scale, sf, sp, right=0.0)
+        b = mp
+    ok = (a > 0) & (b > 0) & (keep >= cut) & (keep <= edge)
+    if not ok.any():
+        sys.exit(f"no overlapping frequency bins between {args.sample} and {path}")
+    av, bv = a[ok], b[ok]
+    if args.scale != 1:
+        # Compare shape, not level. maskstats normalises each field's power over
+        # its whole spectrum, and a scaled mask is deliberately compared over
+        # part of it, so the two normalisations are not the same quantity --
+        # leaving them raw makes removing energy outside the band look like an
+        # error inside it, at every frequency including ones nothing touched.
+        av, bv = av / av.mean(), bv / bv.mean()
+    d, f = np.log10(bv / av), keep[ok]
+
+    def band(lo, hi):
+        sel = d[(f >= lo) & (f < hi)]
+        # A scaled mask's band edge can fall below one of these, leaving nothing
+        # compared in it. That is not a score of zero, so it is not printed as one.
+        return f"{np.sqrt((sel ** 2).mean()):6.3f}" if sel.size else f"{'—':>6}"
+
+    fit = float(np.sqrt((d ** 2).mean()))
+    # Energy the mask placed where the sample defines nothing. A little is
+    # unavoidable: ranking a field flat is a nonlinear transform and generates
+    # harmonics. A lot means the remap folded rather than stopped.
+    beyond = mp[(mf > outer * 1.15) & (mp > 0)]
+    alias = float(100 * beyond.mean() / mp.max()) if beyond.size and mp.max() > 0 else 0.0
+    results.append((path, fit, alias))
+    print(f"{os.path.basename(path):<28} {fit:6.3f}  "
+          f"{band(0, 0.1)} {band(0.1, 0.3)} {band(0.3, 1.0)}"
+          + (f" {alias:6.2f}%" if args.scale != 1 else ""))
+    csv_rows += [(os.path.basename(path), fr, av, bv, dv)
+                 for fr, av, bv, dv in zip(f, a[ok], b[ok], d)]
+
+if args.csv:
+    with open(args.csv, 'w') as fh:
+        fh.write('mask,freq,sample_power,mask_power,log10_ratio\n')
+        for m, fr, av, bv, dv in csv_rows:
+            fh.write(f"{m},{fr:.6f},{av:.6f},{bv:.6f},{dv:.6f}\n")
+
+print()
+for path, fit, alias in results:
+    print(f"RESULT kind=spectral mask={os.path.basename(path)} fit={fit:.4f} "
+          f"highpass={args.highpass:g} scale={args.scale:g} alias={alias:.3f}")

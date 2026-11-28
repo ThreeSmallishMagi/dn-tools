@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Does the documentation name a --mask-* option the program does not have?
+
+Four of the five documentation defects found in the September 2026 UX review
+were one failure: prose naming an option that had been demoted or renamed.
+`--mask-weights` was the worst -- retired to `--set markov.weights=`, still
+written as a flag in four documents, and already recorded in ARCHITECTURE.md as
+a known defect that nobody chased down.
+
+That is a class, not an incident, so it gets a structural check rather than four
+corrections. This is `shellcheck`'s argument in test/run: the rule worth holding
+is broader than the instance that broke it.
+
+**Scope is every `--mask-*` flag and nothing else**, which is narrow on purpose.
+Those belong unambiguously to `dither`, and every option this project has
+actually retired was one of them. The test tools use plain names -- colstats
+takes `--group`, maskfit `--highpass`, seamlab `--write` -- so a wider net
+catches those and cmake's `--build` instead, and a check that cries wolf is
+worse than none. If a non-mask option is ever retired, add it here with its
+replacement.
+
+The authority is the parser, not `--help`: an option exists if `cli.cpp`
+compares against it or the generator table declares it. Whether `--help`
+*documents* it is the reverse question and would be a different check.
+"""
+import os, re, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# Retired names the documents may still mention, because saying where an option
+# went is a service. Each mention must read as history -- the check requires it
+# -- which is what stops this list becoming a way to silence a real defect.
+def retired(path):
+    """Old option names, read from the table the program answers them with.
+
+    cli.cpp already knows every rename -- it prints "X is now Y" when one is
+    typed -- so keeping a second list here was a second thing to update, and a
+    mention this check accepted would then be one the program did not explain.
+    Names retired without a replacement stay below, since nothing in the
+    program has occasion to mention them.
+    """
+    src = open(path).read()
+    out = dict(re.findall(r'\{"(--[a-z0-9-]+)",\s*"(--[a-z0-9-]+)"\}', src))
+    return {k: 'renamed ' + v for k, v in out.items()}
+
+
+# Retired with nothing in cli.cpp's rename table to point at, because each was
+# demoted to --set or split in two rather than renamed one-for-one. Everything
+# renamed is read from cli.cpp instead -- see retired().
+#
+# These hints said "internal; use --set blue.eps=" until the naming work gave
+# every parameter a flag of its own, at which point all five replacements became
+# documented options and "internal" became false. They are advice a developer
+# reads, so nothing failed; it was simply out of date, which is the same drift
+# this file exists to catch one level up.
+RETIRED_UNREPLACED = {
+    '--mask-eps':      'now --blue-eps',
+    '--mask-radius':   'now --blue-radius, and derived from blue.eps',
+    '--mask-iters':    'split into --dft-iters and --markov-iters',
+    '--mask-periodic': 'replaced by --direct-overlap',
+    '--mask-attend':   'withdrawn; use --markov-weights mi',
+    '--mask-weights':  'now --markov-weights',
+}
+PAST = re.compile(r'\b(used to|was|were|retired|replaced|renamed|removed|former|'
+                  r'formerly|no longer|deprecat|obsolete|superseded|instead of|'
+                  r'demoted|withdrawn|not exist|should not have|history|'
+                  r'historical|split|predate|done)\w*\b', re.I)
+
+# Markdown strikethrough is the least ambiguous way a document can say "this is
+# no longer so", and a plan that strikes a line through a task and writes
+# **Done.** beside it is not telling anyone to type what it struck out.
+STRUCK = re.compile(r'~~.*?~~', re.S)
+
+# Maintained guidance only. A dated third-party report quotes options as
+# findings and is not the project speaking: both of these name the commit they
+# were run against, so the commands in them are evidence and rewriting one would
+# make its figures unmatchable against the run that produced them.
+SKIP = {'UXImprovements.md', 'MarkovParameterStudy.md'}
+
+
+def window(lines, at):
+    """The mention and two lines either side -- or its whole table.
+
+    Two lines is enough for markdown's wrapping to carry a clause onto the next
+    line and no more, which is what stops one "was" in a fifty-entry option list
+    from licensing every retired name in the block.
+
+    A table is the exception, and not a grudging one: a column *header* is the
+    label for every row under it however long the table gets, so `| was | is now
+    |` says "renamed" about the fortieth row as much as the first. Without this
+    the only way to write that table is to repeat the word in all forty rows.
+    """
+    lo, hi = max(0, at - 2), at + 3
+    if lines[at].lstrip().startswith('|'):
+        while lo > 0 and lines[lo - 1].lstrip().startswith('|'):
+            lo -= 1
+        lo = max(0, lo - 2)          # the sentence introducing the table
+        while hi < len(lines) and lines[hi].lstrip().startswith('|'):
+            hi += 1
+    return '\n'.join(lines[lo:hi])
+
+
+def real_flags():
+    """Every option the program accepts, asked of the program.
+
+    It used to scan the sources for `"--flag"` string literals, which worked
+    only while every option was written out as one. They are not: a parameter's
+    option is now derived from its key, so --mask-method exists without the
+    string `"--mask-method"` appearing anywhere -- and the check duly reported
+    four real options as nonexistent the moment the hand-written arms went.
+
+    --list-options is the authority: it enumerates every flag the parser
+    accepts, straight from the registry, which is what the completion script
+    relies on. --help is read as well but is not enough on its own -- it
+    describes the generator ceilings as prose, so --mask-size-w and its like
+    appear in neither its text nor any string literal, and a check that only
+    read --help called two real options nonexistent.
+
+    The source scan stays as a fallback for the literals the pipeline flags are
+    still written as, in case neither can be run at all.
+    """
+    flags = set()
+    exe = os.path.join(ROOT, 'build', 'dither')
+    if os.path.exists(exe):
+        for args in (['--list-options'], ['--help']):
+            try:
+                out = subprocess.run([exe] + args, capture_output=True, text=True,
+                                     timeout=30).stdout
+                flags |= set(re.findall(r'(?<![\w-])(--[a-z][a-z0-9-]*)', out))
+            except Exception:
+                pass
+    for name in ('cli.cpp', 'generators.cpp'):
+        flags |= set(re.findall(r'"(--[a-z0-9-]+)"',
+                                open(os.path.join(ROOT, name)).read()))
+    return flags
+
+
+def usage_prose(path):
+    """cli.cpp's help text, without the code around it.
+
+    The file both defines the options and describes them, so scanning it whole
+    would find every flag in its own parser and prove nothing. A flag inside a
+    quoted string is the parser; the help is a raw string literal, so take only
+    that -- what is left is prose, and prose is what goes stale."""
+    src = open(path).read()
+    # Blank out everything else rather than extracting, so a reported line
+    # number is the line in cli.cpp and not the line in some substring of it.
+    keep = [''] * (src.count('\n') + 1)
+    for m in re.finditer(r'R"\w*\((.*?)\)\w*"', src, re.S):
+        first = src.count('\n', 0, m.start(1))
+        for i, line in enumerate(m.group(1).split('\n')):
+            if first + i < len(keep):
+                keep[first + i] = line
+    return '\n'.join(keep)
+
+
+def documents():
+    yield os.path.join(ROOT, 'README.md')
+    yield os.path.join(ROOT, 'CLAUDE.md')
+    for f in sorted(os.listdir(os.path.join(ROOT, 'doc'))):
+        if f.endswith('.md') and f not in SKIP:
+            yield os.path.join(ROOT, 'doc', f)
+    # And the help text, which is documentation the program carries. Leaving it
+    # out is how --mask-cache came to be advertised for a week: the option was
+    # described in usage() and never added to the parser, so `dither
+    # --mask-cache` answered "Unknown option" while `dither --help` recommended
+    # it. Scanning only the .md files missed the one document a user is most
+    # likely to believe.
+    yield os.path.join(ROOT, 'cli.cpp')
+
+
+def paragraphs(text):
+    """(first line number, text) per blank-line-separated block.
+
+    Paragraph rather than line, because markdown wraps prose: "--mask-iters ...
+    and was split" routinely puts the flag and the word that marks it as history
+    on different lines."""
+    line, buf, start = 1, [], 1
+    for raw in text.split('\n'):
+        if raw.strip():
+            if not buf:
+                start = line
+            buf.append(raw)
+        elif buf:
+            yield start, '\n'.join(buf)
+            buf = []
+        line += 1
+    if buf:
+        yield start, '\n'.join(buf)
+
+
+def generators(path):
+    """Generator names, from the table rows in generators.cpp."""
+    src = open(path).read()
+    i = src.index('const std::vector<Generator>& generators()')
+    return re.findall(r'\{\s*"(\w+)",\s*(?:true|false),\s*(?:true|false),', src[i:])
+
+
+def missing_generator_entries(help_text, names):
+    """Generators with no entry of their own in the help's generator list.
+
+    Presence is not the test. `direct` was listed among --mask-method's values
+    and named in the section's opening sentence while having no entry
+    describing it, so anything that merely searched for the word would have
+    passed -- and a user reading the list would still find four generators
+    described where the program has five.
+
+    An entry is a line that begins with the name in the left-hand column, which
+    is how every other one is written.
+    """
+    return [n for n in names
+            if not re.search(r'(?m)^  %s\s{2,}\S' % re.escape(n), help_text)]
+
+
+def main():
+    retired_names = {**RETIRED_UNREPLACED,
+                     **retired(os.path.join(ROOT, 'cli.cpp'))}
+    # A retired name is not a real option even though cli.cpp writes it out as a
+    # string: the rename table quotes both halves, so the source scan finds the
+    # old name and would call it current. Retired wins over found, which is the
+    # only order that lets the rename table serve as the retired list at all.
+    real = real_flags() - set(retired_names)
+    mask_real = {f for f in real if f.startswith('--mask-')}
+    if len(mask_real) < 5:
+        print(f"flagcheck: found only {len(mask_real)} --mask-* options in the "
+              "sources; the extraction is broken, not the docs")
+        return 1
+
+    bad = []
+    for path in documents():
+        rel = os.path.relpath(path, ROOT)
+        text = usage_prose(path) if path.endswith('.cpp') else open(path).read()
+        for start, para in paragraphs(text):
+            lines = para.split('\n')
+            # A trailing hyphen or a `*` marks a prefix being discussed rather
+            # than an option being named: `--mask-*` is how the documents talk
+            # about the family, and it is not a flag anyone could type.
+            for flag in sorted(set(re.findall(r'(?<![\w-])(--mask-[a-z0-9-]*[a-z0-9])(?!\*)', para))):
+                if flag in real:
+                    continue
+                # The line the flag is actually on, not the paragraph's first:
+                # an option list is one paragraph and can be fifty lines long,
+                # so the start of it is not a useful place to be sent.
+                at = start + next((i for i, l in enumerate(lines) if flag in l), 0)
+                if flag in retired_names:
+                    near = window(lines, next((n for n, l in enumerate(lines)
+                                               if flag in l), 0))
+                    if not PAST.search(near) and not STRUCK.search(near):
+                        bad.append(f"  {rel}:{at}: {flag} is retired ({retired_names[flag]}) "
+                                   "but this paragraph reads as current usage")
+                    continue
+                bad.append(f"  {rel}:{at}: {flag} is not an option this program has")
+
+    # Every generator in the table, described in the help.
+    names = generators(os.path.join(ROOT, 'cli.cpp').replace('cli.cpp', 'generators.cpp'))
+    if len(names) < 3:
+        print(f"flagcheck: found only {len(names)} generators in the table; "
+              "the extraction is broken, not the help")
+        return 1
+    absent = missing_generator_entries(usage_prose(os.path.join(ROOT, 'cli.cpp')), names)
+    if absent:
+        print("FAIL  --help describes no such generator: " + ", ".join(absent))
+        print("  Every row of the table in generators.cpp needs an entry in the")
+        print("  generator list in cli.cpp's usage text.")
+        return 1
+
+    if bad:
+        print("FAIL  documentation names mask options the program does not have:")
+        print("\n".join(sorted(set(bad))))
+        print("\n  Fix the text, or -- if it genuinely was retired -- add it to")
+        print("  RETIRED_UNREPLACED in test/flagcheck and say so in the same paragraph.")
+        return 1
+    print(f"  {len(mask_real)} --mask-* options and {len(names)} generators; "
+          "no document names one that does not exist, and --help describes them all")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

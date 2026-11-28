@@ -1,0 +1,21 @@
+Re-measured 22 Nov 2026 on master: every case below is within 3/1000 linear in its
+worst 16-column band. The supersample 1/2 difference that remains is diffusion
+moving tone out of small dark regions, recorded in CLAUDE.md as expected.
+
+One is too light in the dark areas, one is too dark.  What is going on here?  
+dither examples/m039crop.png --supersample 2 && icat dither.png && analyse dither.png sixel:- examples/m039crop.png
+dither examples/m039crop.png --supersample 1 && icat dither.png && analyse dither.png sixel:- examples/m039crop.png
+
+Is this one the same defect or something new?
+No repro: build/dither examples/ramp_256x256.png --threshold blue --spatial 0.0 &&analyse
+repro:    build/dither examples/ramp_256x256.png --threshold blue --spatial 0.5  &&analyse
+repro but less visible:    build/dither examples/ramp_256x256.png --threshold blue --spatial 0.9  &&analyse
+most visible:    build/dither examples/ramp_256x256.png --threshold blue --spatial 0.5 --frames 10 &&analyse
+
+Weird spacing
+dither examples/ramp_256x256.png --threshold mask  --levels 3 --frames 4
+
+Systematic positive bias at about 80 and 180
+dither examples/ramp_256x256.png --threshold mask --spatial 0.5  --levels 4 --frames 8
+dither examples/ramp_256x256.png --threshold random --spatial 0.9  --levels 3 --frames 160
+test/colstats --group 16 dither.png

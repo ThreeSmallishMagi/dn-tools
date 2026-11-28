@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+# Run every check in this directory and report once at the end.
+#
+#   test/run                 everything
+#   test/run col             only the checks whose name contains "col"
+#
+# Works from anywhere: paths are resolved from this script's own location, and
+# the virtualenv is put on PATH because the checks shell out to each other by
+# name and would otherwise reach a python3 without cv2.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
+[ -d "$ROOT/dither_env/bin" ] && PATH="$ROOT/dither_env/bin:$PATH"
+export PATH
+
+# The suite gets its own config directory, so it neither reads nor writes the
+# one the developer is using. Two reasons, and the second is the one with teeth.
+# Politeness: a full run builds dozens of masks, and letting them into the real
+# mask cache would evict whatever is actually being worked on. And isolation:
+# the cache is keyed partly on the executable's identity, so a rebuilt binary
+# can never be served a stale mask -- but starting from an empty cache every
+# time means the suite does not have to rely on that being true, and every
+# generator is exercised at least once per run rather than possibly never.
+DITHER_TEST_CONFIG="$(mktemp -d)"
+export XDG_CONFIG_HOME="$DITHER_TEST_CONFIG"
+trap 'rm -rf "$DITHER_TEST_CONFIG"' EXIT
+
+if [ ! -x "$ROOT/build/unittest" ]; then
+    echo "build/unittest is missing -- run: cmake --build build" >&2
+    exit 1
+fi
+if [ ! -x "$ROOT/build/dither" ]; then
+    echo "no build/dither — run 'cmake --build build' first" >&2
+    exit 2
+fi
+if ! python3 -c 'import cv2' 2>/dev/null; then
+    echo "python3 cannot import cv2 — run 'install_deps', or put dither_env/bin on PATH" >&2
+    exit 2
+fi
+
+filter="${1:-}"
+declare -a names=() results=()
+fails=0
+
+run_one() {
+    local name="$1"; shift
+    if [ -n "$filter" ] && [[ "$name" != *"$filter"* ]]; then return; fi
+    printf '=== %s ===\n' "$name"
+    local start=$SECONDS
+    if "$@"; then
+        results+=("pass  $((SECONDS-start))s")
+    else
+        results+=("FAIL  $((SECONDS-start))s")
+        fails=$((fails+1))
+    fi
+    names+=("$name")
+    echo
+}
+
+# The two that assert: both exit non-zero when something is wrong.
+run_one coltest     "$HERE/coltest"
+run_one unittest    "$ROOT/build/unittest" "$ROOT/examples/ramp_256x256.png"
+run_one tonetest    "$HERE/tonetest"
+run_one impliedtest "$HERE/impliedtest"
+run_one devicetest  "$HERE/devicetest"
+
+run_one masktest    "$HERE/masktest"
+
+# --mask-scale must band-limit the target spectrum, not fold it. The sample says
+# nothing above 0.5/scale cycles/px; a remap that indexes past the end and wraps
+# puts a mirror image of the main lobe up there instead, which reads as fine
+# noise on grain that was asked to be coarse. maskfit's alias column is the
+# fraction of peak power sitting where nothing is defined — 15.8% when this was
+# broken, and the harmonics of the final rank alone once it was not.
+scale_check() {
+    local out; out="$(mktemp -d)"
+    local rc=0
+    for s in 2 4; do
+        "$ROOT/build/dither" "$ROOT/examples/m039crop.png" --mask-sample "$ROOT/examples/Kodak-4X-1.png" \
+            --mask-scale "$s" --mask-size 256x256 --no-config --mask-out "$out/m$s.png" \
+            --out "$out/d.png" >/dev/null 2>&1
+        local alias
+        alias="$("$HERE/maskfit" "$ROOT/examples/Kodak-4X-1.png" "$out/m$s.png" --scale "$s" \
+                 --method dft 2>/dev/null \
+                 | sed -n 's/.*alias=//p')"
+        if [ -n "$alias" ] && awk "BEGIN{exit !($alias < 1.0)}"; then
+            echo "  scale $s: ${alias}% out-of-band"
+        else
+            echo "  scale $s: ${alias:-?}% out-of-band — spectrum folded instead of stopping"
+            rc=1
+        fi
+    done
+    rm -rf "$out"
+    return $rc
+}
+run_one scalecheck scale_check
+
+# A --budget run has to learn this machine's speed, or it works from a
+# compiled-in guess for ever. The list of rates written to the config used to be
+# typed out — "blue.rate", "dft.rate", "markov.rate" — and a fourth generator was
+# added without anyone remembering the fourth string, so --budget could never
+# learn inpaint's speed and said so on every run. The list is derived from the
+# registry now; this checks the behaviour rather than the list, with the
+# generator that was broken.
+budget_check() {
+    local work; work="$(mktemp -d)"
+    local cfg="$work/rate.conf"
+    # Not --out /dev/null: imwrite fails on it, and with `set -o pipefail` a
+    # failing dither would mask what the grep below found.
+    local common=(--mask-sample "$ROOT/examples/Kodak-4X-1.png" --mask-method inpaint
+                  --mask-size 128x128 --set inpaint.db=20000 --set inpaint.iters=2
+                  --budget 60 --config "$cfg" --out "$work/d.png")
+    local rc=0 out
+    "$ROOT/build/dither" "$ROOT/examples/m039crop.png" "${common[@]}" >/dev/null 2>&1
+    if grep -q '^inpaint.rate' "$cfg" 2>/dev/null; then
+        echo "  first run recorded $(grep '^inpaint.rate' "$cfg")"
+    else
+        echo "  first run recorded no inpaint.rate — --budget cannot learn"; rc=1
+    fi
+    out="$("$ROOT/build/dither" "$ROOT/examples/m039crop.png" "${common[@]}" 2>&1 || true)"
+    case "$out" in
+        *"no measured speed"*) echo "  second run still has no measured speed"; rc=1 ;;
+        *)                     echo "  second run uses it" ;;
+    esac
+    rm -rf "$work"
+    return $rc
+}
+run_one budgetcheck budget_check
+
+# No path may be pasted into a shell command. --config, and the
+# XDG_CONFIG_HOME/HOME fallback behind it, are supplied from outside the
+# program: `mkdir -p '<path>'` handed to system() ran everything after the first
+# single quote in it, so `--config "/tmp/x'; rm -rf ~; '/c.conf"` was arbitrary
+# execution. <filesystem> does the same job with no shell involved.
+#
+# Structural rather than behavioural, deliberately. Reproducing the original
+# needs a mask build slow enough to trip the >0.25s cache write, which costs
+# ten seconds for one path; the rule worth holding — never hand a path to a
+# shell — is broader than the one place that broke it, and this holds all of it.
+shell_check() {
+    local files hits
+    files="$(cd "$ROOT" && git ls-files '*.cpp' '*.h' 2>/dev/null)"
+    [ -n "$files" ] || files="$(cd "$ROOT" && ls ./*.cpp ./*.h 2>/dev/null)"
+    # shellcheck disable=SC2086
+    hits="$(cd "$ROOT" && grep -n 'std::system *(\|[^_[:alnum:]]popen *(\|execlp *(\|execvp *(' $files 2>/dev/null)"
+    if [ -z "$hits" ]; then
+        echo "  no shell-outs in the sources"
+        return 0
+    fi
+    echo "$hits" | sed 's/^/  /'
+    echo "  a path handed to a shell is a command — use <filesystem>"
+    return 1
+}
+run_one shellcheck shell_check
+
+# --out-size, and specifically that it resamples once. With --supersample the
+# dither grid holds the sub-pixel information, so scaling from there is not the
+# same as resolving to the input's size and scaling that: the intermediate is 8
+# bits, and the second resample cannot recover what it dropped. Shrinking a 4096
+# grid to 512 measures 21.1/1000 linear against the truth in one step and 36.4
+# through 1024.
+#
+# The tone count is what separates the two paths cheaply. Each output pixel is
+# the mean of (side_in * supersample / side_out)^2 binary dither pixels, so a
+# 256 input at --supersample 4 --out-size 512 averages 2x2 and can hold 5 tones.
+# The via-the-input path would average 4x4 to 17 tones and then interpolate,
+# landing far above that. An exact ceiling rather than a range: a regression
+# here raises it, and nothing legitimate does.
+outsize_check() {
+    local work; work="$(mktemp -d)"
+    local rc=0 d="$ROOT/build/dither" ramp="$ROOT/examples/ramp_256x256.png"
+    local size
+    size() { python3 -c "
+import cv2,sys; i=cv2.imread(sys.argv[1],cv2.IMREAD_GRAYSCALE)
+print('%dx%d' % (i.shape[1], i.shape[0]))" "$1"; }
+
+    # Fit inside the square, aspect ratio kept, and 0 means leave it alone.
+    python3 -c "
+import cv2,numpy as np
+cv2.imwrite('$work/ns.png', np.tile(np.linspace(0,255,400,dtype=np.uint8),(160,1)))"
+    local want got
+    for pair in "200:200x80" "100:100x40" "800:800x320" "0:400x160"; do
+        want="${pair#*:}"
+        "$d" "$work/ns.png" --no-config --threshold mask --out-size "${pair%%:*}" \
+             --out "$work/o.png" >/dev/null 2>&1
+        got="$(size "$work/o.png")"
+        if [ "$got" = "$want" ]; then echo "  --out-size ${pair%%:*} -> $got"
+        else echo "  --out-size ${pair%%:*} -> $got, wanted $want"; rc=1; fi
+    done
+
+    # One resample, not two.
+    "$d" "$ramp" --no-config --threshold mask --supersample 4 --out-size 512 \
+         --out "$work/one.png" >/dev/null 2>&1
+    local tones
+    tones="$(python3 -c "
+import cv2,numpy as np,sys
+print(len(np.unique(cv2.imread(sys.argv[1],cv2.IMREAD_GRAYSCALE))))" "$work/one.png")"
+    if [ "$tones" -eq 5 ]; then
+        echo "  --supersample 4 --out-size 512 gives $tones tones — one resample"
+    else
+        echo "  --supersample 4 --out-size 512 gives $tones tones, expected 5 —"
+        echo "  resampled via the input's size, losing the supersampled detail"
+        rc=1
+    fi
+
+    # At exactly input x supersample the target is the dither grid, so nothing
+    # is averaged and the raw dither survives -- supersample without reducing,
+    # which is the main use. A 256 input at --supersample 8 --out-size 2048 must
+    # therefore write the two levels it dithered to and no intermediates.
+    "$d" "$ramp" --no-config --threshold mask --supersample 8 --out-size 2048 \
+         --out "$work/id.png" >/dev/null 2>&1
+    tones="$(python3 -c "
+import cv2,numpy as np,sys
+print(len(np.unique(cv2.imread(sys.argv[1],cv2.IMREAD_GRAYSCALE))))" "$work/id.png")"
+    if [ "$tones" -eq 2 ]; then
+        echo "  --supersample 8 --out-size 2048 keeps the grid whole, $tones tones"
+    else
+        echo "  --supersample 8 --out-size 2048 gave $tones tones, expected 2 —"
+        echo "  the target equals the dither grid, so nothing should be resampled"
+        rc=1
+    fi
+
+    # Every frame gets the output size, not just the average.
+    "$d" "$ramp" --no-config --threshold mask --frames 2 --save-frames \
+         --out-size 64 --out "$work/f.png" >/dev/null 2>&1
+    got="$(size "$work/f-0.png")"
+    if [ "$got" = "64x64" ]; then echo "  --save-frames writes frames at 64x64"
+    else echo "  --save-frames wrote a frame at $got, not 64x64"; rc=1; fi
+
+    rm -rf "$work"
+    return $rc
+}
+run_one outsizecheck outsize_check
+
+# On speed. The suite ran for 198 seconds and runs for 55, with every
+# assertion and every tolerance unchanged -- each check below was diffed
+# against its serial output and matches line for line.
+#
+# Three things were wrong, and only one of them was parallelism:
+#
+#   tonetest spent 70 of its 85 seconds rebuilding one void-and-cluster mask.
+#   --no-config turns the mask cache off, and seventy of its rows want the same
+#   tile -- none of levels, spacing, spatial or frames reaches the mask. An
+#   isolated XDG_CONFIG_HOME is what --no-config was actually wanted for.
+#
+#   samplecheck built inpaint masks to assert how --mask-sample resolves, which
+#   samples.cpp decides and every combining generator reports alike. dft says
+#   the same thing twenty-one times faster.
+#
+#   and the rest is that independent rows were run one at a time.
+#
+# What was not done: nothing was dropped, no tolerance widened, and --no-config
+# stays wherever a cache hit would make an assertion vacuous -- impliedtest and
+# masktest both assert against real builds and both keep it.
+
+# A refusal must be a refusal: non-zero, with the program's own sentence naming
+# what was wrong, and no output file. The third is the one that regresses
+# quietly, because a partial artifact looks exactly like a real one until
+# something reads it.
+run_one errorcheck "$HERE/errorcheck"
+
+# The config is documented as unable to affect a run -- it holds measurements,
+# and a measurement that cannot be trusted is one to take again. That was not
+# true: an out-of-range cached calibration reached P.set, which throws, and
+# took down a run the cache is supposed to be unable to influence.
+#
+# Calibrate honestly, keep the mask, then corrupt the stored answer every way
+# the file permits and require the same mask back. Each poisoned config sits in
+# a directory of its own, because the mask cache lives beside the config
+# (maskcache::dir_for is <config dir>/masks) and XDG_CONFIG_HOME does not move
+# it once --config is given; sharing one would let a run be served the honest
+# mask rather than build it. The settings are the smallest that still exercise
+# the search, because this is about the decision and not the texture.
+#
+# Every poisoning must actually change the file. The rate cases once rewrote a
+# markov.rate line the honest run never writes -- a 32x32 build is under the
+# time that records one -- so they changed nothing and still counted as passes.
+cachecheck() {
+    local work; work="$(mktemp -d)"
+    local rc=0 d="$ROOT/build/dither"
+    local args=("$ROOT/examples/ramp_256x256.png" --threshold mask --mask-method markov
+                --mask-sample "$ROOT/examples/Kodak-4X-1-crop.png" --mask-size 32x32
+                --markov-pairs 8 --markov-bins 4 --markov-iters 2 --mask-calibrate)
+
+    mkdir -p "$work/c0"
+    XDG_CONFIG_HOME="$work/c0" "$d" "${args[@]}" --config "$work/c0/good.conf" \
+        --mask-out "$work/good.png" --out "$work/o.png" >/dev/null 2>&1
+    local good; good="$(md5sum "$work/good.png" 2>/dev/null | cut -c1-12)"
+    if [ -z "$good" ]; then
+        echo "  the honest calibration produced no mask"; rm -rf "$work"; return 1
+    fi
+
+    # Captured rather than piped to grep: `set -o pipefail` is on, and grep -q
+    # closes the pipe the moment it matches, which SIGPIPEs the program and
+    # turns a success into a failure.
+    local said
+    said="$(XDG_CONFIG_HOME="$work/c1" "$d" "${args[@]}" --config "$work/c0/good.conf" \
+            --out "$work/o.png" 2>&1)"
+    if [[ "$said" == *"from a previous calibration"* ]]; then
+        echo "  a sound entry is read back"
+    else
+        echo "  the sound entry was not read back, so nothing below means anything"
+        rc=1
+    fi
+
+    local n=0 bad
+    # $1 names the case, $2 is a sed script, or with $3 a whole line to put in
+    # place of every line starting with $2 -- inserted whether or not one was
+    # there, which is what the rate cases need.
+    poison() {
+        n=$((n + 1))
+        mkdir -p "$work/p$n"
+        bad="$work/p$n/bad.conf"
+        if [ $# -eq 3 ]; then
+            grep -v "^$2" "$work/c0/good.conf" > "$bad"
+            echo "$3" >> "$bad"
+        else
+            cp "$work/c0/good.conf" "$bad"
+            sed -i "$2" "$bad"
+        fi
+        if cmp -s "$work/c0/good.conf" "$bad"; then
+            echo "  $1: the poisoning changed nothing, so it would test nothing"
+            rc=1; return
+        fi
+        rm -f "$work/bad.png"
+        XDG_CONFIG_HOME="$work/p$n" "$d" "${args[@]}" --config "$bad" \
+            --mask-out "$work/bad.png" --out "$work/o.png" >/dev/null 2>&1
+        local status=$? h
+        h="$(md5sum "$work/bad.png" 2>/dev/null | cut -c1-12)"
+        if [ "$status" -ne 0 ] || [ "$h" != "$good" ]; then
+            echo "  $1: exit $status, mask ${h:-none} against $good"
+            rc=1
+        fi
+    }
+    # A rate only matters to --budget, so a mask built without one never reads
+    # it and the same mask back proves nothing. Ask for it through --explain.
+    rate_refused() {
+        local shown
+        shown="$(XDG_CONFIG_HOME="$work/p$n" "$d" "${args[@]}" --config "$bad" \
+                 --budget 2 --explain 2>/dev/null | grep -E '^  markov\.rate +[-0-9]')"
+        if [ -z "$shown" ] || [[ "$shown" == *measured* ]]; then
+            echo "  $1: the poisoned rate was used: ${shown:-no markov.rate row}"
+            rc=1
+        fi
+    }
+    poison "a temperature above its range"  's/^calib\.\([a-f0-9]*\) = d:.*/calib.\1 = d:999999/'
+    poison "a negative temperature"         's/^calib\.\([a-f0-9]*\) = d:.*/calib.\1 = d:-5/'
+    poison "a temperature that is not one"  's/^calib\.\([a-f0-9]*\) = d:.*/calib.\1 = d:banana/'
+    poison "a weighting off the list"       's/\.w = d:.*/.w = d:77/'
+    poison "a radius off the ladder"        's/\.r = d:.*/.r = d:4/'
+    poison "a rate of zero"   'markov.rate = ' 'markov.rate = d:0'
+    rate_refused "a rate of zero"
+    poison "a negative rate"  'markov.rate = ' 'markov.rate = d:-1'
+    rate_refused "a negative rate"
+    poison "a truncated line"               '$ s/ = .*//'
+    poison "a value with no type prefix"    's/^calib\.\([a-f0-9]*\) = d:\(.*\)/calib.\1 = \2/'
+    [ $rc -eq 0 ] && echo "  $n hostile entries, the same mask from every one"
+
+    rm -rf "$work"
+    return $rc
+}
+run_one cachecheck cachecheck
+
+# examples/films.tsv records each film's crop window and which search chose it,
+# and the crops installed for direct are cut from that record. So the record and
+# the search must not drift apart: every recorded window has to come back out
+# of its own search. One findcrops per scan, concurrently, since the searches
+# share nothing and run 94 s back to back. Its EQ_SIGMA models
+# --direct-equalise and must follow the program's default, as seamlab's must.
+findcropscheck() {
+    local work; work="$(mktemp -d)"
+    local rc=0 film scan x rest i
+    local -a pids=() scans=()
+    while IFS=$'\t' read -r film scan x rest; do
+        case "$film" in ''|\#*) continue ;; esac
+        [ -n "$x" ] || continue
+        "$HERE/findcrops" "$scan" > "$work/$scan.out" 2>&1 &
+        pids+=($!); scans+=("$scan")
+    done < "$ROOT/examples/films.tsv"
+    for i in "${!pids[@]}"; do
+        if wait "${pids[$i]}"; then
+            echo "  ${scans[$i]}: the recorded window reproduces"
+        else
+            echo "  ${scans[$i]}: the search no longer lands on the recorded window"
+            sed 's/^/    /' "$work/${scans[$i]}.out"
+            rc=1
+        fi
+    done
+    [ "${#pids[@]}" -gt 0 ] || { echo "  films.tsv records no windows"; rc=1; }
+
+    local theirs mine
+    theirs="$("$ROOT/build/dither" --explain --no-config --mask-method direct \
+              --mask-sample "$ROOT/examples/Kodak-4X-1-crop.png" 2>/dev/null \
+              | awk '$1 == "direct.equalise" && $2 ~ /^[0-9.]+$/ { print $2; exit }')"
+    mine="$(python3 -c 'import runpy, sys; print(runpy.run_path(sys.argv[1], run_name="probe")["EQ_SIGMA"])' \
+            "$HERE/findcrops")"
+    if python3 -c 'import sys; sys.exit(abs(float(sys.argv[1]) - float(sys.argv[2])) > 0.05)' \
+            "${theirs:-nan}" "${mine:-nan}"; then
+        echo "  EQ_SIGMA $mine follows --direct-equalise $theirs"
+    else
+        echo "  EQ_SIGMA ${mine:-?} does not follow --direct-equalise ${theirs:-?}"
+        rc=1
+    fi
+    rm -rf "$work"
+    return $rc
+}
+run_one findcropscheck findcropscheck
+
+# A declaration and an implementation that have stopped describing the same
+# function. Two of those shipped -- markov.h's calibrate_markov overload and the
+# archived markov driver -- and nothing here could see either, because every
+# test links the whole library and calls through the CLI.
+run_one apicheck "$HERE/apicheck"
+
+# Two requests that used to be dropped in silence, both found by the October
+# 2026 coverage review. --mask-out lived outside the registry, so it implied
+# nothing and conflicted with nothing: under the default round threshold the
+# run exited 0 having written no mask. And a value was typed by its spelling
+# rather than by what the parameter holds, so a sample named 0001 was looked up
+# as 1.
+requestcheck() {
+    local work; work="$(mktemp -d)"
+    local rc=0 d="$ROOT/build/dither" img="$ROOT/examples/ramp_256x256.png"
+
+    # --mask-out alone implies a mask and produces the file
+    rm -f "$work/m.png"
+    "$d" "$img" --no-config --mask-out "$work/m.png" --out "$work/o.png" >/dev/null 2>&1
+    if [ -f "$work/m.png" ]; then echo "  --mask-out alone writes the mask"
+    else echo "  --mask-out alone wrote no mask"; rc=1; fi
+
+    # ...and is refused, not ignored, when a threshold rules it out
+    if "$d" "$img" --no-config --threshold round --mask-out "$work/m2.png" \
+            --out "$work/o.png" >/dev/null 2>&1; then
+        echo "  --threshold round --mask-out exited 0 with the option dropped"; rc=1
+    else
+        echo "  --threshold round --mask-out is refused"
+    fi
+
+    # a numeric-looking sample name is a name
+    mkdir -p "$work/cfg/dither/samples/0001"
+    cp "$ROOT/examples/Kodak-4X-1-crop.png" "$work/cfg/dither/samples/0001/"
+    local got
+    got="$(XDG_CONFIG_HOME="$work/cfg" "$d" "$img" --explain --mask-sample 0001 2>/dev/null \
+           | awk '$1=="mask.sample"{print $2; exit}')"
+    if [ "$got" = "0001" ]; then echo "  --mask-sample 0001 stays 0001"
+    else echo "  --mask-sample 0001 became '$got'"; rc=1; fi
+
+    rm -rf "$work"
+    return $rc
+}
+run_one requestcheck requestcheck
+
+# The documentation's half of the same argument: prose naming an option the
+# program does not have. Structural for the reason shellcheck is -- four of the
+# five defects a UX review found in September 2026 were this one mistake.
+run_one flagcheck   "$HERE/flagcheck"
+run_one samplecheck "$HERE/samplecheck"
+# The seam bench models direct's default treatment and --check compares it with
+# the program, which is only meaningful while the two use the same parameters.
+# They once drifted (the equalise sigma moved from 2 to 4 sigma in the program
+# alone), and nothing noticed, because the bench is run by hand.
+seam_check() {
+    # A 192 px cut, and seamlab's cheapest variant: what is under test is the
+    # comparison with the program, not the bench's own constructions, and the
+    # exact Python equalise over the whole 1024 crop takes minutes.
+    local work; work="$(mktemp -d)"
+    local crop="$work/crop.png"
+    python3 -c 'import cv2, sys; cv2.imwrite(sys.argv[2], cv2.imread(sys.argv[1], 0)[400:592, 400:592])' \
+        "$ROOT/examples/Kodak-4X-1-crop.png" "$crop"
+    "$HERE/seamlab" --params || { rm -rf "$work"; return 1; }
+    # --check builds the same mask with the program and scores its seam; it once
+    # passed the program an output it refuses, read a stale /tmp file or none,
+    # and exited 0 either way. So it must succeed against the real binary and
+    # fail against one that cannot build anything.
+    local rc=0
+    "$HERE/seamlab" "$crop" --size 128x128 --variants plain --check > /dev/null || {
+        echo "  seamlab --check failed against build/dither"; rc=1; }
+    if "$HERE/seamlab" "$crop" --size 128x128 --variants plain --check \
+           --dither /bin/false > /dev/null 2>&1; then
+        echo "  seamlab --check reported success with a binary that builds nothing"
+        rc=1
+    fi
+    [ $rc -eq 0 ] && echo "  seamlab --check builds and scores the program's mask, and fails when it cannot"
+    rm -rf "$work"
+    return $rc
+}
+run_one seamparams seam_check
+# The commands a user types, as they type them: the library installed into an
+# empty config, no size pinned, the cache on. Every check above pins something
+# to keep its question cheap, which is how a default can break while they pass.
+run_one workflowcheck "$HERE/workflowcheck"
+
+if [ ${#names[@]} -eq 0 ]; then
+    echo "nothing matched '$filter'" >&2
+    exit 2
+fi
+
+echo "--------------------------------------------"
+for i in "${!names[@]}"; do printf '%-12s %s\n' "${names[$i]}" "${results[$i]}"; done
+echo "--------------------------------------------"
+if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILED"; fi
+exit $(( fails > 0 ))
